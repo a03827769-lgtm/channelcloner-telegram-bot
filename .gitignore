@@ -1,6 +1,7 @@
 # Environment & Secrets
 .env
 *.env.local
+cloud_env_ready.txt
 *.session
 *.session-journal
 
