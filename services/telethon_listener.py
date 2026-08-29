@@ -52,6 +52,9 @@ class TelethonListener:
             return True
         return False
 
+    def is_configured(self) -> bool:
+        return bool(settings.TELEGRAM_API_ID and settings.TELEGRAM_API_HASH)
+
     async def get_active_session_string(self) -> Optional[str]:
         from services.security_vault import security_vault
         raw_session = await db_manager.get_setting("telethon_session")
