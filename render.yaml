@@ -9,8 +9,6 @@ services:
     autoDeploy: true
     healthCheckPath: /health
     envVars:
-      - key: PORT
-        value: 8080
       - key: DB_PATH
         value: database/cloner.db
       - key: TEMP_DOWNLOAD_DIR
