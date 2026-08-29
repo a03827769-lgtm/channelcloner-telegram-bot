@@ -147,18 +147,19 @@ def get_pair_detail_keyboard(pair: ChannelPair) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Shaxsiy Imzo", callback_data=f"pair_edit_sig_{pair.id}", style="primary", icon_custom_emoji_id=ID_SIGNATURE)
         ],
         [
-            InlineKeyboardButton(text="Qora Ro'yxat", callback_data=f"pair_edit_black_{pair.id}", style="primary", icon_custom_emoji_id=ID_ERROR),
-            InlineKeyboardButton(text="Tarixni Ko'chirish", callback_data=f"pair_history_{pair.id}", style="primary", icon_custom_emoji_id=ID_REFRESH)
+            InlineKeyboardButton(text="So'z/Raqam Almashtirish", callback_data=f"pair_edit_replace_{pair.id}", style="primary", icon_custom_emoji_id=ID_REFRESH),
+            InlineKeyboardButton(text="Qora Ro'yxat", callback_data=f"pair_edit_black_{pair.id}", style="primary", icon_custom_emoji_id=ID_ERROR)
         ],
         [
-            InlineKeyboardButton(text="Zaxira & Qayta Tiklash", callback_data=f"pair_backup_menu_{pair.id}", style="primary", icon_custom_emoji_id=ID_BACKUP),
-            InlineKeyboardButton(text="Test Post Yuborish", callback_data=f"pair_test_post_{pair.id}", style="success", icon_custom_emoji_id=ID_ROCKET)
+            InlineKeyboardButton(text="Tarixni Ko'chirish", callback_data=f"pair_history_{pair.id}", style="primary", icon_custom_emoji_id=ID_REFRESH),
+            InlineKeyboardButton(text="Zaxira & Qayta Tiklash", callback_data=f"pair_backup_menu_{pair.id}", style="primary", icon_custom_emoji_id=ID_BACKUP)
         ],
         [
-            InlineKeyboardButton(text="Statistika", callback_data=f"pair_stats_{pair.id}", style="primary", icon_custom_emoji_id=ID_STATS),
-            InlineKeyboardButton(text="Kanallar Ro'yxati", callback_data="cloner_list_pairs", style="primary", icon_custom_emoji_id=ID_DOCUMENT)
+            InlineKeyboardButton(text="Test Post Yuborish", callback_data=f"pair_test_post_{pair.id}", style="success", icon_custom_emoji_id=ID_ROCKET),
+            InlineKeyboardButton(text="Statistika", callback_data=f"pair_stats_{pair.id}", style="primary", icon_custom_emoji_id=ID_STATS)
         ],
         [
+            InlineKeyboardButton(text="Kanallar Ro'yxati", callback_data="cloner_list_pairs", style="primary", icon_custom_emoji_id=ID_DOCUMENT),
             InlineKeyboardButton(text="O'chirish", callback_data=f"pair_delete_confirm_{pair.id}", style="danger", icon_custom_emoji_id=ID_TRASH)
         ]
     ]

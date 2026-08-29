@@ -255,6 +255,7 @@ async def render_pair_detail(pair, message_obj):
     aff_icon = f"{SUCCESS} O'rnatilgan" if pair.affiliate_rules else f"{ERROR} O'rnatilmagan"
     emoji_icon = f"{SUCCESS} Yoqilgan (VIP)" if pair.auto_premium_emojis else f"{ERROR} O'chirilgan"
     sig_text = f"<code>{pair.custom_signature}</code>" if pair.custom_signature else "<i>O'rnatilmagan</i>"
+    rep_text = f"<code>{pair.replace_words}</code>" if pair.replace_words else "<i>Bo'sh</i>"
     bl_text = f"<code>{pair.blacklist_words}</code>" if pair.blacklist_words else "<i>Bo'sh</i>"
 
     text = f"""
@@ -270,6 +271,7 @@ async def render_pair_detail(pair, message_obj):
 ├ {LOCK_UNLOCKED} <b>Protected Content Mode:</b> {prot_icon}
 ├ ✨ <b>Telegram Premium Emojilar:</b> {emoji_icon}
 ├ {SIGNATURE} <b>Matn imzosi:</b> {sig_text}
+├ {REFRESH} <b>So'z/Raqam almashtirish:</b> {rep_text}
 └ {ERROR} <b>Qora ro'yxat:</b> {bl_text}
 
 Quyidagi tugmalar orqali sozlamalarni o'zgartiring:

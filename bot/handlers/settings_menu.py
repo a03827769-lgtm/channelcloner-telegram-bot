@@ -489,6 +489,71 @@ async def process_new_blacklist(message: Message, state: FSMContext):
         reply_markup=get_pair_detail_keyboard(pair) if pair else None
     )
 
+# --- WORD & PHONE REPLACEMENTS EDITING ---
+
+@router.callback_query(F.data.startswith("pair_edit_replace_"))
+async def cb_edit_replacements(callback: CallbackQuery, state: FSMContext):
+    await safe_answer(callback)
+    pair_id = int(callback.data.split("_")[3])
+    pair = await db_manager.get_pair_by_id(pair_id)
+    if not pair:
+        await safe_answer(callback, "Kanal topilmadi!", show_alert=True)
+        return
+    if not user_has_pair_access(pair, callback.from_user.id):
+        await safe_answer(callback, "⛔️ Ruxsat berilmagan!", show_alert=True)
+        return
+
+    await state.update_data(pair_id=pair_id)
+    await state.set_state(EditSettingsSG.waiting_for_replacements)
+
+    curr_rep = pair.replace_words or "<i>O'rnatilmagan</i>"
+    text = f"""
+{REFRESH} <b>So'z va Telefon Raqam Almashtirgich</b>
+
+Manba kanaldagi begona so'zlar, telefon raqamlari yoki belgilarni o'zingizning ma'lumotlaringizga avtomatik almashtiring.
+
+{PIN} <b>Hozirgi qoidalar:</b>
+<code>{curr_rep}</code>
+
+<i>Format: <code>eski_qiymat=yangi_qiymat</code> (vergul yoki yangi qator bilan)</i>
+<i>Misol:</i>
+<code>+998991112233=+998901234567
+901234567=998887766
+@begona_kanal=@bizning_kanal</code>
+
+<i>Qoidalarni tozalash uchun <code>/clear</code> deb yozing.</i>
+"""
+    await callback.message.edit_text(
+        text=text,
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard(f"pair_view_{pair_id}")
+    )
+
+@router.message(EditSettingsSG.waiting_for_replacements)
+async def process_new_replacements(message: Message, state: FSMContext):
+    data = await state.get_data()
+    pair_id = data.get("pair_id")
+    if not pair_id:
+        await state.clear()
+        await message.answer("⚠️ Sessiya eskirgan. Qaytadan urinib ko'ring.", reply_markup=get_back_to_main_keyboard())
+        return
+
+    raw_rep = message.text.strip()
+    if raw_rep == "/clear":
+        raw_rep = ""
+
+    formatted_rep = ",".join(line.strip() for line in raw_rep.splitlines() if line.strip()) if "\n" in raw_rep else raw_rep
+
+    await db_manager.update_replace_words(pair_id, formatted_rep)
+    await state.clear()
+
+    pair = await db_manager.get_pair_by_id(pair_id)
+    await message.answer(
+        text=f"{SUCCESS} <b>So'z va telefon raqam almashtirish qoidalari saqlandi:</b>\n<code>{formatted_rep or 'Tozalandi'}</code>",
+        parse_mode="HTML",
+        reply_markup=get_pair_detail_keyboard(pair) if pair else get_back_to_main_keyboard()
+    )
+
 # --- VIDEO WATERMARK SETTINGS ---
 
 @router.callback_query(F.data.startswith("pair_vwm_menu_"))
