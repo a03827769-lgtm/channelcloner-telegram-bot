@@ -6,6 +6,8 @@ from services.translator_service import translator_service
 class TestTranslatorService(unittest.TestCase):
     def test_placeholder_masking_and_translation(self):
         async def run():
+            translator_service._cache.clear()
+            translator_service._translators.clear()
             # Mock GoogleTranslator.translate to return translated text with tags preserved
             with patch("services.translator_service.GoogleTranslator") as MockGT:
                 mock_inst = MagicMock()

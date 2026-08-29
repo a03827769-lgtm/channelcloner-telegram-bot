@@ -2,6 +2,7 @@ import asyncio
 import logging
 import sys
 import os
+import signal
 from aiohttp import web
 
 # High performance C-based event loop on Linux in Docker
@@ -34,21 +35,31 @@ logger = logging.getLogger("ChannelClonerApp")
 async def start_health_server():
     """Lightweight 24/7 Keep-Alive HTTP healthcheck server for cloud PaaS (Koyeb, Render)"""
     app = web.Application()
+
     async def health_handler(request):
+        telethon_ok = False
+        try:
+            telethon_ok = bool(telethon_listener.is_connected())
+        except Exception:
+            telethon_ok = False
+
         return web.json_response({
-            "status": "healthy",
-            "uptime": "24/7",
+            "status": "ok",
+            "bot": "running",
             "service": "telegram-channel-cloner",
-            "telethon_connected": telethon_listener.is_connected()
-        })
+            "telethon_connected": telethon_ok
+        }, status=200)
+
+    # Register routes for / and /health (aiohttp add_get automatically registers HEAD handler)
     app.router.add_get("/", health_handler)
     app.router.add_get("/health", health_handler)
+
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"🚀 Keep-Alive HTTP Healthcheck server running on port {port} (/health)")
+    logger.info(f"🚀 Keep-Alive HTTP Healthcheck server running on 0.0.0.0:{port} (/ and /health)")
     return runner
 
 async def setup_bot_commands(bot, admin_bot=None):
@@ -131,6 +142,21 @@ async def main():
 
     # 8. Start Concurrent Polling for Public Bot and Admin Bot
     logger.info("Starting Aiogram 3 Concurrent Bot Polling...")
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _handle_exit_signal(sig_num):
+        sig_name = signal.Signals(sig_num).name if hasattr(signal, "Signals") else str(sig_num)
+        logger.info(f"Received signal {sig_name}. Initiating graceful shutdown...")
+        stop_event.set()
+
+    if sys.platform != "win32":
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, lambda s=sig: _handle_exit_signal(s))
+            except (NotImplementedError, RuntimeError):
+                pass
+
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         bot_user = await bot.get_me()
@@ -144,7 +170,23 @@ async def main():
             logger.info(f"Dedicated Admin Bot started as @{admin_user.username} (ID: {admin_user.id})")
             polling_coroutines.append(admin_dp.start_polling(admin_bot, handle_in_background=True))
 
-        await asyncio.gather(*polling_coroutines)
+        polling_task = asyncio.create_task(asyncio.gather(*polling_coroutines))
+
+        async def _signal_watcher():
+            await stop_event.wait()
+            polling_task.cancel()
+
+        watcher_task = None
+        if sys.platform != "win32":
+            watcher_task = asyncio.create_task(_signal_watcher())
+
+        try:
+            await polling_task
+        except asyncio.CancelledError:
+            logger.info("Polling tasks stopped by shutdown signal.")
+        finally:
+            if watcher_task and not watcher_task.done():
+                watcher_task.cancel()
 
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutting down bot...")
@@ -153,13 +195,25 @@ async def main():
         if http_runner:
             try:
                 await http_runner.cleanup()
+            except Exception as e:
+                logger.debug(f"HTTP runner cleanup: {e}")
+        try:
+            sub_watcher.stop()
+        except Exception:
+            pass
+        try:
+            await telethon_listener.stop()
+        except Exception:
+            pass
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
+        if admin_bot:
+            try:
+                await admin_bot.session.close()
             except Exception:
                 pass
-        sub_watcher.stop()
-        await telethon_listener.stop()
-        await bot.session.close()
-        if admin_bot:
-            await admin_bot.session.close()
         logger.info("Telegram Channel Cloner shut down cleanly.")
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ class TestNextGenFeatures(unittest.IsolatedAsyncioTestCase):
             os.remove(self.test_db_path)
         self.db = DatabaseManager(self.test_db_path)
         await self.db.init_db()
+        await self.db.get_or_create_user(12345, "Test User", "testuser", is_admin=True)
 
     async def asyncTearDown(self):
         if os.path.exists(self.test_db_path):

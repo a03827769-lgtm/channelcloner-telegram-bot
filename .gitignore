@@ -55,3 +55,6 @@ ENV/
 *.swo
 .DS_Store
 Thumbs.db
+
+# Agent metadata
+.agents/

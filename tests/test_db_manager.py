@@ -24,6 +24,7 @@ class TestDatabaseManager(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(user.is_admin)
 
     async def test_channel_pair_operations(self):
+        await self.db.get_or_create_user(12345, "Test User", "testuser", is_admin=True)
         pair_id = await self.db.add_channel_pair(
             user_id=12345,
             source_channel="@src_test",
@@ -54,6 +55,7 @@ class TestDatabaseManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(pairs), 1)
 
     async def test_cloned_message_tracking(self):
+        await self.db.get_or_create_user(12345, "Test User", "testuser", is_admin=True)
         pair_id = await self.db.add_channel_pair(
             user_id=12345,
             source_channel="@src",
@@ -72,6 +74,7 @@ class TestDatabaseManager(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.db.is_message_cloned(pair_id, 999))
 
     async def test_pair_advanced_updates(self):
+        await self.db.get_or_create_user(12345, "Test User", "testuser", is_admin=True)
         pair_id = await self.db.add_channel_pair(
             user_id=12345,
             source_channel="@src_adv",
