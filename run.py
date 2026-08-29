@@ -179,7 +179,10 @@ async def main():
             logger.info(f"Dedicated Admin Bot started as @{admin_user.username} (ID: {admin_user.id})")
             polling_coroutines.append(admin_dp.start_polling(admin_bot, handle_in_background=True))
 
-        polling_task = asyncio.create_task(asyncio.gather(*polling_coroutines))
+        async def _run_polling():
+            await asyncio.gather(*polling_coroutines)
+
+        polling_task = asyncio.create_task(_run_polling())
 
         async def _signal_watcher():
             await stop_event.wait()

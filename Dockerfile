@@ -77,5 +77,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 USER appuser
 
 # Application entrypoint with tini process supervisor
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["python", "run.py"]
