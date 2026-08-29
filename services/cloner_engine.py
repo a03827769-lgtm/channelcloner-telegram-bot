@@ -211,10 +211,11 @@ Kanalingiz botga muvaffaqiyatli ulandi va sozlamalar tekshirildi.
                     if media_type == "photo" and pair.image_watermark_type != "none":
                         wm_text = pair.image_watermark_text or pair.custom_signature or pair.target_channel
                         if wm_text:
-                            temp_file = watermark_service.apply_text_watermark(
-                                image_path=temp_file,
-                                text=wm_text,
-                                position=pair.image_watermark_pos or "bottom_right"
+                            temp_file = await asyncio.to_thread(
+                                watermark_service.apply_text_watermark,
+                                temp_file,
+                                wm_text,
+                                pair.image_watermark_pos or "bottom_right"
                             )
 
                     elif media_type == "video" and pair.video_watermark_type != "none":
@@ -465,22 +466,33 @@ Kanalingiz botga muvaffaqiyatli ulandi va sozlamalar tekshirildi.
 
         try:
             async with cache_manager.media_semaphore:
-                for idx, msg in enumerate(uncloned):
-                    temp_path = await media_handler.download_telethon_media(msg)
-                    if not temp_path or not os.path.exists(temp_path):
-                        continue
+                async def _download_and_prep(msg, idx):
+                    try:
+                        t_path = await media_handler.download_telethon_media(msg)
+                        if not t_path or not os.path.exists(t_path):
+                            return None
+                        m_type = media_handler.get_media_type(msg)
+                        if m_type == "photo" and pair.image_watermark_type != "none":
+                            wm_text = pair.image_watermark_text or pair.custom_signature or pair.target_channel
+                            if wm_text:
+                                t_path = await asyncio.to_thread(
+                                    watermark_service.apply_text_watermark,
+                                    t_path,
+                                    wm_text,
+                                    pair.image_watermark_pos or "bottom_right"
+                                )
+                        return (idx, msg, t_path, m_type)
+                    except Exception as prep_err:
+                        logger.error(f"Error prepping media item {msg.id}: {prep_err}")
+                        return None
 
-                    m_type = media_handler.get_media_type(msg)
+                tasks = [_download_and_prep(m, i) for i, m in enumerate(uncloned)]
+                raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                    if m_type == "photo" and pair.image_watermark_type != "none":
-                        wm_text = pair.image_watermark_text or pair.custom_signature or pair.target_channel
-                        if wm_text:
-                            temp_path = watermark_service.apply_text_watermark(
-                                image_path=temp_path,
-                                text=wm_text,
-                                position=pair.image_watermark_pos or "bottom_right"
-                            )
+                valid_items = [r for r in raw_results if isinstance(r, tuple) and r is not None]
+                valid_items.sort(key=lambda x: x[0])
 
+                for idx, msg, temp_path, m_type in valid_items:
                     downloaded_files.append(temp_path)
                     input_file = FSInputFile(temp_path)
                     item_caption = (caption if idx == 0 and caption else None)

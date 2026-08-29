@@ -406,10 +406,10 @@ class TelethonListener:
                     media_handler.album_buffer.add_message(
                         buffer_key,
                         message,
-                        lambda k, msgs, p=pair: cloner_engine.clone_media_group(msgs, p)
+                        lambda k, msgs, p=pair: asyncio.create_task(cloner_engine.clone_media_group(msgs, p))
                     )
                 else:
-                    await cloner_engine.clone_single_message(message, pair)
+                    asyncio.create_task(cloner_engine.clone_single_message(message, pair))
 
         except Exception as e:
             logger.error(f"Error in Telethon _handle_new_message: {e}", exc_info=True)
