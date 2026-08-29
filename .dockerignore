@@ -1,16 +1,66 @@
-__pycache__
-*.pyc
-*.pyo
-*.pyd
+# ==============================================================================
+# Telegram Channel Cloner — Production .dockerignore
+# ==============================================================================
+
+# Python bytecode & environments
+__pycache__/
+*.py[cod]
+*$py.class
 .Python
 env/
 venv/
 .venv/
-.git
+ENV/
+
+# Sensitive credentials & Environment files (CRITICAL SECURITY)
+.env
+.env.*
+!.env.example
+*.env
+*.env.local
+cloud_env_ready.txt
+*.token
+*.secret
+*.key
+*.pem
+*.cer
+
+# Telethon & Pyrogram MTProto Session Files
+*.session
+*.session-journal
+*.session*
+
+# Database & SQLite files
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+database/*.db*
+database/*.sqlite*
+test_stars.db
+test_next_gen.db
+tests/*.db
+
+# Temporary media & cache
+temp_media/*
+!temp_media/.gitkeep
+temp_media/
+*.tmp
+*.bak
+test.txt
+
+# Git & Development / Agent metadata
+.git/
 .gitignore
 .dockerignore
-temp_media/*
-tests/
-test.txt
+.agents/
+.gemini/
+.vscode/
+.idea/
 .pytest_cache/
 .coverage
+tests/
+test_channel_perm.py
+audit_report.md
+walkthrough.md

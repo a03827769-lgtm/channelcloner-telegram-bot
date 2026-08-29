@@ -1,24 +1,46 @@
-# Environment & Secrets
+# ==============================================================================
+# Telegram Channel Cloner — Production .gitignore
+# ==============================================================================
+
+# 1. Environment variables & Secrets (CRITICAL)
 .env
+.env.*
+!.env.example
+*.env
 *.env.local
 cloud_env_ready.txt
+*.token
+*.secret
+*.key
+*.pem
+*.cer
+
+# 2. Telethon & Pyrogram MTProto Session Files
 *.session
 *.session-journal
+*.session*
 
-# SQLite Databases & WAL files (do not commit user data to git)
-database/*.db
-database/*.db-wal
-database/*.db-shm
+# 3. SQLite Databases & WAL journal files
 *.db
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite3
+database/*.db*
+database/*.sqlite*
+test_stars.db
+test_next_gen.db
+tests/*.db
 
-# Media downloads & temporary storage
+# 4. Media downloads & temporary storage
 temp_media/*
 !temp_media/.gitkeep
 temp_media/
+*.tmp
+*.bak
+test.txt
 
-# Python cache & artifacts
+# 5. Python cache & compiled bytecode
 __pycache__/
 *.py[cod]
 *$py.class
@@ -42,19 +64,20 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# Virtual environments
+# 6. Virtual environments
 venv/
 .venv/
 env/
 ENV/
 
-# IDE & OS files
+# 7. IDE, OS & Agent metadata
 .idea/
 .vscode/
 *.swp
 *.swo
 .DS_Store
 Thumbs.db
-
-# Agent metadata
 .agents/
+.gemini/
+.pytest_cache/
+.coverage

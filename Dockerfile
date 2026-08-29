@@ -1,47 +1,78 @@
-FROM python:3.11-slim
+# ==============================================================================
+# Stage 1: Builder Stage (Compiles C-extensions and builds Python wheels)
+# ==============================================================================
+FROM python:3.11-slim AS builder
 
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Set working directory
-WORKDIR /app
+WORKDIR /build
 
-# Install system dependencies (including ffmpeg for video watermarking)
+# Install build dependencies for compiling Python C-extensions (uvloop, cryptography, pillow)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libffi-dev \
-    ca-certificates \
-    ffmpeg \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install python dependencies
+# Create virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
-COPY config/ ./config/
-COPY database/ ./database/
-COPY services/ ./services/
-COPY bot/ ./bot/
-COPY admin_bot/ ./admin_bot/
-COPY run.py .
-COPY setup_wizard.py .
+# ==============================================================================
+# Stage 2: Runtime Stage (Lean, Secure, Production-Ready)
+# ==============================================================================
+FROM python:3.11-slim AS runner
 
-# Create database and temp storage directories
-RUN mkdir -p /app/database /app/temp_media
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    PORT=8080 \
+    DB_PATH=database/cloner.db \
+    TEMP_DOWNLOAD_DIR=temp_media
 
-# Create non-root user for security
-RUN useradd -m -u 1000 appuser && \
+WORKDIR /app
+
+# Install runtime packages (FFmpeg for video watermark, DejaVu fonts, curl for healthcheck)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    fonts-dejavu-core \
+    ca-certificates \
+    curl \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy virtual environment from builder stage
+COPY --from=builder /opt/venv /opt/venv
+
+# Create non-root application user
+RUN useradd -m -u 1000 -s /bin/bash appuser && \
+    mkdir -p /app/database /app/temp_media && \
     chown -R appuser:appuser /app
 
-# Expose HTTP port for keep-alive healthchecks (Koyeb, Render, Cloud PaaS)
+# Copy application source code
+COPY --chown=appuser:appuser config/ ./config/
+COPY --chown=appuser:appuser database/ ./database/
+COPY --chown=appuser:appuser services/ ./services/
+COPY --chown=appuser:appuser bot/ ./bot/
+COPY --chown=appuser:appuser admin_bot/ ./admin_bot/
+COPY --chown=appuser:appuser run.py setup_wizard.py ./
+
+# Expose HTTP healthcheck port
 EXPOSE 8080
+
+# Native Docker Healthcheck probe
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -f http://127.0.0.1:${PORT:-8080}/health || exit 1
 
 # Switch to non-root user
 USER appuser
 
-# Run the application
+# Application entrypoint
 CMD ["python", "run.py"]

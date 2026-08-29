@@ -3,11 +3,18 @@ services:
     name: channelcloner-telegram-bot
     runtime: docker
     plan: free
-    region: frankfurt
+    region: frankfurt # Frankfurt region for optimized Telegram MTProto connections
     dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    healthCheckPath: /health
     envVars:
       - key: PORT
         value: 8080
+      - key: DB_PATH
+        value: database/cloner.db
+      - key: TEMP_DOWNLOAD_DIR
+        value: temp_media
       - key: BOT_TOKEN
         sync: false
       - key: ADMIN_BOT_TOKEN
@@ -16,7 +23,7 @@ services:
         sync: false
       - key: TELEGRAM_API_HASH
         sync: false
-      - key: ADMIN_IDS
-        sync: false
       - key: TELETHON_SESSION
+        sync: false
+      - key: ADMIN_IDS
         sync: false

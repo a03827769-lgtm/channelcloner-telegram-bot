@@ -5,6 +5,13 @@ import os
 import signal
 from aiohttp import web
 
+# Ensure UTF-8 stdout encoding
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # High performance C-based event loop on Linux in Docker
 try:
     import uvloop

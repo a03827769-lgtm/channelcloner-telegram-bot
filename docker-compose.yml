@@ -1,23 +1,50 @@
+version: "3.8"
+
 services:
-  cloner-bot:
+  telegram-cloner:
     container_name: telegram_channel_cloner
     build:
       context: .
       dockerfile: Dockerfile
-    restart: always
+    restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "${PORT:-8080}:8080"
     env_file:
       - .env
+    environment:
+      - PORT=8080
+      - DB_PATH=database/cloner.db
+      - TEMP_DOWNLOAD_DIR=temp_media
     volumes:
-      - ./database:/app/database
-      - ./temp_media:/app/temp_media
+      - cloner_database:/app/database
+      - cloner_temp:/app/temp_media
+    stop_grace_period: 30s
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "1.50"
+          memory: 768M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     logging:
       driver: "json-file"
       options:
         max-size: "20m"
         max-file: "5"
+
+volumes:
+  cloner_database:
+    name: channelcloner_db_data
+  cloner_temp:
+    name: channelcloner_temp_media

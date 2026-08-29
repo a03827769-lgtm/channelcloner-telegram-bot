@@ -1,20 +1,50 @@
-# Koyeb Cloud PaaS Configuration
 name: channelcloner-telegram-bot
-services:
-  - name: channelcloner-bot
-    type: web
-    instance_type: nano
-    regions:
-      - fra
-    ports:
-      - port: 8080
-        path: /health
-    routes:
-      - path: /
-        port: 8080
-    health_checks:
-      - tcp:
-          port: 8080
-    scalings:
-      - min: 1
-        max: 1
+type: web
+
+regions:
+  - fra # Frankfurt, Europe (Lowest latency for Telegram MTProto)
+
+scalings:
+  - min: 1
+    max: 1 # Strictly 1 instance to prevent MTProto auth conflict and SQLite split-brain
+
+instance_types:
+  - type: free # Koyeb Eco / Free tier instance (512MB RAM, 0.1 vCPU)
+
+ports:
+  - port: 8080
+    protocol: http
+
+routes:
+  - path: /
+    port: 8080
+
+health_checks:
+  - protocol: http
+    port: 8080
+    path: /health
+    initial_delay: 15
+    interval: 30
+    timeout: 5
+    healthy_threshold: 1
+    unhealthy_threshold: 3
+
+env:
+  - key: PORT
+    value: "8080"
+  - key: DB_PATH
+    value: "database/cloner.db"
+  - key: TEMP_DOWNLOAD_DIR
+    value: "temp_media"
+  - key: BOT_TOKEN
+    value: "{{ secret.BOT_TOKEN }}"
+  - key: ADMIN_BOT_TOKEN
+    value: "{{ secret.ADMIN_BOT_TOKEN }}"
+  - key: TELEGRAM_API_ID
+    value: "{{ secret.TELEGRAM_API_ID }}"
+  - key: TELEGRAM_API_HASH
+    value: "{{ secret.TELEGRAM_API_HASH }}"
+  - key: TELETHON_SESSION
+    value: "{{ secret.TELETHON_SESSION }}"
+  - key: ADMIN_IDS
+    value: "{{ secret.ADMIN_IDS }}"
