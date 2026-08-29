@@ -52,14 +52,20 @@ class TelethonListener:
             return True
         return False
 
-    def is_configured(self) -> bool:
-        return bool(settings.TELEGRAM_API_ID and settings.TELEGRAM_API_HASH)
-
     async def get_active_session_string(self) -> Optional[str]:
-        db_session = await db_manager.get_setting("telethon_session")
-        if db_session:
-            return db_session
-        return settings.TELETHON_SESSION or None
+        from services.security_vault import security_vault
+        raw_session = await db_manager.get_setting("telethon_session")
+        if not raw_session:
+            raw_session = settings.TELETHON_SESSION or None
+        if not raw_session:
+            return None
+        
+        # If encrypted with enc:, decrypt transparently
+        if raw_session.startswith("enc:"):
+            decrypted = security_vault.decrypt_secret(raw_session)
+            if decrypted:
+                return decrypted
+        return raw_session
 
     async def start(self):
         """Starts Telethon client and initiates self-healing connection supervisor"""
@@ -78,16 +84,21 @@ class TelethonListener:
             except Exception:
                 pass
 
-        self.client = TelegramClient(
-            StringSession(session_str),
-            settings.TELEGRAM_API_ID,
-            settings.TELEGRAM_API_HASH,
-            device_model=DEVICE_MODEL,
-            system_version=SYSTEM_VERSION,
-            app_version=APP_VERSION,
-            lang_code=LANG_CODE,
-            system_lang_code=SYSTEM_LANG_CODE
-        )
+        try:
+            self.client = TelegramClient(
+                StringSession(session_str),
+                settings.TELEGRAM_API_ID,
+                settings.TELEGRAM_API_HASH,
+                device_model=DEVICE_MODEL,
+                system_version=SYSTEM_VERSION,
+                app_version=APP_VERSION,
+                lang_code=LANG_CODE,
+                system_lang_code=SYSTEM_LANG_CODE
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize Telethon StringSession: {e}")
+            self._is_running = False
+            return
 
         try:
             await self.client.connect()
