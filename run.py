@@ -27,6 +27,7 @@ from services.telethon_listener import telethon_listener
 from services.media_handler import media_handler
 from services.subscription_watcher import SubscriptionWatcher
 from services.drip_feed_queue import drip_feed_service
+from services.memory_supervisor import system_supervisor
 from bot.bot_instance import create_bot, create_dispatcher
 from admin_bot.bot_instance import create_admin_bot, create_admin_dispatcher
 
@@ -127,8 +128,9 @@ async def main():
     # 4. Register Telegram Commands Menu
     await setup_bot_commands(bot, admin_bot)
 
-    # 5. Start Media Garbage Collector, Subscription Trial Watcher & Drip Feed Worker
+    # 5. Start Media Garbage Collector, System Supervisor & Subscription Watcher
     media_handler.start_background_cleanup(interval=300, max_age=300)
+    system_supervisor.start()
     sub_watcher = SubscriptionWatcher(bot)
     sub_watcher.start()
     asyncio.create_task(drip_feed_service.start_worker(bot, cloner_engine))
@@ -205,11 +207,19 @@ async def main():
             except Exception as e:
                 logger.debug(f"HTTP runner cleanup: {e}")
         try:
+            system_supervisor.stop()
+        except Exception:
+            pass
+        try:
             sub_watcher.stop()
         except Exception:
             pass
         try:
             await telethon_listener.stop()
+        except Exception:
+            pass
+        try:
+            await db_manager.execute("PRAGMA wal_checkpoint(TRUNCATE);")
         except Exception:
             pass
         try:

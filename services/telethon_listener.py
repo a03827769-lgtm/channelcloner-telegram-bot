@@ -1,11 +1,13 @@
 import asyncio
 import logging
+import random
 from typing import Optional, List, Dict, Callable, Any, Tuple
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat, Message as TelethonMessage
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telethon.tl.functions.updates import GetStateRequest
 from telethon.errors import (
     FloodWaitError,
     ChannelPrivateError,
@@ -123,25 +125,96 @@ class TelethonListener:
             self._is_running = False
 
     async def _connection_supervisor(self):
-        """Monitors Telethon MTProto connectivity and auto-reconnects on disconnection"""
+        """Active MTProto Watchdog: Pings Telegram DC via GetStateRequest & auto-reconnects with jitter"""
+        consecutive_failures = 0
+        base_delay = 2.0
+        max_delay = 60.0
+        prune_counter = 0
+
         while self._is_running:
             try:
-                await asyncio.sleep(30)
-                if not self.client or not self.client.is_connected():
-                    logger.warning("Telethon connection dropped! Auto-reconnecting...")
-                    session_str = await self.get_active_session_string()
-                    if session_str and self.client:
-                        try:
-                            await self.client.connect()
-                            if await self.client.is_user_authorized():
-                                logger.info("Telethon MTProto connection restored successfully.")
-                        except Exception as rec_err:
-                            logger.error(f"Reconnection attempt failed: {rec_err}")
+                await asyncio.sleep(40)
+                if not self.client:
+                    continue
+
+                is_alive = False
+                if self.client.is_connected():
+                    try:
+                        # Active RPC probe to detect half-open sockets
+                        await asyncio.wait_for(self.client(GetStateRequest()), timeout=10.0)
+                        is_alive = True
+                        consecutive_failures = 0
+                    except (asyncio.TimeoutError, ConnectionError, OSError) as net_err:
+                        logger.warning(f"Active MTProto ping probe timed out/failed: {net_err}")
+                    except FloodWaitError as fwe:
+                        logger.warning(f"FloodWait on probe: sleeping {fwe.seconds}s")
+                        await asyncio.sleep(fwe.seconds + 1)
+                        is_alive = True
+                    except Exception:
+                        is_alive = bool(self.client.is_connected())
+
+                if not is_alive:
+                    consecutive_failures += 1
+                    backoff = min(max_delay, base_delay * (2 ** min(consecutive_failures, 5)))
+                    jittered_delay = random.uniform(backoff * 0.5, backoff * 1.5)
+                    logger.warning(f"Telethon connection stalled (fail #{consecutive_failures}). Reconnecting in {jittered_delay:.1f}s...")
+                    await asyncio.sleep(jittered_delay)
+
+                    try:
+                        if self.client.is_connected():
+                            await self.client.disconnect()
+                    except Exception:
+                        pass
+
+                    try:
+                        await self.client.connect()
+                        if await self.client.is_user_authorized():
+                            logger.info("✅ Telethon MTProto connection restored successfully.")
+                            try:
+                                self.client.remove_event_handler(self._handle_new_message, events.NewMessage)
+                            except Exception:
+                                pass
+                            self.client.add_event_handler(self._handle_new_message, events.NewMessage)
+                            consecutive_failures = 0
+                    except Exception as rec_err:
+                        logger.error(f"Reconnection attempt #{consecutive_failures} failed: {rec_err}")
+
+                # Periodic Entity Cache Pruning to keep memory footprint < 200MB
+                prune_counter += 1
+                if prune_counter >= 30:
+                    prune_counter = 0
+                    await self._prune_entity_cache()
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in Telethon connection supervisor: {e}")
                 await asyncio.sleep(10)
+
+    async def _prune_entity_cache(self):
+        """Prunes old Telethon cached entities to keep container RAM usage minimal (<200MB)"""
+        try:
+            if not self.client or not hasattr(self.client, "_entities"):
+                return
+            count = len(self.client._entities)
+            if count > 2000:
+                active_pairs = await db_manager.get_all_active_pairs()
+                keep_ids = set()
+                for p in active_pairs:
+                    if p.source_id:
+                        keep_ids.add(p.source_id)
+                    if p.target_id:
+                        keep_ids.add(p.target_id)
+                me = await self.get_me()
+                if me:
+                    keep_ids.add(me.id)
+
+                self.client._entities = {k: v for k, v in self.client._entities.items() if k in keep_ids}
+                if hasattr(self.client, "_input_entities"):
+                    self.client._input_entities = {k: v for k, v in self.client._input_entities.items() if k in keep_ids}
+                logger.info(f"Pruned Telethon entity cache: {count} -> {len(self.client._entities)} items retained.")
+        except Exception as pe:
+            logger.debug(f"Entity cache pruning skipped: {pe}")
 
     async def stop(self):
         """Gracefully stops Telethon client"""

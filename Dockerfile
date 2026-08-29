@@ -39,13 +39,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install runtime packages (FFmpeg for video watermark, DejaVu fonts, curl for healthcheck)
+# Install runtime packages (FFmpeg for video watermark, DejaVu fonts, curl for healthcheck, tini, jemalloc)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     fonts-dejavu-core \
     ca-certificates \
     curl \
     tzdata \
+    tini \
+    libjemalloc2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy virtual environment from builder stage
@@ -74,5 +76,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 # Switch to non-root user
 USER appuser
 
-# Application entrypoint
+# Application entrypoint with tini process supervisor
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "run.py"]
