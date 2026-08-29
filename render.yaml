@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: channelcloner-telegram-bot
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: TELETHON_SESSION
+        sync: false

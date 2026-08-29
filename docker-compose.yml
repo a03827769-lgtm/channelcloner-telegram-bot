@@ -1,0 +1,23 @@
+services:
+  cloner-bot:
+    container_name: telegram_channel_cloner
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./database:/app/database
+      - ./temp_media:/app/temp_media
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"

@@ -1,0 +1,56 @@
+# Environment & Secrets
+.env
+*.env.local
+*.session
+*.session-journal
+
+# SQLite Databases & WAL files (do not commit user data to git)
+database/*.db
+database/*.db-wal
+database/*.db-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Media downloads & temporary storage
+temp_media/*
+!temp_media/.gitkeep
+temp_media/
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE & OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

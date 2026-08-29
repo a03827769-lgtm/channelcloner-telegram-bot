@@ -1,0 +1,20 @@
+# Koyeb Cloud PaaS Configuration
+name: channelcloner-telegram-bot
+services:
+  - name: channelcloner-bot
+    type: web
+    instance_type: nano
+    regions:
+      - fra
+    ports:
+      - port: 8080
+        path: /health
+    routes:
+      - path: /
+        port: 8080
+    health_checks:
+      - tcp:
+          port: 8080
+    scalings:
+      - min: 1
+        max: 1
