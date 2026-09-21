@@ -8,6 +8,8 @@ logger = logging.getLogger(__name__)
 
 from services.custom_emojis import ERROR
 
+from database.db_manager import db_manager
+
 class AdminStrictAuthMiddleware(BaseMiddleware):
     """
     Strict security middleware for Admin Bot:
@@ -23,18 +25,15 @@ class AdminStrictAuthMiddleware(BaseMiddleware):
         if not user:
             return None
 
-        if user.id not in settings.admin_ids:
+        is_authorized = (user.id == settings.PRIMARY_SUPER_ADMIN_ID or user.id in settings.admin_ids) or await db_manager.is_admin(user.id)
+        if not is_authorized:
             logger.warning(f"UNAUTHORIZED access attempt on Admin Bot by user_id={user.id} ({user.full_name}, @{user.username})")
             if isinstance(event, CallbackQuery):
                 try:
                     await event.answer("Ruxsat berilmagan! Ushbu bot faqat Super Adminlar uchun!", show_alert=True)
                 except Exception:
-                    pass
-            elif isinstance(event, Message):
-                try:
-                    await event.answer(f"{ERROR} <b>Ruxsat berilmagan:</b> Siz ushbu botning ma'muri emassiz!", parse_mode="HTML")
-                except Exception:
-                    pass
+                    logger.debug("Ignored exception", exc_info=True)
+            # Silently drop unauthorized messages to protect dedicated admin bot from FloodWait attacks
             return None
 
         return await handler(event, data)

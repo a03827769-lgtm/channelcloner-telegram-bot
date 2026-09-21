@@ -1,0 +1,690 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --apple-blue: #0A84FF;
+    --apple-green: #34C759;
+    --apple-orange: #FF9F0A;
+    --apple-purple: #BF5AF2;
+    --apple-gold: #FFD60A;
+    --apple-red: #FF453A;
+    --apple-teal: #64D2FF;
+    /* iOS 26 Liquid Glass Spring Curve */
+    --spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+    --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-spring-soft: cubic-bezier(0.32, 0.72, 0, 1);
+  }
+
+  body {
+    background-color: #1A191F;
+    color: #FFFFFF;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    -webkit-tap-highlight-color: transparent;
+    letter-spacing: -0.017em;
+    user-select: none;
+    -webkit-user-select: none;
+    overscroll-behavior-y: none;
+    font-feature-settings: "cv01", "ss03";
+  }
+}
+
+/* Custom scrollbars hidden globally & utilities */
+::-webkit-scrollbar {
+  display: none;
+}
+* {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* ==========================================================================
+   APPLE iOS 26 "LIQUID GLASS" DESIGN SYSTEM
+   Authentic recreation of the Liquid Glass material language
+   introduced at WWDC 2025 — translucent, refractive, spring-animated
+   ========================================================================== */
+
+/* 1. Spatial Canvas — Warm naturalistic ambient depth
+   iOS 26 backgrounds are warm gray-brown, NOT pitch black.
+   Modeled after the warm room ambience in reference images 1 & 2. */
+.vision-spatial-canvas {
+  background:
+    radial-gradient(ellipse 90% 55% at 50% -5%, rgba(210, 195, 175, 0.10) 0%, transparent 65%),
+    radial-gradient(circle 550px at 12% 30%, rgba(80, 105, 155, 0.16) 0%, transparent 55%),
+    radial-gradient(circle 450px at 88% 60%, rgba(140, 95, 165, 0.11) 0%, transparent 50%),
+    radial-gradient(circle 600px at 50% 105%, rgba(65, 60, 85, 0.20) 0%, transparent 60%),
+    linear-gradient(180deg, #1E1D23 0%, #18171D 45%, #131218 100%);
+}
+
+/* 2. Liquid Glass Panel — PRIMARY window/card material
+   Key insight from iOS 26: glass is LIGHT and TRANSLUCENT, not dark.
+   The specular top rim highlight is the defining detail. */
+.vision-glass-panel {
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.13) 0%,
+    rgba(255, 255, 255, 0.07) 100%
+  );
+  backdrop-filter: blur(40px) saturate(190%);
+  -webkit-backdrop-filter: blur(40px) saturate(190%);
+  border: 0.5px solid rgba(255, 255, 255, 0.20);
+  border-top-color: rgba(255, 255, 255, 0.35);
+  border-radius: 26px;
+  box-shadow:
+    0 20px 50px -12px rgba(0, 0, 0, 0.55),
+    0 0 0 0.5px rgba(255, 255, 255, 0.10),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.50),
+    inset 0 -0.5px 0 0 rgba(255, 255, 255, 0.06);
+  transition: transform 0.35s var(--spring), box-shadow 0.35s var(--ease-out-expo);
+}
+
+/* 3. Liquid Glass Card — Inner elevated container
+   Lighter than panel, with softer shadows */
+.vision-card {
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.11) 0%,
+    rgba(255, 255, 255, 0.055) 100%
+  );
+  backdrop-filter: blur(30px) saturate(180%);
+  -webkit-backdrop-filter: blur(30px) saturate(180%);
+  border: 0.5px solid rgba(255, 255, 255, 0.18);
+  border-top-color: rgba(255, 255, 255, 0.30);
+  border-radius: 22px;
+  box-shadow:
+    0 10px 25px -6px rgba(0, 0, 0, 0.35),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.35);
+  transition: all 0.3s var(--spring);
+}
+.vision-card:hover {
+  transform: translateY(-1px);
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.14) 0%,
+    rgba(255, 255, 255, 0.08) 100%
+  );
+  border-color: rgba(255, 255, 255, 0.28);
+  box-shadow:
+    0 14px 35px -6px rgba(0, 0, 0, 0.45),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.45);
+}
+
+/* 4. Grouped Inset List — Settings-style container (Image 4) */
+.vision-grouped-list {
+  background: rgba(255, 255, 255, 0.065);
+  backdrop-filter: blur(30px) saturate(170%);
+  -webkit-backdrop-filter: blur(30px) saturate(170%);
+  border: 0.5px solid rgba(255, 255, 255, 0.14);
+  border-top-color: rgba(255, 255, 255, 0.22);
+  border-radius: 22px;
+  overflow: hidden;
+  box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.25);
+}
+
+/* 4b. Recessed Pod — Sunken container for inputs/media (Image 3 & 4) */
+.vision-recessed-pod {
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 0.5px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+  box-shadow:
+    inset 0 1.5px 3px 0 rgba(0, 0, 0, 0.45),
+    0 0.5px 0 0 rgba(255, 255, 255, 0.06);
+}
+
+/* 4c. Segmented Control — Capsule pill switcher (Image 1, 2, 4) */
+.vision-segmented-container {
+  display: flex;
+  align-items: center;
+  padding: 3px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 0.5px solid rgba(255, 255, 255, 0.12);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.20);
+}
+
+.vision-segment-pill {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 7px 10px;
+  border-radius: 9999px;
+  font-size: 11px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.50);
+  transition: all 0.35s var(--spring);
+  cursor: pointer;
+}
+.vision-segment-pill:hover {
+  color: rgba(255, 255, 255, 0.85);
+}
+.vision-segment-pill.active {
+  background: rgba(255, 255, 255, 0.20);
+  color: #FFFFFF;
+  font-weight: 600;
+  box-shadow:
+    0 2px 8px 0 rgba(0, 0, 0, 0.25),
+    0 0 0 0.5px rgba(255, 255, 255, 0.22),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.40);
+}
+
+/* Hairline divider */
+.vision-hairline {
+  height: 0.5px;
+  background: rgba(255, 255, 255, 0.08);
+  margin-left: 3.25rem;
+}
+
+/* 5. Apple Colored Squircle Icon Badge */
+.apple-squircle-badge {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #FFFFFF;
+  flex-shrink: 0;
+  border: 0.5px solid rgba(255, 255, 255, 0.30);
+  box-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.30),
+    inset 0 0.5px 0 rgba(255, 255, 255, 0.50);
+}
+
+/* 6. Button Variants — Liquid Glass interactive pills */
+
+/* White Pill Button (e.g. "Watch" in Image 2) */
+.vision-btn-white {
+  background: #FFFFFF;
+  color: #000000;
+  font-weight: 600;
+  border-radius: 9999px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.30);
+  transition: all 0.25s var(--spring);
+}
+.vision-btn-white:hover {
+  filter: brightness(0.96);
+  transform: scale(1.02);
+}
+.vision-btn-white:active {
+  transform: scale(0.95);
+  filter: brightness(0.92);
+}
+
+/* Apple Blue Primary CTA */
+.vision-btn-blue {
+  background: linear-gradient(180deg, #1A8CFF 0%, #0071E3 100%);
+  color: #FFFFFF;
+  font-weight: 600;
+  border: 0.5px solid rgba(255, 255, 255, 0.30);
+  border-radius: 9999px;
+  box-shadow:
+    0 6px 20px 0 rgba(10, 132, 255, 0.35),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.45);
+  transition: all 0.25s var(--spring);
+}
+.vision-btn-blue:hover {
+  filter: brightness(1.06);
+  box-shadow:
+    0 8px 28px 0 rgba(10, 132, 255, 0.45),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.50);
+}
+.vision-btn-blue:active {
+  transform: scale(0.95);
+  filter: brightness(0.94);
+}
+
+/* Apple Green CTA (FaceTime style, Image 3) */
+.vision-btn-green {
+  background: linear-gradient(180deg, #36D15B 0%, #28B04C 100%);
+  color: #FFFFFF;
+  font-weight: 600;
+  border: 0.5px solid rgba(255, 255, 255, 0.30);
+  border-radius: 9999px;
+  box-shadow:
+    0 6px 20px 0 rgba(52, 199, 89, 0.35),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.45);
+  transition: all 0.25s var(--spring);
+}
+.vision-btn-green:hover {
+  filter: brightness(1.06);
+}
+.vision-btn-green:active {
+  transform: scale(0.95);
+}
+
+/* Apple Gold CTA */
+.vision-btn-gold {
+  background: linear-gradient(180deg, #FFD60A 0%, #E5A800 100%);
+  border: 0.5px solid rgba(255, 255, 255, 0.40);
+  box-shadow:
+    0 6px 20px 0 rgba(255, 214, 10, 0.30),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.55);
+  border-radius: 9999px;
+  color: #000000;
+  font-weight: 700;
+  transition: all 0.25s var(--spring);
+}
+.vision-btn-gold:hover {
+  filter: brightness(1.05);
+}
+.vision-btn-gold:active {
+  transform: scale(0.95);
+}
+
+/* Frosted Glass Pill Button */
+.vision-btn-glass {
+  background: rgba(255, 255, 255, 0.09);
+  backdrop-filter: blur(20px) saturate(170%);
+  -webkit-backdrop-filter: blur(20px) saturate(170%);
+  border: 0.5px solid rgba(255, 255, 255, 0.16);
+  border-radius: 9999px;
+  box-shadow:
+    0 3px 10px 0 rgba(0, 0, 0, 0.20),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.22);
+  transition: all 0.25s var(--spring);
+}
+.vision-btn-glass:hover {
+  background: rgba(255, 255, 255, 0.15);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+.vision-btn-glass:active {
+  transform: scale(0.95);
+}
+
+/* 7. Floating Dock Capsule — Bottom navigation (Image 1, 2, 3) */
+.vision-dock {
+  background: rgba(255, 255, 255, 0.10);
+  backdrop-filter: blur(50px) saturate(200%);
+  -webkit-backdrop-filter: blur(50px) saturate(200%);
+  border: 0.5px solid rgba(255, 255, 255, 0.22);
+  border-top-color: rgba(255, 255, 255, 0.35);
+  border-radius: 9999px;
+  box-shadow:
+    0 20px 50px -10px rgba(0, 0, 0, 0.70),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.40);
+}
+
+/* 8. Search Pill (Image 1, 2, 4) */
+.vision-search-pill {
+  background: rgba(255, 255, 255, 0.07);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 0.5px solid rgba(255, 255, 255, 0.14);
+  border-radius: 9999px;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.15);
+  transition: all 0.3s var(--ease-out-expo);
+}
+.vision-search-pill:focus-within {
+  background: rgba(255, 255, 255, 0.11);
+  border-color: rgba(10, 132, 255, 0.55);
+  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.18), inset 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+
+/* 9. Apple Intelligence Chromatic Shimmer Card */
+.vision-intelligence-card {
+  position: relative;
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(40px) saturate(200%);
+  -webkit-backdrop-filter: blur(40px) saturate(200%);
+  border-radius: 26px;
+  overflow: hidden;
+  box-shadow:
+    0 20px 50px rgba(0, 0, 0, 0.50),
+    inset 0 0.5px 0 rgba(255, 255, 255, 0.40);
+}
+.vision-intelligence-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 26px;
+  padding: 1px;
+  background: linear-gradient(
+    135deg,
+    rgba(10, 132, 255, 0.65),
+    rgba(191, 90, 242, 0.65),
+    rgba(255, 214, 10, 0.65),
+    rgba(52, 199, 89, 0.65)
+  );
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  animation: chromatic-rotate 8s linear infinite;
+}
+
+/* 10. Form Controls */
+.vision-input {
+  width: 100%;
+  padding: 0.65rem 0.9rem;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 0.5px solid rgba(255, 255, 255, 0.14);
+  color: #FFFFFF;
+  font-size: 0.8125rem;
+  transition: all 0.25s var(--ease-out-expo);
+}
+.vision-input:focus {
+  outline: none;
+  background: rgba(255, 255, 255, 0.10);
+  border-color: rgba(10, 132, 255, 0.7);
+  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.18);
+}
+
+.vision-select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='rgba(255,255,255,0.6)'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.85rem center;
+  background-size: 1rem;
+}
+
+/* ==========================================================================
+   iOS 26 LIQUID GLASS SPRING ANIMATIONS
+   Based on Apple's interruptible spring physics model
+   ========================================================================== */
+
+/* Modal sheet slide-up with spring overshoot */
+@keyframes slideUpSpring {
+  0% {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  60% {
+    transform: translateY(-2%);
+    opacity: 1;
+  }
+  80% {
+    transform: translateY(0.5%);
+  }
+  100% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+/* Card entrance — fade + rise */
+@keyframes fadeInUp {
+  0% {
+    opacity: 0;
+    transform: translateY(16px) scale(0.97);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Button/pill scale-in entrance */
+@keyframes scaleIn {
+  0% {
+    opacity: 0;
+    transform: scale(0.85);
+  }
+  60% {
+    transform: scale(1.03);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Chromatic border rotation for intelligence card */
+@keyframes chromatic-rotate {
+  0% {
+    filter: hue-rotate(0deg);
+  }
+  100% {
+    filter: hue-rotate(360deg);
+  }
+}
+
+/* Gentle glass shimmer sweep */
+@keyframes glassShimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+/* Status indicator pulse with soft glow */
+@keyframes pulseGlow {
+  0%, 100% {
+    opacity: 1;
+    box-shadow: 0 0 4px currentColor;
+  }
+  50% {
+    opacity: 0.6;
+    box-shadow: 0 0 10px currentColor;
+  }
+}
+
+/* Fade-in only */
+@keyframes fadeIn {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+/* Animation utility classes */
+.animate-slide-up {
+  animation: slideUpSpring 0.55s var(--ease-out-expo) forwards;
+}
+
+.animate-fade-up {
+  animation: fadeInUp 0.45s var(--ease-out-expo) both;
+}
+
+.animate-scale-in {
+  animation: scaleIn 0.35s var(--spring) both;
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.3s ease-out both;
+}
+
+/* Stagger delay utilities for entrance animations */
+.stagger-1 { animation-delay: 0.03s; }
+.stagger-2 { animation-delay: 0.06s; }
+.stagger-3 { animation-delay: 0.09s; }
+.stagger-4 { animation-delay: 0.12s; }
+.stagger-5 { animation-delay: 0.15s; }
+.stagger-6 { animation-delay: 0.18s; }
+.stagger-7 { animation-delay: 0.21s; }
+.stagger-8 { animation-delay: 0.24s; }
+
+/* Liquid Glass shimmer for premium cards */
+.liquid-glass-shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    105deg,
+    transparent 30%,
+    rgba(255, 255, 255, 0.06) 45%,
+    rgba(255, 255, 255, 0.12) 50%,
+    rgba(255, 255, 255, 0.06) 55%,
+    transparent 70%
+  );
+  background-size: 200% 100%;
+  animation: glassShimmer 6s ease-in-out infinite;
+  pointer-events: none;
+}
+
+/* ==========================================================================
+   BACKWARD COMPATIBILITY ALIASES
+   ========================================================================== */
+
+.liquid-pod {
+  background: rgba(255, 255, 255, 0.10);
+  backdrop-filter: blur(40px) saturate(190%);
+  -webkit-backdrop-filter: blur(40px) saturate(190%);
+  border: 0.5px solid rgba(255, 255, 255, 0.18);
+  border-radius: 26px;
+  box-shadow:
+    0 18px 45px -10px rgba(0, 0, 0, 0.50),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.35);
+  transition: transform 0.35s var(--spring), box-shadow 0.35s var(--ease-out-expo);
+}
+.liquid-pill {
+  background: rgba(255, 255, 255, 0.09);
+  backdrop-filter: blur(20px) saturate(170%);
+  -webkit-backdrop-filter: blur(20px) saturate(170%);
+  border: 0.5px solid rgba(255, 255, 255, 0.16);
+  border-radius: 9999px;
+  box-shadow:
+    0 3px 10px 0 rgba(0, 0, 0, 0.20),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.22);
+  transition: all 0.25s var(--spring);
+}
+.apple-cta-blue {
+  background: linear-gradient(180deg, #1A8CFF 0%, #0071E3 100%);
+  border: 0.5px solid rgba(255, 255, 255, 0.30);
+  box-shadow:
+    0 6px 20px 0 rgba(10, 132, 255, 0.35),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.45);
+  border-radius: 9999px;
+  color: #FFFFFF;
+  font-weight: 600;
+  transition: all 0.25s var(--spring);
+}
+.apple-cta-gold {
+  background: linear-gradient(180deg, #FFD60A 0%, #E5A800 100%);
+  border: 0.5px solid rgba(255, 255, 255, 0.40);
+  box-shadow:
+    0 6px 20px 0 rgba(255, 214, 10, 0.30),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.55);
+  border-radius: 9999px;
+  color: #000000;
+  font-weight: 700;
+  transition: all 0.25s var(--spring);
+}
+.apple-grouped-list {
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(30px) saturate(170%);
+  -webkit-backdrop-filter: blur(30px) saturate(170%);
+  border: 0.5px solid rgba(255, 255, 255, 0.14);
+  border-radius: 22px;
+  overflow: hidden;
+}
+.apple-hairline-divider {
+  height: 0.5px;
+  background: rgba(255, 255, 255, 0.08);
+  margin-left: 3.5rem;
+}
+.apple-floating-nav {
+  background: rgba(255, 255, 255, 0.10);
+  backdrop-filter: blur(50px) saturate(200%);
+  -webkit-backdrop-filter: blur(50px) saturate(200%);
+  border: 0.5px solid rgba(255, 255, 255, 0.22);
+  border-radius: 9999px;
+  box-shadow:
+    0 20px 50px -10px rgba(0, 0, 0, 0.70),
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.40);
+}
+.apple-intelligence-card {
+  position: relative;
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(40px) saturate(200%);
+  -webkit-backdrop-filter: blur(40px) saturate(200%);
+  border-radius: 26px;
+  overflow: hidden;
+  box-shadow:
+    0 20px 50px rgba(0, 0, 0, 0.50),
+    inset 0 0.5px 0 rgba(255, 255, 255, 0.40);
+}
+.apple-intelligence-aurora {
+  position: absolute;
+  top: -25%;
+  left: -20%;
+  width: 140%;
+  height: 140%;
+  background:
+    radial-gradient(circle at 30% 20%, rgba(10, 132, 255, 0.12) 0%, transparent 45%),
+    radial-gradient(circle at 75% 25%, rgba(191, 90, 242, 0.10) 0%, transparent 45%),
+    radial-gradient(circle at 25% 80%, rgba(48, 209, 88, 0.08) 0%, transparent 45%),
+    radial-gradient(circle at 70% 70%, rgba(255, 159, 10, 0.08) 0%, transparent 45%);
+  filter: blur(85px) saturate(180%);
+  pointer-events: none;
+  z-index: 0;
+  animation: auroraFlow 24s ease-in-out infinite alternate;
+}
+
+@keyframes auroraFlow {
+  0% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(-3%, 2%) scale(1.05); }
+  100% { transform: translate(2%, -2%) scale(0.98); }
+}
+
+/* Soundwave animations for active audio */
+@keyframes soundwave {
+  0%, 100% { height: 4px; }
+  50% { height: 14px; }
+}
+.soundwave-bar {
+  animation: soundwave 0.8s ease-in-out infinite;
+}
+.soundwave-bar:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.soundwave-bar:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+/* Ken Burns cinematic image motion */
+@keyframes kenburns {
+  0% { transform: scale(1.0) translate(0, 0); }
+  50% { transform: scale(1.12) translate(-1.5%, -1.5%); }
+  100% { transform: scale(1.0) translate(0, 0); }
+}
+.ken-burns {
+  animation: kenburns 16s ease-in-out infinite alternate;
+}
+
+/* ==========================================================================
+   ACCESSIBILITY: Respect reduced motion preferences
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .ken-burns,
+  .soundwave-bar,
+  .apple-intelligence-aurora,
+  .animate-slide-up,
+  .animate-fade-up,
+  .animate-scale-in,
+  .animate-fade-in,
+  .liquid-glass-shimmer::after,
+  .vision-intelligence-card::before {
+    animation: none !important;
+  }
+
+  .vision-glass-panel,
+  .vision-card,
+  .vision-btn-white,
+  .vision-btn-blue,
+  .vision-btn-green,
+  .vision-btn-gold,
+  .vision-btn-glass,
+  .vision-segment-pill,
+  .vision-search-pill {
+    transition-duration: 0.01ms !important;
+  }
+}

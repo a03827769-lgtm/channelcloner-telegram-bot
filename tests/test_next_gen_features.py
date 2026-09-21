@@ -13,19 +13,22 @@ from services.disaster_recovery import disaster_recovery_service
 class TestNextGenFeatures(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
-        self.test_db_path = "test_next_gen.db"
-        if os.path.exists(self.test_db_path):
-            os.remove(self.test_db_path)
+        import tempfile
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_db_path = os.path.join(self.temp_dir.name, "test_next_gen.db")
         self.db = DatabaseManager(self.test_db_path)
         await self.db.init_db()
         await self.db.get_or_create_user(12345, "Test User", "testuser", is_admin=True)
 
     async def asyncTearDown(self):
-        if os.path.exists(self.test_db_path):
-            try:
-                os.remove(self.test_db_path)
-            except Exception:
-                pass
+        try:
+            await self.db.close()
+        except Exception:
+            pass
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
 
     async def test_ai_paraphraser_formal(self):
         raw = "Salom hammaga! Bugun yangi qonun qabul qilindi. Tafsilotlar tez orada."
@@ -59,9 +62,9 @@ class TestNextGenFeatures(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(cta_buttons), 2)
         self.assertIn("Uzum", cta_buttons[0][0])
-        self.assertIn("ref=myref123", cta_buttons[0][1])
+        self.assertIn("p=myref123", cta_buttons[0][1])
         self.assertIn("AliExpress", cta_buttons[1][0])
-        self.assertIn("ref=aliref456", cta_buttons[1][1])
+        self.assertIn("aff_id=aliref456", cta_buttons[1][1])
 
         kb = dynamic_affiliate_engine.build_cta_keyboard(cta_buttons)
         self.assertIsNotNone(kb)

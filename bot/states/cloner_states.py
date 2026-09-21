@@ -22,5 +22,3 @@ class AuthSG(StatesGroup):
     waiting_for_code = State()
     waiting_for_2fa = State()
 
-class AdminSG(StatesGroup):
-    waiting_for_broadcast_text = State()

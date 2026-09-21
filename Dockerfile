@@ -53,10 +53,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy virtual environment from builder stage
 COPY --from=builder /opt/venv /opt/venv
 
+# Install Playwright Chromium headless engine and system dependencies
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN /opt/venv/bin/playwright install --with-deps chromium && \
+    mkdir -p /ms-playwright && \
+    chmod -R 777 /ms-playwright
+
+# Configure jemalloc for optimal memory fragmentation management (supports x86_64 and arm64)
+RUN mkdir -p /usr/local/lib && \
+    JEMALLOC_PATH=$(find /usr/lib -name "libjemalloc.so.2" 2>/dev/null | head -n 1) && \
+    if [ -n "$JEMALLOC_PATH" ]; then ln -sf "$JEMALLOC_PATH" /usr/local/lib/libjemalloc.so.2; fi
+ENV LD_PRELOAD=/usr/local/lib/libjemalloc.so.2
+
 # Create non-root application user
 RUN useradd -m -u 1000 -s /bin/bash appuser && \
-    mkdir -p /app/database /app/temp_media && \
-    chown -R appuser:appuser /app
+    mkdir -p /app/data /app/database /app/temp_media /app/assets && \
+    chown -R appuser:appuser /app /ms-playwright
 
 # Copy application source code
 COPY --chown=appuser:appuser config/ ./config/
@@ -64,13 +76,16 @@ COPY --chown=appuser:appuser database/ ./database/
 COPY --chown=appuser:appuser services/ ./services/
 COPY --chown=appuser:appuser bot/ ./bot/
 COPY --chown=appuser:appuser admin_bot/ ./admin_bot/
+COPY --chown=appuser:appuser deploy/ ./deploy/
+COPY --chown=appuser:appuser assets/ ./assets/
+COPY --chown=appuser:appuser scripts/ ./scripts/
 COPY --chown=appuser:appuser run.py setup_wizard.py ./
 
 # Expose HTTP healthcheck port
 EXPOSE 8080
 
 # Native Docker Healthcheck probe
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=15s --timeout=10s --start-period=60s --retries=5 \
     CMD curl -f http://127.0.0.1:${PORT:-8080}/health || exit 1
 
 # Switch to non-root user

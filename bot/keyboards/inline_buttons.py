@@ -1,4 +1,5 @@
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
+from config.settings import settings
 from database.models import ChannelPair
 from typing import List, Optional
 from services.custom_emojis import (
@@ -6,21 +7,57 @@ from services.custom_emojis import (
     ID_KEY, ID_SUCCESS, ID_ERROR, ID_WARN, ID_HOME, ID_BACK, ID_BROADCAST, ID_BACKUP,
     ID_LOGOUT, ID_TRASH, ID_CLEAN, ID_TRANSLATE, ID_IMAGE, ID_MONEY,
     ID_LOCK_UNLOCKED, ID_LOCK_LOCKED, ID_SIGNATURE, ID_DOCUMENT, ID_SPARKLE,
-    ID_HISTORY_CLOCK, ID_SERVER_CPU, ID_FLASH
+    ID_HISTORY_CLOCK, ID_SERVER_CPU, ID_FLASH,
+    ID_FLAG_UZ, ID_FLAG_RU, ID_FLAG_EN, ID_FLAG_TR, ID_SETTINGS, ID_FORWARD
 )
 
-def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Persistent bottom Reply Keyboard menu with modern Bot API 9.4 styles and custom emojis"""
+from pathlib import Path
+import logging
+logger = logging.getLogger(__name__)
+
+def get_active_webapp_url() -> str:
+    """Reads live HTTPS Cloudflare tunnel URL or falls back to settings.WEBAPP_URL safely"""
+    import os
+    from time import time
+    base_url = ""
+    
+    # 1. First priority: explicit WEBAPP_URL environment variable (permanent domain)
+    env_url = os.getenv("WEBAPP_URL", "").strip()
+    if env_url.startswith("https://") and len(env_url) > len("https://"):
+        base_url = env_url
+    
+    # 2. Second priority: active_tunnel_url.txt file (dynamic tunnel URL)
+    if not base_url:
+        url_file = Path("data/active_tunnel_url.txt")
+        if url_file.exists():
+            try:
+                url = url_file.read_text(encoding="utf-8").strip()
+                if url.startswith("https://") and len(url) > len("https://"):
+                    base_url = url
+            except Exception:
+                logger.debug("Ignored exception", exc_info=True)
+    
+    # 3. Third priority: settings.WEBAPP_URL
+    if not base_url:
+        base_url = getattr(settings, "WEBAPP_URL", "")
+        
+    if base_url and len(base_url) > len("https://"):
+        return base_url.strip().rstrip('/')
+    return ""
+
+def get_main_reply_keyboard(is_admin: bool = False, *args, **kwargs) -> ReplyKeyboardMarkup:
+    """Persistent bottom Reply Keyboard menu with modern Bot API 9.4 styles and custom animated emojis"""
     buttons = [
         [
             KeyboardButton(text="Kanal Kloner", style="primary", icon_custom_emoji_id=ID_REFRESH),
             KeyboardButton(text="Yangi Kanal", style="success", icon_custom_emoji_id=ID_ROCKET)
         ],
         [
-            KeyboardButton(text="Tariflar & Obuna", style="success", icon_custom_emoji_id=ID_STARS),
+            KeyboardButton(text="Istoriya Kloner (VIP)", style="success", icon_custom_emoji_id=ID_FLASH),
             KeyboardButton(text="Mening Statistikam", style="primary", icon_custom_emoji_id=ID_STATS)
         ],
         [
+            KeyboardButton(text="Tariflar & Obuna", style="primary", icon_custom_emoji_id=ID_CROWN),
             KeyboardButton(text="Qo'llanma", style="primary", icon_custom_emoji_id=ID_BOOK)
         ]
     ]
@@ -30,21 +67,28 @@ def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
         is_persistent=True
     )
 
-def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Main dashboard inline keyboard with Bot API 9.4 styles and custom emojis"""
+def get_main_menu_keyboard(is_admin: bool = False, *args, **kwargs) -> InlineKeyboardMarkup:
+    """Main dashboard inline keyboard with Bot API 9.4 styles and custom animated emojis"""
+    admin_flag = is_admin or kwargs.get("is_admin", False)
+
     keyboard = [
         [
-            InlineKeyboardButton(text="Tezkor Boshlash (Qo'llanma)", callback_data="menu_quickstart", style="primary", icon_custom_emoji_id=ID_ROCKET)
+            InlineKeyboardButton(text="Tezkor Boshlash", callback_data="menu_quickstart", style="primary", icon_custom_emoji_id=ID_ROCKET),
+            InlineKeyboardButton(text="Istoriya Kloner (VIP)", callback_data="story_main_menu", style="success", icon_custom_emoji_id=ID_FLASH)
         ],
         [
             InlineKeyboardButton(text="Kanal Kloner", callback_data="menu_cloner", style="primary", icon_custom_emoji_id=ID_REFRESH),
-            InlineKeyboardButton(text="Tariflar & Obuna", callback_data="menu_stars", style="success", icon_custom_emoji_id=ID_STARS)
+            InlineKeyboardButton(text="Tariflar & Obuna", callback_data="menu_stars", style="success", icon_custom_emoji_id=ID_CROWN)
         ],
         [
             InlineKeyboardButton(text="Mening Statistikam", callback_data="menu_stats", style="primary", icon_custom_emoji_id=ID_STATS),
             InlineKeyboardButton(text="Qo'llanma", callback_data="menu_guide", style="primary", icon_custom_emoji_id=ID_BOOK)
         ]
     ]
+    if admin_flag:
+        keyboard.append([
+            InlineKeyboardButton(text="Admin Paneli", callback_data="menu_admin", style="danger", icon_custom_emoji_id=ID_SETTINGS)
+        ])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def get_quickstart_keyboard() -> InlineKeyboardMarkup:
@@ -70,9 +114,16 @@ def get_cloner_menu_keyboard(has_pairs: bool = False) -> InlineKeyboardMarkup:
     ])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-def get_pairs_list_keyboard(pairs: List[ChannelPair]) -> InlineKeyboardMarkup:
+def get_pairs_list_keyboard(pairs: List[ChannelPair], page: int = 0, page_size: int = 6) -> InlineKeyboardMarkup:
     keyboard = []
-    for idx, pair in enumerate(pairs, 1):
+    total = len(pairs)
+    total_pages = (total + page_size - 1) // page_size if total > 0 else 1
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * page_size
+    page_pairs = pairs[start_idx : start_idx + page_size]
+
+    for idx, pair in enumerate(page_pairs, start=start_idx + 1):
         pair_style = "success" if pair.is_active else "danger"
         pair_icon = ID_SUCCESS if pair.is_active else ID_ERROR
         src_label = pair.source_title or pair.source_channel
@@ -81,7 +132,16 @@ def get_pairs_list_keyboard(pairs: List[ChannelPair]) -> InlineKeyboardMarkup:
         keyboard.append([
             InlineKeyboardButton(text=button_text, callback_data=f"pair_view_{pair.id}", style=pair_style, icon_custom_emoji_id=pair_icon)
         ])
-    
+
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(text="Oldingi", callback_data=f"cloner_pairs_page_{page - 1}", style="primary", icon_custom_emoji_id=ID_BACK))
+        nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop", style="primary", icon_custom_emoji_id=ID_DOCUMENT))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton(text="Keyingi", callback_data=f"cloner_pairs_page_{page + 1}", style="primary", icon_custom_emoji_id=ID_FORWARD))
+        keyboard.append(nav_row)
+
     keyboard.append([
         InlineKeyboardButton(text="Yangi Kanal", callback_data="cloner_add_pair", style="success", icon_custom_emoji_id=ID_ROCKET),
         InlineKeyboardButton(text="Orqaga", callback_data="menu_cloner", style="danger", icon_custom_emoji_id=ID_BACK)
@@ -165,18 +225,23 @@ def get_pair_detail_keyboard(pair: ChannelPair) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-def get_translate_lang_keyboard(pair_id: int) -> InlineKeyboardMarkup:
+def get_translate_lang_keyboard(pair_id: int, current_lang: Optional[str] = None) -> InlineKeyboardMarkup:
+    def mark(lang_code: str, label: str) -> str:
+        if current_lang and current_lang.lower() == lang_code.lower():
+            return f"{label} [Faol]"
+        return label
+
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="O'zbekcha (UZ)", callback_data=f"trans_set_{pair_id}_uz", style="success", icon_custom_emoji_id=ID_TRANSLATE),
-            InlineKeyboardButton(text="Русский (RU)", callback_data=f"trans_set_{pair_id}_ru", style="primary", icon_custom_emoji_id=ID_TRANSLATE)
+            InlineKeyboardButton(text=mark("uz", "O'zbekcha (UZ)"), callback_data=f"trans_set_{pair_id}_uz", style="primary", icon_custom_emoji_id=ID_FLAG_UZ),
+            InlineKeyboardButton(text=mark("ru", "Русский (RU)"), callback_data=f"trans_set_{pair_id}_ru", style="primary", icon_custom_emoji_id=ID_FLAG_RU)
         ],
         [
-            InlineKeyboardButton(text="English (EN)", callback_data=f"trans_set_{pair_id}_en", style="primary", icon_custom_emoji_id=ID_TRANSLATE),
-            InlineKeyboardButton(text="Türkçe (TR)", callback_data=f"trans_set_{pair_id}_tr", style="primary", icon_custom_emoji_id=ID_TRANSLATE)
+            InlineKeyboardButton(text=mark("en", "English (EN)"), callback_data=f"trans_set_{pair_id}_en", style="primary", icon_custom_emoji_id=ID_FLAG_EN),
+            InlineKeyboardButton(text=mark("tr", "Türkçe (TR)"), callback_data=f"trans_set_{pair_id}_tr", style="primary", icon_custom_emoji_id=ID_FLAG_TR)
         ],
         [
-            InlineKeyboardButton(text="Tarjimani O'chirish", callback_data=f"trans_set_{pair_id}_off", style="danger", icon_custom_emoji_id=ID_ERROR)
+            InlineKeyboardButton(text=mark("off", "Tarjimani O'chirish"), callback_data=f"trans_set_{pair_id}_off", style="danger", icon_custom_emoji_id=ID_ERROR)
         ],
         [
             InlineKeyboardButton(text="Orqaga", callback_data=f"pair_view_{pair_id}", style="danger", icon_custom_emoji_id=ID_BACK)
@@ -204,7 +269,7 @@ def get_history_count_keyboard(pair_id: int) -> InlineKeyboardMarkup:
 def get_history_progress_keyboard(pair_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="⛔ Ko'chirishni To'xtatish", callback_data=f"hist_cancel_{pair_id}", style="danger", icon_custom_emoji_id=ID_ERROR)
+            InlineKeyboardButton(text="Ko'chirishni To'xtatish", callback_data=f"hist_cancel_{pair_id}", style="danger", icon_custom_emoji_id=ID_ERROR)
         ]
     ])
 
@@ -231,21 +296,30 @@ def get_video_watermark_keyboard(pair_id: int, pair: ChannelPair) -> InlineKeybo
     status_btn_style = "danger" if pair.video_watermark_type != "none" else "success"
     status_btn_icon = ID_ERROR if pair.video_watermark_type != "none" else ID_SUCCESS
     
+    def _vpos_btn(pos: str, label: str):
+        is_sel = (pair.video_watermark_pos == pos)
+        return InlineKeyboardButton(
+            text=f"{label} [Faol]" if is_sel else label,
+            callback_data=f"vwm_pos_{pair_id}_{pos}",
+            style="success" if is_sel else "primary",
+            icon_custom_emoji_id=ID_SUCCESS if is_sel else ID_DOCUMENT
+        )
+
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text=status_btn_text, callback_data=f"vwm_toggle_{pair_id}", style=status_btn_style, icon_custom_emoji_id=status_btn_icon),
             InlineKeyboardButton(text="Matnni O'zgartirish", callback_data=f"vwm_set_text_{pair_id}", style="primary", icon_custom_emoji_id=ID_SIGNATURE)
         ],
         [
-            InlineKeyboardButton(text="Pastki O'ng", callback_data=f"vwm_pos_{pair_id}_bottom_right", style="primary", icon_custom_emoji_id=ID_DOCUMENT),
-            InlineKeyboardButton(text="Pastki Chap", callback_data=f"vwm_pos_{pair_id}_bottom_left", style="primary", icon_custom_emoji_id=ID_DOCUMENT)
+            _vpos_btn("bottom_right", "Pastki O'ng"),
+            _vpos_btn("bottom_left", "Pastki Chap")
         ],
         [
-            InlineKeyboardButton(text="Yuqori O'ng", callback_data=f"vwm_pos_{pair_id}_top_right", style="primary", icon_custom_emoji_id=ID_DOCUMENT),
-            InlineKeyboardButton(text="Yuqori Chap", callback_data=f"vwm_pos_{pair_id}_top_left", style="primary", icon_custom_emoji_id=ID_DOCUMENT)
+            _vpos_btn("top_right", "Yuqori O'ng"),
+            _vpos_btn("top_left", "Yuqori Chap")
         ],
         [
-            InlineKeyboardButton(text="Markaz (Center)", callback_data=f"vwm_pos_{pair_id}_center", style="primary", icon_custom_emoji_id=ID_DOCUMENT)
+            _vpos_btn("center", "Markaz (Center)")
         ],
         [
             InlineKeyboardButton(text="Orqaga", callback_data=f"pair_view_{pair_id}", style="danger", icon_custom_emoji_id=ID_BACK)

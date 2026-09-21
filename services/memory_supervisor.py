@@ -22,15 +22,23 @@ class SystemSupervisor:
         self._tasks = []
         self._libc = None
         if sys.platform != "win32":
-            try:
-                self._libc = ctypes.CDLL("libc.so.6")
-            except Exception:
-                pass
+            for lib_name in ["libc.so.6", "libc.musl-x86_64.so.1", "libc.musl-aarch64.so.1", "libc.so"]:
+                try:
+                    self._libc = ctypes.CDLL(lib_name)
+                    if hasattr(self._libc, "malloc_trim"):
+                        break
+                except Exception:
+                    continue
 
     def start(self):
+        if self._is_running:
+            logger.debug("SystemSupervisor is already running.")
+            return
         self._is_running = True
-        self._tasks.append(asyncio.create_task(self._memory_loop()))
-        self._tasks.append(asyncio.create_task(self._lag_monitor_loop()))
+        self._tasks = [
+            asyncio.create_task(self._memory_loop()),
+            asyncio.create_task(self._lag_monitor_loop())
+        ]
         logger.info("24/7 System Supervisor started (Event loop lag watchdog + Memory trimmer).")
 
     def stop(self):
@@ -38,12 +46,13 @@ class SystemSupervisor:
         for t in self._tasks:
             if not t.done():
                 t.cancel()
+        self._tasks.clear()
 
     async def _memory_loop(self):
         try:
             gc.set_threshold(50000, 10, 10)
         except Exception:
-            pass
+            logger.debug("Ignored exception", exc_info=True)
         while self._is_running:
             try:
                 await asyncio.sleep(self.memory_interval)
@@ -53,7 +62,12 @@ class SystemSupervisor:
                     try:
                         trimmed = self._libc.malloc_trim(0)
                     except Exception:
-                        pass
+                        logger.debug("Ignored exception", exc_info=True)
+                try:
+                    from services.rate_limiter import rate_limiter
+                    await rate_limiter.prune_stale_locks()
+                except Exception:
+                    logger.debug("Ignored exception", exc_info=True)
                 logger.debug(f"Memory optimization executed: {collected} cyclic objects freed, malloc_trim: {trimmed}")
             except asyncio.CancelledError:
                 break

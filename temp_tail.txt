@@ -1,0 +1,37 @@
+            feed.map((item, idx) => (
+              <div key={item.id || idx} className="flex items-start gap-3 p-3 rounded-2xl bg-white/5 text-[13px]">
+                <div className="w-8 h-8 rounded-[10px] bg-emerald-500/20 flex items-center justify-center shrink-0 shadow-[inset_0_1px_1px_rgba(48,209,88,0.3)]">
+                  <CheckCircle2 size={16} className="text-emerald-400" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-white/90 truncate mr-2">
+                      {item.media_type === 'story' ? 'VIP Istoriya Ko\'chirildi' : 'Xabar Ko\'chirildi'}
+                    </span>
+                    <span className="text-[10px] text-white/40 whitespace-nowrap">
+                      {new Date(item.cloned_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-white/40 truncate mt-0.5">
+                    {item.cp_src} &rarr; {item.cp_tgt}
+                  </p>
+                  <div className="flex items-center gap-2 mt-1.5">
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-ios-blue/20 text-ios-blue">
+                      O'tib ketdi
+                    </span>
+                    {item.media_type && item.media_type !== 'text' && (
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-purple-500/20 text-purple-300">
+                        {item.media_type}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+      
+    </div>
+  );
+};

@@ -15,11 +15,8 @@ class TestSecurityAndAccessControl(unittest.IsolatedAsyncioTestCase):
         await self.db.init_db()
 
     async def asyncTearDown(self):
-        if os.path.exists(self.test_db_path):
-            try:
-                os.remove(self.test_db_path)
-            except Exception:
-                pass
+        from tests.test_utils import safe_cleanup_db
+        await safe_cleanup_db(self.test_db_path, self.db)
 
     async def test_is_admin_user(self):
         self.assertTrue(is_admin_user(8881989487))
@@ -49,6 +46,17 @@ class TestSecurityAndAccessControl(unittest.IsolatedAsyncioTestCase):
         user_qs_kb = get_quickstart_keyboard()
         user_qs_btns = [btn.text for row in user_qs_kb.inline_keyboard for btn in row]
         self.assertNotIn("1. Telegram Akkauntni Ulash", user_qs_btns)
+
+        # 4. Even when is_admin=True is passed, public bot keyboards never include admin panel (moved to Admin Bot)
+        admin_reply_kb = get_main_reply_keyboard(is_admin=True)
+        admin_buttons = [btn.text for row in admin_reply_kb.keyboard for btn in row]
+        self.assertNotIn("👑 Boshqaruv Paneli", admin_buttons)
+        self.assertNotIn("Admin Panel", admin_buttons)
+
+        admin_inline_kb = get_main_menu_keyboard(is_admin=True)
+        admin_inline_btns = [btn.text for row in admin_inline_kb.inline_keyboard for btn in row]
+        self.assertNotIn("Super Admin Paneli", admin_inline_btns)
+        self.assertNotIn("Admin Panel", admin_inline_btns)
 
     async def test_user_db_admin_sync(self):
         # Register regular user

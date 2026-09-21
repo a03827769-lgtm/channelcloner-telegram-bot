@@ -16,9 +16,9 @@ from services.cloner_engine import cloner_engine
 
 class TestTierRestrictionsAndAdminGrant(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.test_db_path = "database/test_tier_admin_cloner.db"
-        if os.path.exists(self.test_db_path):
-            os.remove(self.test_db_path)
+        import uuid
+        self.test_db_path = f"database/test_tier_{uuid.uuid4().hex[:8]}.db"
+        os.makedirs("database", exist_ok=True)
 
         self.db = DatabaseManager(db_path=self.test_db_path)
         await self.db.init_db()
@@ -65,8 +65,8 @@ class TestTierRestrictionsAndAdminGrant(unittest.IsolatedAsyncioTestCase):
         self.db_patcher.stop()
         self.db_patcher_admin.stop()
         self.db_patcher_engine.stop()
-        if os.path.exists(self.test_db_path):
-            os.remove(self.test_db_path)
+        from tests.test_utils import safe_cleanup_db
+        await safe_cleanup_db(self.test_db_path, self.db)
 
     def _create_mock_callback(self, user_id: int, data: str):
         cb = AsyncMock(spec=CallbackQuery)
@@ -104,7 +104,7 @@ class TestTierRestrictionsAndAdminGrant(unittest.IsolatedAsyncioTestCase):
 
         cb_toggle = self._create_mock_callback(self.free_user_id, f"vwm_toggle_{self.free_pair_id}")
         await settings_menu_mod.cb_vwm_toggle(cb_toggle)
-        cb_toggle.answer.assert_called_with(text="🔒 Video Watermark faqat PRO va VIP tariflarida mavjud! 'Tariflar & Obuna' bo'limidan faollashtiring.", show_alert=True)
+        cb_toggle.answer.assert_called_with(text="Video Watermark faqat PRO va VIP tariflarida mavjud! 'Tariflar & Obuna' bo'limidan faollashtiring.", show_alert=True)
 
     async def test_free_user_ai_paraphraser_blocked(self):
         """Free user opening AI menu sees upgrade paywall, setting mode gives alert"""
@@ -116,7 +116,7 @@ class TestTierRestrictionsAndAdminGrant(unittest.IsolatedAsyncioTestCase):
 
         cb_set = self._create_mock_callback(self.free_user_id, f"ai_set_{self.free_pair_id}_hype")
         await settings_menu_mod.cb_ai_set(cb_set)
-        cb_set.answer.assert_called_with(text="🔒 AI Content Paraphraser faqat PRO va VIP tariflarida mavjud! 'Tariflar & Obuna' bo'limidan faollashtiring.", show_alert=True)
+        cb_set.answer.assert_called_with(text="AI Content Paraphraser faqat PRO va VIP tariflarida mavjud! 'Tariflar & Obuna' bo'limidan faollashtiring.", show_alert=True)
 
     async def test_pro_user_can_access_video_watermark_and_ai(self):
         """Pro user can open vwm & ai menus and toggle modes without blocks"""
@@ -127,7 +127,7 @@ class TestTierRestrictionsAndAdminGrant(unittest.IsolatedAsyncioTestCase):
 
         cb_vwm_toggle = self._create_mock_callback(self.pro_user_id, f"vwm_toggle_{self.pro_pair_id}")
         await settings_menu_mod.cb_vwm_toggle(cb_vwm_toggle)
-        cb_vwm_toggle.message.edit_reply_markup.assert_called_once()
+        cb_vwm_toggle.message.edit_text.assert_called_once()
 
         cb_ai_set = self._create_mock_callback(self.pro_user_id, f"ai_set_{self.pro_pair_id}_hype")
         await settings_menu_mod.cb_ai_set(cb_ai_set)

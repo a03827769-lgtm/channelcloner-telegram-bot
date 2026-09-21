@@ -1,0 +1,108 @@
+# ============================================================
+# ChannelCloner Pro — Telegram Mini App Docker Stack
+# PHP 8.3-FPM + MySQL 8.0 + Nginx
+# ============================================================
+
+version: '3.8'
+
+services:
+  # ── 1. MySQL 8.0 Enterprise Relational Database ──────────────
+  mysql:
+    image: mysql:8.0
+    container_name: channelcloner_mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-cloner_root_pass_2026}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-channelcloner}
+      MYSQL_USER: ${MYSQL_USER:-cloner_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-cloner_pass_2026}
+    ports:
+      - "${MYSQL_PORT:-3307}:3306"
+    volumes:
+      - cloner_mysql_data:/var/lib/mysql
+      - ./miniapp/sql/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./miniapp/sql/seed_data.sql:/docker-entrypoint-initdb.d/02_seed.sql:ro
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max_connections=200
+      --innodb_buffer_pool_size=256M
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-cloner_root_pass_2026}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - channelcloner_net
+
+  # ── 2. PHP 8.3-FPM Backend API ────────────────────────────
+  miniapp_php:
+    image: channelcloner_miniapp_php:latest
+    build:
+      context: .
+      dockerfile: docker/miniapp/Dockerfile
+    container_name: channelcloner_miniapp_php
+    restart: always
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-channelcloner}
+      - MYSQL_USER=${MYSQL_USER:-cloner_user}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-cloner_pass_2026}
+      - BOT_TOKEN=${BOT_TOKEN:-}
+      - APP_ENV=${APP_ENV:-production}
+    volumes:
+      - ./miniapp:/var/www/html
+      - ./assets/audio:/app/assets/audio:ro
+      - ./data:/app/data
+    networks:
+      - channelcloner_net
+
+  # ── 3. Nginx Web Server & Static Cache ───────────────────
+  miniapp_web:
+    image: nginx:alpine
+    container_name: channelcloner_miniapp_web
+    restart: always
+    depends_on:
+      - miniapp_php
+    ports:
+      - "${PORT:-8080}:80"
+    volumes:
+      - ./miniapp:/var/www/html:ro
+      - ./docker/nginx/miniapp.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    networks:
+      - channelcloner_net
+
+  # ── 4. Cloudflare 24/7 Global Edge Tunnel ────────────────
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: channelcloner_cloudflared
+    restart: always
+    depends_on:
+      miniapp_web:
+        condition: service_healthy
+    command: tunnel --url http://miniapp_web:80 --no-autoupdate
+    networks:
+      - channelcloner_net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  cloner_mysql_data:
+    name: channelcloner_mysql_data
+
+networks:
+  channelcloner_net:
+    name: channelcloner_net

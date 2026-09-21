@@ -1,0 +1,18 @@
+[Unit]
+Description=GitHub Webhook Auto-Deployment Service
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/app
+Environment=PROJECT_DIR=/home/ubuntu/app
+Environment=WEBHOOK_PORT=9000
+ExecStart=/usr/bin/python3 /home/ubuntu/app/deploy/webhook/deploy_webhook.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

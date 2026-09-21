@@ -11,11 +11,8 @@ class TestDatabaseManager(unittest.IsolatedAsyncioTestCase):
         await self.db.init_db()
 
     async def asyncTearDown(self):
-        if os.path.exists(self.test_db_path):
-            try:
-                os.remove(self.test_db_path)
-            except Exception:
-                pass
+        from tests.test_utils import safe_cleanup_db
+        await safe_cleanup_db(self.test_db_path, self.db)
 
     async def test_user_operations(self):
         user = await self.db.get_or_create_user(12345, "Test User", "testuser", is_admin=True)
@@ -105,13 +102,14 @@ class TestDatabaseManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(max_ch, 999)
 
     async def test_stats(self):
+        initial_users = (await self.db.get_stats())["total_users"]
         await self.db.get_or_create_user(1, "User 1")
         await self.db.get_or_create_user(2, "User 2")
         p_id = await self.db.add_channel_pair(1, "@src1", "S1", "@tgt1", "T1")
         await self.db.record_cloned_message(p_id, 10)
 
         stats = await self.db.get_stats()
-        self.assertEqual(stats["total_users"], 2)
+        self.assertEqual(stats["total_users"], initial_users + 2)
         self.assertEqual(stats["total_pairs"], 1)
         self.assertEqual(stats["active_pairs"], 1)
         self.assertEqual(stats["total_cloned_messages"], 1)

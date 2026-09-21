@@ -9,18 +9,24 @@
 *.env
 *.env.local
 cloud_env_ready.txt
+cloud_raw_session.txt
+cloud_*.txt
+app.pid
 *.token
 *.secret
 *.key
 *.pem
 *.cer
+oracle_vps.key
+.vault_key
+database/.vault_key
 
 # 2. Telethon & Pyrogram MTProto Session Files
 *.session
 *.session-journal
 *.session*
 
-# 3. SQLite Databases & WAL journal files
+# 3. SQLite Databases, backups & WAL journal files
 *.db
 *.db-wal
 *.db-shm
@@ -28,6 +34,8 @@ cloud_env_ready.txt
 *.sqlite3
 database/*.db*
 database/*.sqlite*
+backups/
+data/
 test_stars.db
 test_next_gen.db
 tests/*.db
@@ -81,3 +89,10 @@ Thumbs.db
 .gemini/
 .pytest_cache/
 .coverage
+logs/
+*.log
+
+# Cloudflare Tunnel Credentials (SECRET)
+.cloudflared/cert.json
+.cloudflared/cert.pem
+cloudflared.exe

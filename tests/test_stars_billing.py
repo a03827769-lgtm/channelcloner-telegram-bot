@@ -12,11 +12,8 @@ class TestStarsBilling(unittest.TestCase):
         asyncio.run(self.db.init_db())
 
     def tearDown(self):
-        if os.path.exists(self.db_path):
-            try:
-                os.remove(self.db_path)
-            except Exception:
-                pass
+        from tests.test_utils import safe_cleanup_db
+        asyncio.run(safe_cleanup_db(self.db_path, self.db))
 
     def test_subscription_and_quota(self):
         async def run():
@@ -57,6 +54,21 @@ class TestStarsBilling(unittest.TestCase):
             self.assertEqual(vip_sub.tier, "vip")
             self.assertEqual(vip_sub.stars_spent, 400)
             self.assertEqual(vip_sub.max_channels, 999)
+
+        asyncio.run(run())
+
+    def test_pro_purchase_does_not_extend_vip_tier(self):
+        async def run():
+            user_id = 999222
+            await self.db.get_or_create_user(user_id, "VIP User")
+            # 1. Activate VIP for 30 days
+            vip_sub = await self.db.activate_subscription(user_id, tier="vip", stars=300, charge_id="chg_vip_1", days=30)
+            self.assertEqual(vip_sub.tier, "vip")
+
+            # 2. Purchasing Pro (e.g. 100 stars) MUST NOT retain or extend VIP tier
+            pro_sub = await self.db.activate_subscription(user_id, tier="pro", stars=100, charge_id="chg_pro_2", days=30)
+            self.assertEqual(pro_sub.tier, "pro")
+            self.assertNotEqual(pro_sub.tier, "vip")
 
         asyncio.run(run())
 

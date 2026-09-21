@@ -4,6 +4,8 @@ import sys
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
+import logging
+logger = logging.getLogger(__name__)
 
 DEVICE_MODEL = "Klonla Bot Server"
 SYSTEM_VERSION = "Linux Server 64bit"
@@ -51,7 +53,13 @@ async def main():
     # 4. TELETHON USER LOGIN
     print("\n4️⃣  TELEGRAM AKKAUNTGA KIRISH (MTProto Sessiya)")
     print("   Begona ochiq kanallarni kuzatish uchun Telegram akkauntingizga ulanamiz.")
-    phone = input("   Telefon raqamingiz (+998901234567): ").strip()
+    phone_raw = input("   Telefon raqamingiz (+998901234567): ").strip()
+    try:
+        from services.phone_utils import normalize_phone_number
+        is_val, norm_p, _ = normalize_phone_number(phone_raw)
+        phone = norm_p if is_val else phone_raw
+    except Exception:
+        phone = phone_raw
 
     session_string = ""
     try:
@@ -85,18 +93,36 @@ async def main():
         print(f"\n   ⚠️ Telethon sessiya yaratishda xatolik: {e}")
         print("   Keyinroq .env fayliga TELETHON_SESSION ni qo'lda kiritishingiz mumkin.")
 
-    # 5. WRITE .ENV FILE
-    env_content = f"""# Telegram Channel Cloner Configuration
-BOT_TOKEN={bot_token}
-TELEGRAM_API_ID={api_id}
-TELEGRAM_API_HASH={api_hash}
-TELETHON_SESSION={session_string}
-ADMIN_IDS={admin_id}
-DB_PATH=database/cloner.db
-TEMP_DOWNLOAD_DIR=temp_media
-"""
+    # 5. WRITE / UPDATE .ENV FILE (Preserve existing keys like ADMIN_BOT_TOKEN, ENCRYPTION_KEY, etc.)
+    existing_env: dict[str, str] = {}
+    if os.path.exists(".env"):
+        try:
+            with open(".env", "r", encoding="utf-8") as f:
+                for line in f:
+                    line_s = line.strip()
+                    if line_s and not line_s.startswith("#") and "=" in line_s:
+                        k, v = line_s.split("=", 1)
+                        existing_env[k.strip()] = v.strip()
+        except Exception:
+            logger.debug("Ignored exception", exc_info=True)
+
+    existing_env["BOT_TOKEN"] = bot_token
+    existing_env["TELEGRAM_API_ID"] = str(api_id)
+    existing_env["TELEGRAM_API_HASH"] = api_hash
+    if session_string:
+        existing_env["TELETHON_SESSION"] = session_string
+    existing_env["ADMIN_IDS"] = admin_id
+    if "DB_PATH" not in existing_env:
+        existing_env["DB_PATH"] = "database/cloner.db"
+    if "TEMP_DOWNLOAD_DIR" not in existing_env:
+        existing_env["TEMP_DOWNLOAD_DIR"] = "temp_media"
+
+    env_lines = ["# Telegram Channel Cloner Configuration\n"]
+    for k, v in existing_env.items():
+        env_lines.append(f"{k}={v}\n")
+
     with open(".env", "w", encoding="utf-8") as f:
-        f.write(env_content)
+        f.writelines(env_lines)
 
     print("\n" + "=" * 65)
     print("🎉 BARCHA SOZLAMALAR .env FAYLIGA SAQLANDI!")

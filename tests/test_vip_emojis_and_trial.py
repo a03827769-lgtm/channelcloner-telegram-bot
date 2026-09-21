@@ -16,11 +16,8 @@ class TestVipEmojisAndTrial(unittest.TestCase):
         asyncio.run(self.db.init_db())
 
     def tearDown(self):
-        if os.path.exists(self.db_path):
-            try:
-                os.remove(self.db_path)
-            except Exception:
-                pass
+        from tests.test_utils import safe_cleanup_db
+        asyncio.run(safe_cleanup_db(self.db_path, self.db))
 
     def test_emoji_converter_preserves_html(self):
         raw_text = "Salom! ✅ To'lov o'tdi. 🚀 <a href=\"https://t.me\">Kanal 🔗</a> va <code>⚠️ Code</code>."
@@ -141,6 +138,66 @@ class TestVipEmojisAndTrial(unittest.TestCase):
 
             self.assertEqual(results.get("cb1"), [101, 102])
             self.assertEqual(results.get("cb2"), [101, 102])
+
+        asyncio.run(run())
+
+    def test_emoji_converter_all_categories_and_edge_cases(self):
+        # 1. Flags
+        text_flags = "Davlatlar: 🇺🇿 O'zbekiston, 🇷🇺 Rossiya, 🇹🇷 Turkiya, 🇩🇪 Germaniya, 🇺🇸 AQSH."
+        conv_flags = emoji_converter.convert_to_premium_emojis(text_flags)
+        self.assertIn('<tg-emoji emoji-id="5445378486711623503">🇺🇿</tg-emoji>', conv_flags)
+        self.assertIn('<tg-emoji emoji-id="5398017006165305287">🇷🇺</tg-emoji>', conv_flags)
+        self.assertIn('<tg-emoji emoji-id="5474150171979822886">🇹🇷</tg-emoji>', conv_flags)
+
+        # 2. 3D Numbers (with and without variation selector)
+        text_nums = "Qadamlar: 1️⃣ Ro'yxat, 2️⃣ To'lov, 3️⃣ Ishga tushirish!"
+        conv_nums = emoji_converter.convert_to_premium_emojis(text_nums)
+        self.assertIn('<tg-emoji emoji-id="5208519140645551525">1️⃣</tg-emoji>', conv_nums)
+        self.assertIn('<tg-emoji emoji-id="5208431510427810832">2️⃣</tg-emoji>', conv_nums)
+        self.assertIn('<tg-emoji emoji-id="5210941321811871048">3️⃣</tg-emoji>', conv_nums)
+
+        # 3. Variation selector matching (e.g. ⚙ without \ufe0f vs ⚙️ with \ufe0f)
+        text_gear_clean = "Sozlamalar: \u2699 va \u26a0"
+        conv_gear = emoji_converter.convert_to_premium_emojis(text_gear_clean)
+        self.assertIn('5350396951407895212', conv_gear)
+        self.assertIn('5447644880824181073', conv_gear)
+
+        # 4. Strict Anchor tag protection (no nested tg-emoji inside <a>)
+        text_link = 'Batafsil ma\'lumot: <a href="https://example.com/post?id=1">Kanalga o\'tish 🚀</a>.'
+        conv_link = emoji_converter.convert_to_premium_emojis(text_link)
+        self.assertNotIn('<a href="https://example.com/post?id=1">Kanalga o\'tish <tg-emoji', conv_link)
+        self.assertIn('<a href="https://example.com/post?id=1">Kanalga o\'tish 🚀</a>', conv_link)
+
+        # 5. Idempotence: No double-wrapping on already converted tg-emoji
+        already_converted = '<tg-emoji emoji-id="5456432998092133477">✅</tg-emoji> All ready! 🚀'
+        conv_idempotent = emoji_converter.convert_to_premium_emojis(already_converted)
+        self.assertNotIn('<tg-emoji emoji-id="5456432998092133477"><tg-emoji', conv_idempotent)
+        self.assertIn('<tg-emoji emoji-id="5372917041193828849">🚀</tg-emoji>', conv_idempotent)
+
+    def test_cloner_engine_process_post_text_vip_emoji_signature(self):
+        async def run():
+            from config.settings import settings
+            user_id = 999111
+            settings.ADMIN_IDS_RAW = f"{user_id}"
+
+            cloner = ClonerEngine()
+            pair = ChannelPair(
+                id=1,
+                user_id=user_id,
+                source_channel="@src",
+                target_channel="@tgt",
+                auto_premium_emojis=True,
+                custom_signature="👉 Obuna: @tgt_channel 🚀"
+            )
+
+            raw_post = "Yangi yangilik! 🔥 Tezkor xabar ⚡"
+            processed = await cloner.process_post_text(raw_post, pair)
+
+            # Both body emojis AND signature emojis should be converted to Telegram Premium custom emojis
+            self.assertIn('<tg-emoji emoji-id="5402406965252989103">🔥</tg-emoji>', processed)
+            self.assertIn('<tg-emoji emoji-id="5285063442204481914">⚡</tg-emoji>', processed)
+            self.assertIn('<tg-emoji emoji-id="5332819376842226496">👉</tg-emoji>', processed)
+            self.assertIn('<tg-emoji emoji-id="5372917041193828849">🚀</tg-emoji>', processed)
 
         asyncio.run(run())
 

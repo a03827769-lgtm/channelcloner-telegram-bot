@@ -23,6 +23,10 @@ class TestTextProcessor(unittest.TestCase):
         self.assertEqual(TextProcessor.normalize_channel_input("@kunuzofficial"), "@kunuzofficial")
         self.assertEqual(TextProcessor.normalize_channel_input("-1001234567890"), "-1001234567890")
         self.assertEqual(TextProcessor.normalize_channel_input("https://t.me/+AbCdEfGh"), "https://t.me/+AbCdEfGh")
+        self.assertEqual(TextProcessor.normalize_channel_input("https://t.me/c/1234567890/123"), "-1001234567890")
+        self.assertEqual(TextProcessor.normalize_channel_input("t.me/c/987654321/42/99"), "-100987654321")
+        self.assertEqual(TextProcessor.normalize_channel_input("https://t.me/s/kunuzofficial/123"), "@kunuzofficial")
+        self.assertEqual(TextProcessor.normalize_channel_input("tg://resolve?domain=kunuzofficial"), "@kunuzofficial")
 
     def test_clean_usernames_and_links(self):
         text = "Yangi xabar! Batafsil @kunuz va https://t.me/kunuz/123 da o'qing. Kanalimiz: @kunuz"

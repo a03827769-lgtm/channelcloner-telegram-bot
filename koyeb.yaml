@@ -37,14 +37,18 @@ env:
   - key: TEMP_DOWNLOAD_DIR
     value: "temp_media"
   - key: BOT_TOKEN
-    value: "{{ secret.BOT_TOKEN }}"
+    secret: BOT_TOKEN
   - key: ADMIN_BOT_TOKEN
-    value: "{{ secret.ADMIN_BOT_TOKEN }}"
+    secret: ADMIN_BOT_TOKEN
   - key: TELEGRAM_API_ID
-    value: "{{ secret.TELEGRAM_API_ID }}"
+    secret: TELEGRAM_API_ID
   - key: TELEGRAM_API_HASH
-    value: "{{ secret.TELEGRAM_API_HASH }}"
+    secret: TELEGRAM_API_HASH
   - key: TELETHON_SESSION
-    value: "{{ secret.TELETHON_SESSION }}"
+    secret: TELETHON_SESSION
   - key: ADMIN_IDS
-    value: "{{ secret.ADMIN_IDS }}"
+    secret: ADMIN_IDS
+  - key: ENCRYPTION_KEY
+    secret: ENCRYPTION_KEY
+  - key: ENABLE_PLAYWRIGHT
+    value: "false"

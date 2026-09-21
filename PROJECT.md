@@ -26,11 +26,11 @@
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
-| M1 | HTTP Keep-Alive Healthcheck Integration | Verify and refine `start_health_server()` in `run.py` to return required schema and handle graceful shutdown signals | Survey | PLANNED |
-| M2 | Containerization & Cloud Deployment Manifests | Create multi-stage `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `koyeb.yaml`, `render.yaml`, `Procfile` | M1 | PLANNED |
-| M3 | Environment Templates & Documentation | Create `.env.example` and `DEPLOYMENT.md` setup guides | M1 | PLANNED |
-| M4 | Git Security, Secret Sanitization & Private GitHub Push | Create `.gitignore`, sanitize staging area, create private GitHub repository `channelcloner-telegram-bot`, push to `main` | M2, M3 | PLANNED |
-| M5 | E2E Empirical Verification & Forensic Integrity Audit | Execute automated healthcheck tests, verify container build, run challenger stress tests, and conduct forensic audit | M4 | PLANNED |
+| M1 | HTTP Keep-Alive Healthcheck Integration | Verify and refine `start_health_server()` in `run.py` to return required schema and handle graceful shutdown signals | Survey | DONE |
+| M2 | Containerization & Cloud Deployment Manifests | Create multi-stage `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `koyeb.yaml`, `render.yaml`, `Procfile` | M1 | DONE |
+| M3 | Environment Templates & Documentation | Create `.env.example` and `DEPLOYMENT.md` setup guides | M1 | DONE |
+| M4 | Git Security, Secret Sanitization & Private GitHub Push | Create `.gitignore`, sanitize staging area, create private GitHub repository `channelcloner-telegram-bot`, push to `main` | M2, M3 | DONE |
+| M5 | E2E Empirical Verification & Forensic Integrity Audit | Execute automated healthcheck tests, verify container build, run challenger stress tests, and conduct forensic audit | M4 | DONE |
 
 ## Interface Contracts
 ### HTTP Keep-Alive Healthcheck (`run.py`)

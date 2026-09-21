@@ -27,10 +27,9 @@ import admin_bot.handlers.mtproto_auth as admin_auth_mod
 class TestAllButtonsAndFlows(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
-        self.test_db_path = "test_e2e_flows.db"
-        if os.path.exists(self.test_db_path):
-            os.remove(self.test_db_path)
-            
+        import tempfile
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_db_path = os.path.join(self.temp_dir.name, "test_e2e.db")
         self.db = DatabaseManager(self.test_db_path)
         await self.db.init_db()
 
@@ -47,6 +46,8 @@ class TestAllButtonsAndFlows(unittest.IsolatedAsyncioTestCase):
             patch("admin_bot.handlers.broadcast.db_manager", self.db),
             patch("admin_bot.handlers.backup.db_manager", self.db),
             patch("services.disaster_recovery.db_manager", self.db),
+            patch("admin_bot.handlers.user_management.Bot"),
+            patch("admin_bot.handlers.broadcast.Bot"),
         ]
         for p in self.patchers:
             p.start()
@@ -73,11 +74,14 @@ class TestAllButtonsAndFlows(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         for p in self.patchers:
             p.stop()
-        if os.path.exists(self.test_db_path):
-            try:
-                os.remove(self.test_db_path)
-            except Exception:
-                pass
+        try:
+            await self.db.close()
+        except Exception:
+            pass
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
 
     def _create_mock_message(self, user_id: int, text: str = "") -> Message:
         msg = MagicMock(spec=Message)

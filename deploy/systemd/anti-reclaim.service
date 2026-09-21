@@ -1,0 +1,17 @@
+[Unit]
+Description=Oracle Cloud Always Free Anti-Reclamation Service
+After=network.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/home/opc/app/deploy
+ExecStart=/usr/bin/python3 /home/opc/app/deploy/anti_reclaim.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Nice=19
+
+[Install]
+WantedBy=multi-user.target

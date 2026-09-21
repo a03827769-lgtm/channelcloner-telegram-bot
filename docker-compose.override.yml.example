@@ -1,0 +1,10 @@
+# Example Docker Compose Override for Local Development / Custom Proxies
+# Copy to docker-compose.override.yml to use. (Ignored by git)
+
+services:
+  telegram-cloner:
+    environment:
+      # Uncomment if you are running behind a local corporate / WSL proxy:
+      # - HTTP_PROXY=http://192.168.65.254:8888
+      # - HTTPS_PROXY=http://192.168.65.254:8888
+      - LOG_LEVEL=DEBUG

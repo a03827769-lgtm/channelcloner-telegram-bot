@@ -1,5 +1,6 @@
 import logging
 from aiogram import Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -11,7 +12,9 @@ from admin_bot.keyboards.admin_keyboards import (
 )
 from services.telethon_listener import telethon_listener
 from services.phone_utils import mask_phone_number
-from services.custom_emojis import KEY, SUCCESS, ERROR, WARN, LOADING
+from services.custom_emojis import (
+    KEY, SUCCESS, ERROR, WARN, LOADING, INFO, clean_for_alert
+)
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin_auth_router")
@@ -21,11 +24,7 @@ class AuthStates(StatesGroup):
     waiting_for_code = State()
     waiting_for_2fa = State()
 
-async def safe_answer(callback: CallbackQuery, text: str = "", show_alert: bool = False):
-    try:
-        await callback.answer(text=text, show_alert=show_alert)
-    except Exception:
-        pass
+from bot.utils import safe_answer, html_escape
 
 @router.callback_query(F.data == "admin_auth_status")
 @router.message(F.text.contains("MTProto Hisob"))
@@ -38,11 +37,13 @@ async def cb_auth_status(event: CallbackQuery | Message, state: FSMContext):
     is_auth = me is not None
 
     if is_auth:
+        first_name = html_escape(me.first_name or '')
+        last_name = html_escape(me.last_name or '')
         text = f"""
 {KEY} <b>MTProto Markaziy Telegram Hisobi:</b>
 
 ├ <b>Holati:</b> {SUCCESS} Ulangan
-├ <b>Ism:</b> {me.first_name} {me.last_name or ''}
+├ <b>Ism:</b> {first_name} {last_name}
 ├ <b>Username:</b> @{me.username or 'mavjud_emas'}
 ├ <b>Telefon:</b> {mask_phone_number(getattr(me, 'phone', ''))}
 └ <b>User ID:</b> <code>{me.id}</code>
@@ -60,11 +61,15 @@ Quyidagi tugma orqali telefon raqamingizni kiriting:
 """
 
     if isinstance(event, CallbackQuery):
-        await event.message.edit_text(
-            text=text,
-            parse_mode="HTML",
-            reply_markup=get_auth_menu_keyboard(is_auth=is_auth)
-        )
+        try:
+            await event.message.edit_text(
+                text=text,
+                parse_mode="HTML",
+                reply_markup=get_auth_menu_keyboard(is_auth=is_auth)
+            )
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e).lower():
+                raise
     else:
         await event.answer(
             text=text,
@@ -83,16 +88,29 @@ async def cb_start_phone(callback: CallbackQuery, state: FSMContext):
 Telegram akkauntingizga bog'langan xalqaro formatdagi telefon raqamingizni yuboring:
 <i>(Masalan: +998901234567 yoki 998901234567)</i>
 """
-    await callback.message.edit_text(
-        text=text,
-        parse_mode="HTML",
-        reply_markup=get_auth_cancel_keyboard()
-    )
+    try:
+        await callback.message.edit_text(
+            text=text,
+            parse_mode="HTML",
+            reply_markup=get_auth_cancel_keyboard()
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
 
 @router.message(AuthStates.waiting_for_phone)
 async def process_phone_input(message: Message, state: FSMContext):
+    if not message.text or message.text.strip().lower() in ("/cancel", "bekor qilish"):
+        await state.clear()
+        await message.answer(f"{INFO} Telefon kiritish bekor qilindi.", parse_mode="HTML", reply_markup=get_back_to_admin_keyboard())
+        return
+
     phone = message.text.strip()
     user_id = message.from_user.id
+    try:
+        await message.delete()
+    except Exception:
+        logger.debug("Ignored exception", exc_info=True)
 
     msg_wait = await message.answer(f"{LOADING} Telegramga ulanish va kod so'rash yuborilmoqda...")
 
@@ -105,7 +123,7 @@ async def process_phone_input(message: Message, state: FSMContext):
         text = f"""
 {SUCCESS} <b>Tasdiqlash kodi yuborildi!</b>
 
-Telegram orqali <code>{phone}</code> raqamiga yuborilgan 5 xonali tasdiqlash kodini kiriting.
+Telegram orqali <code>{mask_phone_number(phone)}</code> raqamiga yuborilgan 5 xonali tasdiqlash kodini kiriting.
 <i>(Kod xavfsizligi uchun raqamlar orasiga bo'sh joy qo'ysangiz ham bo'ladi, masalan: <code>1 2 3 4 5</code>)</i>
 """
         await message.answer(text=text, parse_mode="HTML", reply_markup=get_auth_cancel_keyboard())
@@ -114,15 +132,25 @@ Telegram orqali <code>{phone}</code> raqamiga yuborilgan 5 xonali tasdiqlash kod
 
 @router.message(AuthStates.waiting_for_code)
 async def process_code_input(message: Message, state: FSMContext):
+    if not message.text or message.text.strip().lower() in ("/cancel", "bekor qilish"):
+        await state.clear()
+        await message.answer(f"{INFO} Kod kiritish bekor qilindi.", parse_mode="HTML", reply_markup=get_back_to_admin_keyboard())
+        return
+
     code = message.text.strip()
     data = await state.get_data()
     phone = data.get("phone", "")
+    user_id = message.from_user.id
+    try:
+        await message.delete()
+    except Exception:
+        logger.debug("Ignored exception", exc_info=True)
 
     msg_wait = await message.answer(f"{LOADING} Kod tekshirilmoqda...")
-    status, res_msg = await telethon_listener.sign_in_with_code(phone=phone, code=code)
+    ok, res_msg, status = await telethon_listener.submit_phone_code(user_id=user_id, code=code)
     await msg_wait.delete()
 
-    if status == "SUCCESS":
+    if status == "success":
         await state.clear()
         me = await telethon_listener.get_me()
         me_title = f"{me.first_name} (@{me.username or 'yoq'})" if me else phone
@@ -131,7 +159,7 @@ async def process_code_input(message: Message, state: FSMContext):
             parse_mode="HTML",
             reply_markup=get_back_to_admin_keyboard()
         )
-    elif status == "2FA_REQUIRED":
+    elif status == "needs_2fa":
         await state.set_state(AuthStates.waiting_for_2fa)
         await message.answer(
             text=f"{WARN} <b>Ikki bosqichli autentifikatsiya (2FA) yoqilgan!</b>\n\nIltimos, Telegram hisobingizning 2FA bulutli parolini (Cloud Password) kiriting:",
@@ -147,9 +175,19 @@ async def process_code_input(message: Message, state: FSMContext):
 
 @router.message(AuthStates.waiting_for_2fa)
 async def process_2fa_input(message: Message, state: FSMContext):
+    if not message.text or message.text.strip().lower() in ("/cancel", "bekor qilish"):
+        await state.clear()
+        await message.answer(f"{INFO} 2FA parol kiritish bekor qilindi.", parse_mode="HTML", reply_markup=get_back_to_admin_keyboard())
+        return
+
     password = message.text.strip()
+    try:
+        await message.delete()
+    except Exception:
+        logger.debug("Ignored exception", exc_info=True)
+    user_id = message.from_user.id
     msg_wait = await message.answer(f"{LOADING} 2FA parol tekshirilmoqda...")
-    success, res_msg = await telethon_listener.sign_in_with_2fa(password=password)
+    success, res_msg = await telethon_listener.submit_2fa_password(user_id=user_id, password=password)
     await msg_wait.delete()
 
     if success:
@@ -171,18 +209,26 @@ async def process_2fa_input(message: Message, state: FSMContext):
 @router.callback_query(F.data == "auth_logout_confirm")
 async def cb_logout_confirm(callback: CallbackQuery):
     await safe_answer(callback)
-    await callback.message.edit_text(
-        text=f"{WARN} <b>Haqiqatan ham markaziy Telegram hisobidan chiqmoqchimisiz?</b>\n\nChiqilsa, barcha kanallarni real-vaqtda klonlash to'xtatiladi!",
-        parse_mode="HTML",
-        reply_markup=get_logout_confirm_keyboard()
-    )
+    try:
+        await callback.message.edit_text(
+            text=f"{WARN} <b>Haqiqatan ham markaziy Telegram hisobidan chiqmoqchimisiz?</b>\n\nChiqilsa, barcha kanallarni real-vaqtda klonlash to'xtatiladi!",
+            parse_mode="HTML",
+            reply_markup=get_logout_confirm_keyboard()
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
 
 @router.callback_query(F.data == "auth_logout_yes")
 async def cb_logout_yes(callback: CallbackQuery):
     await safe_answer(callback)
     await telethon_listener.logout()
-    await callback.message.edit_text(
-        text=f"{SUCCESS} <b>Telegram hisobidan muvaffaqiyatli chiqildi.</b>\nSessiya xavfsiz o'chirildi.",
-        parse_mode="HTML",
-        reply_markup=get_back_to_admin_keyboard()
-    )
+    try:
+        await callback.message.edit_text(
+            text=f"{SUCCESS} <b>Telegram hisobidan muvaffaqiyatli chiqildi.</b>\nSessiya xavfsiz o'chirildi.",
+            parse_mode="HTML",
+            reply_markup=get_back_to_admin_keyboard()
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
