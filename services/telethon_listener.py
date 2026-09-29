@@ -26,6 +26,7 @@ from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 from telethon.tl.functions.updates import GetStateRequest
 from telethon.errors import (
+    ChannelPrivateError,
     FloodWaitError,
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -87,6 +88,21 @@ SESSION_REVOKED_ALERT = (
     "Markaziy Telegram hisobining sessiyasi Telegram tomonidan bekor qilindi (boshqa qurilmadan chiqarilgan "
     "yoki hisob cheklangan). Kanallarni real vaqtda kuzatish to'xtadi.\n\n"
     "<i>Admin botdagi «MTProto Hisob» bo'limi orqali hisobni qaytadan ulang.</i>"
+)
+
+# A pair whose source the central account can no longer read (kicked, banned, or the chat became private)
+# is reported once per incident; the app_settings flag is cleared as soon as the source is readable again.
+SOURCE_ACCESS_LOST_KEY_PREFIX = "source_access_lost:"
+SOURCE_ACCESS_LOST_OWNER_TEXT = (
+    "⚠️ <b>Manbaga kirish yo'qoldi</b> (juftlik #{pair_id})\n\n"
+    "Bot «{source}» manbasini o'qiy olmayapti: manba uni chiqarib yuborgan yoki bloklagan, yoki manba yopiq "
+    "bo'lib qolgan. Shu sababli yangi postlar ko'chirilmayapti.\n\n"
+    "<i>Manba adminlaridan cheklovni olib tashlashni so'rang yoki /cloner menyusida boshqa manba tanlang.</i>"
+)
+SOURCE_ACCESS_LOST_ADMIN_TEXT = (
+    "⚠️ <b>Manbaga kirish yo'qoldi</b>\n\n"
+    "Juftlik #{pair_id} (egasi <code>{owner}</code>): markaziy MTProto akkaunt «{source}» manbasini o'qiy "
+    "olmayapti ({error}). Juftlik egasiga xabar yuborildi."
 )
 
 
@@ -306,6 +322,46 @@ class TelethonListener:
                 logger.warning(f"Could not alert super admin {admin_id}: {e!r}")
         if not delivered:
             logger.error(f"Super admin alert could not be delivered to anyone: {text}")
+
+    async def _report_source_access_lost(self, pair: ChannelPair, error: BaseException) -> None:
+        """Tells the pair owner and the super admins - once per incident - that the central account can no
+        longer read the pair's source, so nobody waits for posts that will never be cloned."""
+        key = f"{SOURCE_ACCESS_LOST_KEY_PREFIX}{pair.id}"
+        try:
+            if await db_manager.get_setting(key):
+                return
+            await db_manager.set_setting(key, str(int(time.time())))
+        except Exception:
+            logger.warning(f"Could not record the lost source of pair #{pair.id}", exc_info=True)
+            return
+        source = html.escape(str(pair.source_title or pair.source_channel or pair.source_id or "?"))
+        bot = cloner_engine.bot
+        if bot is not None and pair.user_id:
+            try:
+                await asyncio.wait_for(
+                    bot.send_message(
+                        chat_id=pair.user_id,
+                        text=SOURCE_ACCESS_LOST_OWNER_TEXT.format(pair_id=pair.id, source=source),
+                        parse_mode="HTML",
+                    ),
+                    timeout=RECONNECT_STEP_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"Could not tell the owner of pair #{pair.id} about the lost source: {e!r}")
+        await self._alert_super_admins(SOURCE_ACCESS_LOST_ADMIN_TEXT.format(
+            pair_id=pair.id, owner=pair.user_id, source=source, error=html.escape(str(error)[:120])))
+
+    async def _clear_source_access_lost(self, pair: ChannelPair) -> None:
+        """The source is readable again: a later loss of access is reported anew."""
+        key = f"{SOURCE_ACCESS_LOST_KEY_PREFIX}{pair.id}"
+        try:
+            if await db_manager.get_setting(key):
+                await db_manager.delete_setting(key)
+                logger.info(f"Source of pair #{pair.id} is readable again.")
+        except Exception:
+            logger.debug(f"Could not clear the lost-source flag of pair #{pair.id}", exc_info=True)
 
     def invalidate_pairs_cache(self):
         """Invalidates the in-memory active channel pairs cache"""
@@ -2246,6 +2302,7 @@ class TelethonListener:
 
             # 2. Inspect latest message in source channel
             latest_msgs = await self.client.get_messages(entity, limit=1)
+            await self._clear_source_access_lost(pair)
             if not latest_msgs:
                 return {"status": "channel_empty", "caught_up": 0, "failed": 0}
 
@@ -2419,6 +2476,11 @@ class TelethonListener:
                     "caught_up": caught_up,
                     "failed": failed
                 }
+            if isinstance(e, ChannelPrivateError):
+                logger.warning(f"Catch-up for pair #{pair.id}: the MTProto account cannot read the source "
+                               f"{pair.source_channel} ({e})")
+                await self._report_source_access_lost(pair, e)
+                return {"status": "source_inaccessible", "caught_up": caught_up, "failed": failed}
             logger.error(f"Error during catch-up for pair #{pair.id}: {e}", exc_info=True)
             return {
                 "status": f"error: {str(e)[:60]}",

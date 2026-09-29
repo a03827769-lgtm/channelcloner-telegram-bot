@@ -449,6 +449,51 @@ async def test_catch_up_stops_when_the_pair_is_paused(tmp_path, listener):
         await db.close()
 
 
+async def test_lost_source_is_reported_once_and_again_after_recovery(tmp_path, listener):
+    """A source the central account can no longer read (kicked, banned, turned private) is reported to the
+    pair owner and the super admins once per incident - not on every restart - and reported anew after the
+    source was readable again."""
+    db = DatabaseManager(str(tmp_path / "lost.db"))
+    await db.init_db()
+    try:
+        await db.get_or_create_user(503, "Owner", "owner_user")
+        pid = await db.add_channel_pair(user_id=503, source_channel="@src_lost", source_title="Lost <Source>",
+                                        target_channel="@tgt_lost", target_title="T")
+        await db.update_pair_last_seen_msg_id(pid, 882100)
+        pair = await db.get_pair_by_id(pid)
+
+        client = MagicMock()
+        client.is_connected.return_value = True
+        client.is_user_authorized = AsyncMock(return_value=True)
+        client.get_messages = AsyncMock(side_effect=ChannelPrivateError(request=None))
+        listener.client = client
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        alert = AsyncMock()
+        with patch.object(tl_mod, "db_manager", db), \
+             patch.object(tl_mod.cloner_engine, "bot", bot), \
+             patch.object(listener, "_alert_super_admins", alert), \
+             patch.object(listener, "resolve_entity", AsyncMock(return_value=SimpleNamespace(id=4444))):
+            first = await listener.catch_up_pair_messages(pair)
+            again = await listener.catch_up_pair_messages(pair)  # the next restart
+            assert first["status"] == again["status"] == "source_inaccessible"
+            bot.send_message.assert_awaited_once()
+            sent = bot.send_message.await_args.kwargs
+            assert sent["chat_id"] == 503 and f"#{pid}" in sent["text"]
+            assert "Lost &lt;Source&gt;" in sent["text"] and sent["parse_mode"] == "HTML"
+            alert.assert_awaited_once()
+
+            client.get_messages = AsyncMock(return_value=[SimpleNamespace(id=882100)])
+            assert (await listener.catch_up_pair_messages(pair))["status"] == "up_to_date"
+            assert await db.get_setting(f"{tl_mod.SOURCE_ACCESS_LOST_KEY_PREFIX}{pid}") is None
+
+            client.get_messages = AsyncMock(side_effect=ChannelPrivateError(request=None))
+            await listener.catch_up_pair_messages(pair)
+            assert bot.send_message.await_count == 2 and alert.await_count == 2
+    finally:
+        await db.close()
+
+
 # --------------------------------------------------------------------------- LS-M1 / LS-L11: supervisor
 
 async def test_supervisor_rebuilds_a_fresh_client_instead_of_reconnecting(listener, monkeypatch):
