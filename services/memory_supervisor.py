@@ -85,7 +85,9 @@ class SystemSupervisor:
 
     async def _lag_monitor_loop(self):
         interval = 0.5
-        last_report = 0.0
+        # -inf, not 0.0: time.monotonic() counts from boot on Linux, so 0.0 silenced every warning during the
+        # first lag_report_interval seconds after the machine started (fresh servers, CI runners)
+        last_report = float("-inf")
         suppressed = 0
         worst_ms = 0.0
         while self._is_running:

@@ -215,3 +215,15 @@ async def test_resume_refuses_self_loops_cycles_and_duplicates(db):
     assert await db.set_pair_active_by_owner(copy_id, True) == (False, "duplicate")
     # Admins bypass plan limits, never the safety checks
     assert await db.set_pair_active_by_owner(copy_id, True, bypass_limits=True) == (False, "duplicate")
+
+
+def test_subscription_dates_with_a_z_suffix_parse_on_every_python():
+    """datetime.fromisoformat() rejects a trailing "Z" before Python 3.11 (CI runs 3.10): such an expiry
+    must still count as UTC instead of turning an active plan into an expired one."""
+    from database.models import Subscription
+    parse = Subscription._parse_iso_to_utc_naive
+    assert parse("2026-01-01T10:00:00Z") == datetime(2026, 1, 1, 10, 0)
+    assert parse("2026-01-01 10:00:00") == datetime(2026, 1, 1, 10, 0)
+    assert parse("2026-01-01T15:00:00+05:00") == datetime(2026, 1, 1, 10, 0)
+    assert parse("not a date") is None and parse("") is None and parse(None) is None
+    assert Subscription(user_id=1, tier="vip", expires_at="2099-01-01T00:00:00Z").is_active is True

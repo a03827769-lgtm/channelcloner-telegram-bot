@@ -33,7 +33,10 @@ class Subscription:
         if not dt_str:
             return None
         try:
-            dt = datetime.fromisoformat(dt_str.replace(" ", "T"))
+            text = dt_str.strip().replace(" ", "T")
+            if text[-1:] in ("Z", "z"):
+                text = text[:-1] + "+00:00"  # fromisoformat() rejects the "Z" suffix before Python 3.11
+            dt = datetime.fromisoformat(text)
             if dt.tzinfo is not None:
                 dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
             return dt
