@@ -1,7 +1,8 @@
 """
 Regression tests for the VIP real-estate story pipeline (area F3): price parsing (units, separators,
 catastrophic backtracking), offer/demand classification, district detection, the Tashkent prime-time
-window, listing fingerprints, Telegram error classification, story targets and story deletion.
+window, listing fingerprints, Telegram error classification, story targets, story deletion and revoked
+customer sessions.
 """
 import time
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from telethon import types
+from telethon.errors import AuthKeyUnregisteredError, FloodWaitError, RpcCallFailError
 
 from services.listing_analyzer import format_price_usd, listing_analyzer, normalize_listing_text
 from services.story_cloner_service import (
@@ -218,3 +220,93 @@ async def test_ui_helpers_are_available_on_the_shared_service():
     with patch.object(story_cloner_service, "_discard_login_session", new=AsyncMock()) as discard:
         await story_cloner_service.cancel_login(42)
     discard.assert_awaited_once_with(42)
+
+
+# ---------------------------------------------------------------- revoked customer sessions
+
+def _session_string() -> str:
+    """A syntactically valid StringSession with a random auth key (never used against Telegram)."""
+    import os
+    from telethon.crypto import AuthKey
+    from telethon.sessions import StringSession
+    session = StringSession()
+    session.set_dc(2, "149.154.167.51", 443)
+    session.auth_key = AuthKey(os.urandom(256))
+    return session.save()
+
+
+class _FakeStoryClient:
+    """Stands in for TelegramClient: connect/disconnect bookkeeping, and every request answers with
+    `answer` (an RPC error) or succeeds."""
+    answer = None
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        self.connected = False
+        _FakeStoryClient.instances.append(self)
+
+    async def connect(self):
+        self.connected = True
+
+    def is_connected(self):
+        return self.connected
+
+    async def disconnect(self):
+        self.connected = False
+
+    async def __call__(self, request):
+        if _FakeStoryClient.answer is not None:
+            raise _FakeStoryClient.answer
+        return object()
+
+
+@pytest.fixture
+def fake_story_client(monkeypatch):
+    _FakeStoryClient.answer = None
+    _FakeStoryClient.instances = []
+    monkeypatch.setattr("services.story_cloner_service.TelegramClient", _FakeStoryClient)
+    return _FakeStoryClient
+
+
+async def test_revoked_customer_session_is_deleted_and_the_user_told(fake_story_client):
+    service = StoryClonerService()
+    fake_story_client.answer = AuthKeyUnregisteredError(request=None)
+    with patch("services.story_cloner_service.db_manager.get_user_session",
+               new=AsyncMock(return_value=_session_string())), \
+         patch("services.story_cloner_service.db_manager.delete_user_session",
+               new=AsyncMock(return_value=True)) as delete, \
+         patch.object(service, "_notify", new=AsyncMock()) as notify:
+        assert await service.get_client_for_user(501) is None
+    delete.assert_awaited_once_with(501)
+    notify.assert_awaited_once()
+    assert notify.await_args.args[0] == 501 and "qaytadan ulang" in notify.await_args.args[1]
+    assert not fake_story_client.instances[0].is_connected()
+    assert 501 not in service._user_clients
+
+
+@pytest.mark.parametrize("error", [
+    pytest.param(FloodWaitError(request=None, capture=30), id="flood-wait"),
+    pytest.param(RpcCallFailError(request=None), id="telegram-5xx"),
+])
+async def test_temporary_failures_never_delete_a_customer_session(fake_story_client, error):
+    service = StoryClonerService()
+    fake_story_client.answer = error
+    with patch("services.story_cloner_service.db_manager.get_user_session",
+               new=AsyncMock(return_value=_session_string())), \
+         patch("services.story_cloner_service.db_manager.delete_user_session", new=AsyncMock()) as delete, \
+         patch.object(service, "_notify", new=AsyncMock()) as notify:
+        assert await service.get_client_for_user(502) is None
+    delete.assert_not_awaited()
+    notify.assert_not_awaited()
+    assert not fake_story_client.instances[0].is_connected()
+
+
+async def test_authorized_customer_session_is_pooled(fake_story_client):
+    service = StoryClonerService()
+    with patch("services.story_cloner_service.db_manager.get_user_session",
+               new=AsyncMock(return_value=_session_string())), \
+         patch("services.story_cloner_service.db_manager.delete_user_session", new=AsyncMock()) as delete:
+        client = await service.get_client_for_user(503)
+    assert client is fake_story_client.instances[0] and client.is_connected()
+    assert service._user_clients[503] is client
+    delete.assert_not_awaited()

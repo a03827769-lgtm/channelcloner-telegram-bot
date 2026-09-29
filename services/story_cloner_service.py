@@ -25,6 +25,7 @@ from telethon.errors import (
     ChatAdminRequiredError,
     ChatWriteForbiddenError,
     PremiumAccountRequiredError,
+    RPCError,
     UserBannedInChannelError,
     UserAlreadyParticipantError
 )
@@ -43,7 +44,7 @@ from services.story_video_generator import story_video_generator
 from services.listing_analyzer import listing_analyzer, format_price_usd, normalize_listing_text
 from services.story_queue_service import story_queue_service, NON_PREMIUM_DAILY_STORY_LIMIT
 from services.render_queue import render_queue
-from services.telethon_listener import session_uses_ipv6
+from services.telethon_listener import is_session_revoked_error, session_uses_ipv6
 from services.custom_emojis import INBOX, TROPHY, CHANNEL, MONEY, LOCATION, TIMER, PARTY, TAG, INFO, MOBILE, LINK, WARN
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,13 @@ ALBUM_MAX_PHOTOS = 8
 STORY_JOB_DIR_PREFIX = "story_job_"
 STORY_JOB_DIR_MAX_AGE_SECONDS = 6 * 3600
 FAILURE_NOTICE_INTERVAL_SECONDS = 6 * 3600
+
+SESSION_REVOKED_USER_TEXT = (
+    f"{WARN} <b>Telegram akkauntingiz uzildi</b>\n\n"
+    "Istoriya uchun ulangan Telegram sessiyangiz bekor qilingan (akkaunt boshqa qurilmadan chiqarilgan "
+    "yoki cheklangan), shuning uchun istoriya kuzatuvi to'xtatildi.\n\n"
+    "<i>/story menyusida akkauntingizni qaytadan ulang va kuzatuvni yoqing.</i>"
+)
 
 
 def _normalize_peer_id(value: Any) -> Optional[int]:
@@ -1113,14 +1121,47 @@ class StoryClonerService:
                     use_ipv6=session_uses_ipv6(user_string_session)
                 )
                 await client.connect()
-                if await client.is_user_authorized():
+                auth_error = await self._authorization_error(client)
+                if auth_error is None:
                     await self._install_user_client(user_id, client)
                     return client
-                logger.warning(f"Stored Telegram session of user {user_id} is not authorized")
+                if is_session_revoked_error(auth_error):
+                    await self._disconnect_quietly(client)
+                    client = None
+                    await self._forget_revoked_session(user_id, auth_error)
+                else:
+                    logger.warning(f"Stored Telegram session of user {user_id} is not usable right now "
+                                   f"({type(auth_error).__name__}: {auth_error}); will retry")
             except Exception as e:
                 logger.error(f"Error connecting Telethon client for user {user_id}: {e}")
             await self._disconnect_quietly(client)
             return None
+
+    @staticmethod
+    async def _authorization_error(client: TelegramClient) -> Optional[RPCError]:
+        """None when the session is logged in, otherwise the RPC error Telegram answered with.
+
+        TelegramClient.is_user_authorized() turns every RPC error (flood waits and Telegram 5xx included) into
+        False; keeping the error lets a revoked session be told apart from a temporary failure."""
+        try:
+            await client(functions.updates.GetStateRequest())
+            return None
+        except RPCError as e:
+            return e
+
+    async def _forget_revoked_session(self, user_id: int, error: BaseException) -> None:
+        """The stored session is permanently unusable (logged out from another device, account deactivated,
+        auth key duplicated): the session is deleted, story monitoring is switched off and the user is told
+        to connect the account again, instead of the supervisor retrying a dead session forever."""
+        logger.warning(f"Telegram session of user {user_id} was revoked ({type(error).__name__}); "
+                       "deleting it and pausing story monitoring")
+        self.stop_monitor_for_user(user_id)
+        try:
+            await db_manager.delete_user_session(user_id)
+        except Exception:
+            logger.error(f"Could not delete the revoked session of user {user_id}", exc_info=True)
+            return
+        await self._notify(user_id, SESSION_REVOKED_USER_TEXT)
 
     get_user_client = get_client_for_user
 
