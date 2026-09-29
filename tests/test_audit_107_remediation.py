@@ -1,15 +1,12 @@
 import os
-import re
 import json
-import time
 import tempfile
 import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from database.db_manager import DatabaseManager, db_manager
-from database.models import ChannelPair, Subscription
-from services.cloner_engine import ClonerEngine
+from database.db_manager import DatabaseManager
+from database.models import ChannelPair
 from services.ai_paraphraser import ai_paraphraser
 from services.story_queue_service import story_queue_service
 from bot.keyboards.inline_buttons import get_translate_lang_keyboard, get_video_watermark_keyboard

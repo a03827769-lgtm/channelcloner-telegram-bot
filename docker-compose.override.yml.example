@@ -1,10 +1,14 @@
-# Example Docker Compose Override for Local Development / Custom Proxies
-# Copy to docker-compose.override.yml to use. (Ignored by git)
+# Example local overrides for docker compose.
+# Copy to docker-compose.override.yml (git-ignored); `docker compose` merges it automatically.
+# Only settings the application reads are useful here (see config/settings.py and .env.example).
 
 services:
   telegram-cloner:
     environment:
-      # Uncomment if you are running behind a local corporate / WSL proxy:
-      # - HTTP_PROXY=http://192.168.65.254:8888
-      # - HTTPS_PROXY=http://192.168.65.254:8888
-      - LOG_LEVEL=DEBUG
+      # Bot API through an HTTP/SOCKS proxy (PROXY_URL in config/settings.py).
+      # HTTP_PROXY/HTTPS_PROXY pointing at Docker Desktop's internal proxy are ignored by run.py.
+      # PROXY_URL: "socks5://user:password@proxy.example.com:1080"
+      ENABLE_PLAYWRIGHT: "false"
+    # Smaller hosts:
+    # mem_limit: 1g
+    # cpus: 1.0

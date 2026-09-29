@@ -1,5 +1,4 @@
 import unittest
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 from aiogram.types import Message, CallbackQuery, User as AiogramUser, Chat
 from bot.middlewares.throttling_middleware import ThrottlingMiddleware

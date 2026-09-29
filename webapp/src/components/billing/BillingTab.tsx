@@ -1,23 +1,30 @@
 import React from 'react';
 import { Crown, Check, Star, ShieldCheck, Zap } from 'lucide-react';
-import { Subscription } from '../../types';
+import { BillingCatalog, Subscription } from '../../types';
 import { telegram } from '../../services/telegram';
 
 interface BillingTabProps {
   subscription: Subscription | null;
+  /** Prices from the server (config/plans.py); the static values below are only a fallback */
+  billing: BillingCatalog | null;
   onSelectPlan: (planKey: string) => Promise<void>;
 }
 
-export const BillingTab: React.FC<BillingTabProps> = ({ subscription, onSelectPlan }) => {
+const periodLabel = (days: number) => (days % 30 === 0 ? `${days / 30} oy` : `${days} kun`);
+
+export const BillingTab: React.FC<BillingTabProps> = ({ subscription, billing, onSelectPlan }) => {
   const currentTier = subscription?.tier || 'free';
   const [processingPlan, setProcessingPlan] = React.useState<string | null>(null);
+  const planInfo = (key: 'pro' | 'vip') => billing?.plans.find((p) => p.key === key);
+  const vipPlan = planInfo('vip');
+  const proPlan = planInfo('pro');
 
   const plans = [
     {
       key: 'vip',
       name: 'VIP Cheksiz',
-      stars: 300,
-      period: '1 oy',
+      stars: vipPlan?.stars ?? 300,
+      period: periodLabel(vipPlan?.days ?? 30),
       badge: 'visionOS & Cheksiz',
       isPopular: false,
       isVip: true,
@@ -36,14 +43,14 @@ export const BillingTab: React.FC<BillingTabProps> = ({ subscription, onSelectPl
     {
       key: 'pro',
       name: 'Pro Tarif',
-      stars: 100,
-      period: '1 oy',
+      stars: proPlan?.stars ?? 100,
+      period: periodLabel(proPlan?.days ?? 30),
       badge: 'Eng Ommabop',
       isPopular: true,
       iconColor: 'bg-[#0A84FF]',
       icon: Zap,
       features: [
-        '5 tagacha faol kanal juftligi',
+        `${proPlan?.max_channels ?? 5} tagacha faol kanal juftligi`,
         'AI Content Paraphraser (3 xil uslub)',
         'Rasm va Video Watermark (Logo urish)',
         'Avto-Tarjima (Uz, Ru, En, Tr)',
@@ -55,7 +62,7 @@ export const BillingTab: React.FC<BillingTabProps> = ({ subscription, onSelectPl
       key: 'free',
       name: 'Bepul Sinov',
       stars: 0,
-      period: '14 kun',
+      period: `${billing?.trial_days ?? 14} kun`,
       badge: 'Boshlang\'ich',
       isPopular: false,
       iconColor: 'bg-[#636366]',

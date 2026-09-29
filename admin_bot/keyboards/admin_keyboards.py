@@ -1,5 +1,4 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from config.settings import settings
 from services.custom_emojis import (
     ID_SETTINGS, ID_SERVER_CPU, ID_KEY, ID_BROADCAST, ID_USERS, ID_BACKUP,
     ID_SUCCESS, ID_SUCCESS_V2, ID_ERROR, ID_DOCUMENT, ID_REFRESH, ID_BACK,
@@ -7,21 +6,35 @@ from services.custom_emojis import (
     ID_ARROW_LEFT, ID_ARROW_RIGHT
 )
 
+# Labels of the persistent admin reply keyboard. Handlers match them exactly, and wizard input
+# handlers ignore them so tapping a menu button never becomes wizard input.
+ADMIN_MENU_DASHBOARD = "Boshqaruv Paneli"
+ADMIN_MENU_STATUS = "Tizim Holati & Server"
+ADMIN_MENU_MTPROTO = "MTProto Hisob"
+ADMIN_MENU_BROADCAST = "Xabar Tarqatish"
+ADMIN_MENU_USERS = "Foydalanuvchilar"
+ADMIN_MENU_BACKUP = "Baza Nusxasi (Backup)"
+ADMIN_REPLY_MENU_LABELS = frozenset({
+    ADMIN_MENU_DASHBOARD, ADMIN_MENU_STATUS, ADMIN_MENU_MTPROTO,
+    ADMIN_MENU_BROADCAST, ADMIN_MENU_USERS, ADMIN_MENU_BACKUP,
+})
+
+
 def get_admin_reply_keyboard() -> ReplyKeyboardMarkup:
     """Bottom persistent keyboard for Super Admins with Bot API 9.4 styles"""
     return ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text="Boshqaruv Paneli", style="primary", icon_custom_emoji_id=ID_SETTINGS),
-                KeyboardButton(text="Tizim Holati & Server", style="primary", icon_custom_emoji_id=ID_SERVER_CPU)
+                KeyboardButton(text=ADMIN_MENU_DASHBOARD, style="primary", icon_custom_emoji_id=ID_SETTINGS),
+                KeyboardButton(text=ADMIN_MENU_STATUS, style="primary", icon_custom_emoji_id=ID_SERVER_CPU)
             ],
             [
-                KeyboardButton(text="MTProto Hisob", style="primary", icon_custom_emoji_id=ID_KEY),
-                KeyboardButton(text="Xabar Tarqatish", style="primary", icon_custom_emoji_id=ID_BROADCAST)
+                KeyboardButton(text=ADMIN_MENU_MTPROTO, style="primary", icon_custom_emoji_id=ID_KEY),
+                KeyboardButton(text=ADMIN_MENU_BROADCAST, style="primary", icon_custom_emoji_id=ID_BROADCAST)
             ],
             [
-                KeyboardButton(text="Foydalanuvchilar", style="primary", icon_custom_emoji_id=ID_USERS),
-                KeyboardButton(text="Baza Nusxasi (Backup)", style="success", icon_custom_emoji_id=ID_BACKUP)
+                KeyboardButton(text=ADMIN_MENU_USERS, style="primary", icon_custom_emoji_id=ID_USERS),
+                KeyboardButton(text=ADMIN_MENU_BACKUP, style="success", icon_custom_emoji_id=ID_BACKUP)
             ]
         ],
         resize_keyboard=True,
@@ -308,6 +321,58 @@ def get_cancel_whitelist_keyboard() -> InlineKeyboardMarkup:
                 style="danger",
                 icon_custom_emoji_id=ID_ERROR,
                 callback_data="admin_bot_mode"
+            )
+        ]
+    ])
+
+def get_broadcast_confirm_keyboard(total_users: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f"Ha, {total_users} ta foydalanuvchiga yuborish",
+                icon_custom_emoji_id=ID_SUCCESS,
+                style="success",
+                callback_data="admin_broadcast_confirm"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Bekor qilish",
+                icon_custom_emoji_id=ID_ERROR,
+                style="danger",
+                callback_data="admin_broadcast_cancel"
+            )
+        ]
+    ])
+
+def get_broadcast_stop_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="Tarqatishni to'xtatish",
+                icon_custom_emoji_id=ID_ERROR,
+                style="danger",
+                callback_data="admin_broadcast_stop"
+            )
+        ]
+    ])
+
+def get_revoke_confirm_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="Ha, tarifni bekor qilish",
+                icon_custom_emoji_id=ID_ERROR,
+                style="danger",
+                callback_data=f"adm_revoke_ok_{user_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Yo'q, orqaga",
+                icon_custom_emoji_id=ID_BACK,
+                style="primary",
+                callback_data=f"adm_user_{user_id}"
             )
         ]
     ])

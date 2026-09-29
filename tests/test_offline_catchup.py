@@ -1,7 +1,7 @@
 import unittest
 import os
+import tempfile
 import uuid
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from database.db_manager import DatabaseManager
 from database.models import ChannelPair
@@ -9,8 +9,8 @@ from services.telethon_listener import TelethonListener
 
 class TestOfflineCatchup(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.test_db_path = f"temp_media/test_catchup_{uuid.uuid4().hex[:8]}.db"
-        os.makedirs("temp_media", exist_ok=True)
+        self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.test_db_path = os.path.join(self._tmp_dir.name, f"test_catchup_{uuid.uuid4().hex[:8]}.db")
         self.db = DatabaseManager(self.test_db_path)
         await self.db.init_db()
 
@@ -19,6 +19,7 @@ class TestOfflineCatchup(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         from tests.test_utils import safe_cleanup_db
         await safe_cleanup_db(self.test_db_path, self.db)
+        self._tmp_dir.cleanup()
 
     async def test_channel_pair_catchup_defaults_and_toggle(self):
         """Tests that auto_catchup defaults to True and can be toggled in DB"""

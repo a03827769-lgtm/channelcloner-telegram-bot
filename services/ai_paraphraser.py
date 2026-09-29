@@ -12,6 +12,15 @@ from services.custom_emojis import (
 
 logger = logging.getLogger(__name__)
 
+# Posts longer than this are rewritten by the deterministic templates only (the model's answer would be truncated)
+AI_MAX_INPUT_CHARS = 6000
+AI_MAX_OUTPUT_TOKENS = 8192
+# A rewrite shorter than this share of the original is treated as truncated output (except for the "short" mode)
+AI_MIN_KEPT_RATIO = 0.4
+_HTML_PLACEHOLDER_RE = re.compile(r'___HTM_\d+___', re.IGNORECASE)
+_BARE_AMPERSAND_RE = re.compile(r'&(?!(?:[a-zA-Z0-9]+|#[0-9]+|#x[0-9a-fA-F]+);)')
+
+
 class AIParaphraserService:
     """
     Intelligent Content Paraphraser & Tone Shifter.
@@ -22,6 +31,23 @@ class AIParaphraserService:
 
     def __init__(self):
         pass
+
+    @staticmethod
+    def _accept_ai_output(masked_input: str, output: Optional[str], mode: str) -> Optional[str]:
+        """Validates a model rewrite: every HTML placeholder must survive (otherwise tags would be lost and the post
+        could become unbalanced HTML) and the text must not be truncated. Returns HTML-safe text or None."""
+        if not output or not output.strip():
+            return None
+        expected = {p.lower() for p in _HTML_PLACEHOLDER_RE.findall(masked_input)}
+        found = {p.lower() for p in _HTML_PLACEHOLDER_RE.findall(output)}
+        if expected - found:
+            logger.debug("Gemini rewrite dropped HTML placeholders; using the template rewrite instead")
+            return None
+        if mode != "short" and len(output.strip()) < len(masked_input.strip()) * AI_MIN_KEPT_RATIO:
+            logger.debug("Gemini rewrite looks truncated; using the template rewrite instead")
+            return None
+        safe = output.replace("<", "&lt;").replace(">", "&gt;")
+        return _BARE_AMPERSAND_RE.sub("&amp;", safe)
 
     @staticmethod
     def _strip_markdown_code_fences(text: str) -> str:
@@ -50,7 +76,7 @@ class AIParaphraserService:
                 }],
                 "generationConfig": {
                     "temperature": 0.4,
-                    "maxOutputTokens": 2048
+                    "maxOutputTokens": AI_MAX_OUTPUT_TOKENS
                 }
             }
             req_data = json.dumps(payload).encode("utf-8")
@@ -62,12 +88,12 @@ class AIParaphraserService:
             with _urllib_request.urlopen(req, timeout=8.0) as resp:
                 res_json = json.loads(resp.read().decode("utf-8"))
                 candidates = res_json.get("candidates", [])
-                if candidates:
+                if candidates and candidates[0].get("finishReason") != "MAX_TOKENS":
                     parts = candidates[0].get("content", {}).get("parts", [])
                     if parts and parts[0].get("text"):
                         return self._strip_markdown_code_fences(parts[0]["text"])
         except Exception as e:
-            logger.debug(f"Gemini API paraphraser notice: {e}")
+            logger.debug(f"Gemini API paraphraser notice: {type(e).__name__}")
         return None
 
 
@@ -105,10 +131,8 @@ class AIParaphraserService:
             except RuntimeError:
                 loop = None
 
-            if not (loop and loop.is_running()):
-                transformed = self._paraphrase_with_gemini(masked_text, mode, gemini_key)
-                if transformed:
-                    transformed = transformed.replace("<", "&lt;").replace(">", "&gt;")
+            if not (loop and loop.is_running()) and len(masked_text) <= AI_MAX_INPUT_CHARS:
+                transformed = self._accept_ai_output(masked_text, self._paraphrase_with_gemini(masked_text, mode, gemini_key), mode)
 
         # 2. Seamlessly fallback to deterministic high-performance template re-writers
         if not transformed:
@@ -153,7 +177,7 @@ class AIParaphraserService:
                 }],
                 "generationConfig": {
                     "temperature": 0.4,
-                    "maxOutputTokens": 2048
+                    "maxOutputTokens": AI_MAX_OUTPUT_TOKENS
                 }
             }
             headers = {
@@ -166,14 +190,14 @@ class AIParaphraserService:
                     if resp.status == 200:
                         res_json = await resp.json()
                         candidates = res_json.get("candidates", [])
-                        if candidates:
+                        if candidates and candidates[0].get("finishReason") != "MAX_TOKENS":
                             parts = candidates[0].get("content", {}).get("parts", [])
                             if parts and parts[0].get("text"):
                                 return self._strip_markdown_code_fences(parts[0]["text"])
                     else:
                         logger.debug(f"Gemini API returned status {resp.status}")
         except Exception as e:
-            logger.debug(f"Gemini API async paraphraser notice: {e}")
+            logger.debug(f"Gemini API async paraphraser notice: {type(e).__name__}")
         return None
 
     async def paraphrase_async(self, text: str, mode: str = "off") -> str:
@@ -196,10 +220,10 @@ class AIParaphraserService:
 
         transformed = None
         gemini_key = getattr(settings, "GEMINI_API_KEY", None)
-        if gemini_key:
-            transformed = await self._paraphrase_with_gemini_async(masked_text, mode, gemini_key)
-            if transformed:
-                transformed = transformed.replace("<", "&lt;").replace(">", "&gt;")
+        if gemini_key and len(masked_text) <= AI_MAX_INPUT_CHARS:
+            transformed = self._accept_ai_output(
+                masked_text, await self._paraphrase_with_gemini_async(masked_text, mode, gemini_key), mode
+            )
 
         if not transformed:
             if mode == "formal":

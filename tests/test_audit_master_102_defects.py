@@ -1,18 +1,14 @@
-import os
 import json
-import asyncio
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
-from aiogram.types import Message, CallbackQuery, User as AiogramUser, Chat
+from aiogram.types import Message, User as AiogramUser, Chat
 from aiogram.fsm.storage.base import StorageKey
 
 from database.db_manager import DatabaseManager
-from database.models import User, ChannelPair
 from database.fsm_storage import SQLiteStorage
 from bot.middlewares.user_registration_middleware import UserRegistrationMiddleware
 from services.text_processor import TextProcessor
-from services.cloner_engine import ClonerEngine
 
 
 @pytest_asyncio.fixture

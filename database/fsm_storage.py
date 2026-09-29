@@ -1,10 +1,17 @@
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
 from aiogram.fsm.state import State
 from database.db_manager import DatabaseManager, db_manager
 
 logger = logging.getLogger(__name__)
+
+def _destiny(key: StorageKey) -> str:
+    """Business-connection chats get their own FSM namespace (StorageKey.business_connection_id)."""
+    destiny = key.destiny or "default"
+    bc_id = getattr(key, "business_connection_id", None)
+    return f"{destiny}|bc:{bc_id}" if bc_id else destiny
+
 
 class SQLiteStorage(BaseStorage):
     """
@@ -22,7 +29,7 @@ class SQLiteStorage(BaseStorage):
             chat_id=key.chat_id,
             user_id=key.user_id,
             thread_id=key.thread_id,
-            destiny=key.destiny,
+            destiny=_destiny(key),
             state=state_str
         )
 
@@ -32,17 +39,17 @@ class SQLiteStorage(BaseStorage):
             chat_id=key.chat_id,
             user_id=key.user_id,
             thread_id=key.thread_id,
-            destiny=key.destiny
+            destiny=_destiny(key)
         )
 
-    async def set_data(self, key: StorageKey, data: Dict[str, Any]) -> None:
+    async def set_data(self, key: StorageKey, data: Mapping[str, Any]) -> None:
         await self.db.set_fsm_data(
             bot_id=key.bot_id,
             chat_id=key.chat_id,
             user_id=key.user_id,
             thread_id=key.thread_id,
-            destiny=key.destiny,
-            data=data
+            destiny=_destiny(key),
+            data=dict(data)
         )
 
     async def get_data(self, key: StorageKey) -> Dict[str, Any]:
@@ -51,7 +58,7 @@ class SQLiteStorage(BaseStorage):
             chat_id=key.chat_id,
             user_id=key.user_id,
             thread_id=key.thread_id,
-            destiny=key.destiny
+            destiny=_destiny(key)
         )
 
     async def clear(self, key: StorageKey) -> None:
@@ -60,7 +67,7 @@ class SQLiteStorage(BaseStorage):
             chat_id=key.chat_id,
             user_id=key.user_id,
             thread_id=key.thread_id,
-            destiny=key.destiny
+            destiny=_destiny(key)
         )
 
     async def close(self) -> None:

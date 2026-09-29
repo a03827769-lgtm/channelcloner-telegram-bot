@@ -1,9 +1,11 @@
 import re
 import html
+import time
 import logging
-from typing import Optional, Tuple
-from aiogram import Router, F
+from typing import Dict, Optional, Tuple
+from aiogram import Router, F, Bot
 from aiogram.types import Message
+from database.db_manager import db_manager
 
 logger = logging.getLogger(__name__)
 router = Router(name="comment_moderator_router")
@@ -19,6 +21,14 @@ SPAM_PATTERNS = [
 PRICE_INQUIRY_PATTERNS = [
     r'\b(?:narxi\s*qancha|necha\s*pul|nech\s*pul|nechpul|qanchadan|narxini\s*ayting|skolko\s*stoit|цена|почем)\b'
 ]
+
+# Which groups are moderated is decided once per group and cached for this long (seconds)
+MODERATION_CACHE_TTL = 900.0
+# A failed look-up (network, rights) is retried sooner
+MODERATION_ERROR_TTL = 60.0
+
+# group chat id -> (expires_at monotonic, linked channel id of the moderated discussion group or None)
+_moderated_groups: Dict[int, Tuple[float, Optional[int]]] = {}
 
 
 class CommentModerator:
@@ -40,14 +50,66 @@ class CommentModerator:
         return any(re.search(pat, t_lower) for pat in PRICE_INQUIRY_PATTERNS)
 
 
+async def _is_active_pair_target(channel_id: int) -> bool:
+    raw_id = db_manager.normalize_peer_id(channel_id)
+    if raw_id is None:
+        return False
+    for pair in await db_manager.get_all_active_pairs():
+        if raw_id in (db_manager.normalize_peer_id(pair.target_id), db_manager.normalize_peer_id(pair.target_channel)):
+            return True
+    return False
+
+
+async def get_moderated_channel(bot: Bot, chat_id: int) -> Optional[int]:
+    """Linked channel id when `chat_id` is a discussion group the bot moderates, else None.
+
+    Moderation is opt-in by construction: only the discussion (comments) group linked to a channel that
+    is the target of an active channel pair is moderated. Every other group the bot is a member of —
+    including customers' target supergroups and unrelated groups — is left completely alone."""
+    now = time.monotonic()
+    cached = _moderated_groups.get(chat_id)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    linked_id: Optional[int] = None
+    ttl = MODERATION_CACHE_TTL
+    try:
+        chat = await bot.get_chat(chat_id)
+        linked = getattr(chat, "linked_chat_id", None)
+        if isinstance(linked, int) and await _is_active_pair_target(linked):
+            linked_id = linked
+    except Exception as e:
+        logger.debug(f"Could not determine moderation status of group {chat_id}: {e}")
+        ttl = MODERATION_ERROR_TTL
+
+    if len(_moderated_groups) > 5000:
+        for gid in [gid for gid, (exp, _) in _moderated_groups.items() if exp <= now]:
+            _moderated_groups.pop(gid, None)
+    _moderated_groups[chat_id] = (now + ttl, linked_id)
+    return linked_id
+
+
 @router.message(F.chat.type.in_(["group", "supergroup"]))
-async def handle_discussion_group_message(message: Message):
+async def handle_discussion_group_message(message: Message, bot: Bot):
     """
     Auto-moderates real estate channel discussion group comments:
     1. Instantly deletes spam, casino links, and illicit referral promos.
     2. Auto-answers frequent buyer inquiries (e.g. price inquiries in comments).
+    Only discussion groups of customers' target channels are moderated (see get_moderated_channel).
     """
     if not message.text and not message.caption:
+        return
+    # Channel posts mirrored into the comments group and messages the group's anonymous admins post on
+    # behalf of the group are the owners' own content
+    if message.is_automatic_forward:
+        return
+    if message.sender_chat is not None and message.sender_chat.id == message.chat.id:
+        return
+
+    linked_channel_id = await get_moderated_channel(bot, message.chat.id)
+    if linked_channel_id is None:
+        return
+    if message.sender_chat is not None and message.sender_chat.id == linked_channel_id:
         return
 
     text = message.text or message.caption or ""

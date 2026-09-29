@@ -1,5 +1,3 @@
-import os
-import re
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -152,7 +150,7 @@ async def test_paused_channel_pair_history_clone_rejected(tmp_path):
         target_title="Target"
     )
     # Pause the pair
-    await db.toggle_pair_active(pair_id)
+    await db.set_pair_active_by_owner(pair_id, False)
     pair = await db.get_pair_by_id(pair_id)
     assert pair.is_active is False
 

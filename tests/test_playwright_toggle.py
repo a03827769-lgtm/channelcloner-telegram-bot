@@ -1,7 +1,6 @@
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from services.story_renderer import StoryCardRenderer
-from config.settings import settings
 
 class TestPlaywrightToggle(unittest.TestCase):
     def setUp(self):

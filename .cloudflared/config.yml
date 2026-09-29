@@ -1,7 +1,0 @@
-tunnel: f499bc80-2abf-4b3e-b1a4-af5135c07346
-credentials-file: /etc/cloudflared/cert.json
-
-ingress:
-  - hostname: app.abdulloh.me
-    service: http://miniapp_web:80
-  - service: http_status:404

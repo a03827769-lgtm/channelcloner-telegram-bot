@@ -1,10 +1,8 @@
 import pytest
-import asyncio
 from datetime import datetime, timedelta, timezone
-from database.models import Subscription, ChannelPair, ClonedMessage
+from database.models import Subscription, ChannelPair
 from services.text_processor import TextProcessor
 from services.dynamic_affiliate_engine import dynamic_affiliate_engine
-from services.drip_feed_queue import drip_feed_service
 from services.phone_utils import normalize_phone_number
 
 @pytest.mark.asyncio

@@ -3,18 +3,27 @@ import hashlib
 import logging
 import asyncio
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Dict, List, Tuple
 from deep_translator import GoogleTranslator
 
 logger = logging.getLogger(__name__)
 
+# deep_translator performs requests.get() without a timeout. Every call runs in this small dedicated pool (so a
+# stalled HTTP request can never exhaust the default executor) and is abandoned after TRANSLATE_TIMEOUT_SECONDS.
+TRANSLATE_TIMEOUT_SECONDS = 15.0
+TRANSLATE_MAX_WORKERS = 4
+
+
 class TranslatorService:
     def __init__(self):
         self._cache: OrderedDict[str, str] = OrderedDict()
+        # Kept for API compatibility; translators are no longer shared (see _get_translator)
         self._translators: OrderedDict[str, GoogleTranslator] = OrderedDict()
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._semaphore_loop: Optional[asyncio.AbstractEventLoop] = None
         self._last_call_time: float = 0.0
+        self._executor: Optional[ThreadPoolExecutor] = None
 
     def _get_semaphore(self) -> asyncio.Semaphore:
         try:
@@ -26,16 +35,15 @@ class TranslatorService:
             self._semaphore_loop = curr_loop
         return self._semaphore
 
+    def _get_executor(self) -> ThreadPoolExecutor:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=TRANSLATE_MAX_WORKERS, thread_name_prefix="translator")
+        return self._executor
+
     def _get_translator(self, source: str = "auto", target: str = "uz") -> GoogleTranslator:
-        key = f"{source}_{target}"
-        if key in self._translators:
-            self._translators.move_to_end(key)
-            return self._translators[key]
-        translator = GoogleTranslator(source=source, target=target)
-        self._translators[key] = translator
-        if len(self._translators) > 50:
-            self._translators.popitem(last=False)
-        return translator
+        """A fresh translator per call: GoogleTranslator.translate() stores the text in the instance's URL
+        parameters, so one instance shared between worker threads could send another post's text."""
+        return GoogleTranslator(source=source, target=target)
 
     async def translate_text(self, text: str, target_lang: str = "uz", source_lang: str = "auto") -> str:
         """
@@ -63,6 +71,8 @@ class TranslatorService:
 
         # Mask HTML tags
         masked_text = re.sub(r'<[^>]+>', mask_match, text)
+        # Protected affiliate link placeholders must survive translation untouched
+        masked_text = re.sub(r'___AFF_PROT_\d+___', mask_match, masked_text)
         # Mask URLs (excluding trailing sentence punctuation)
         def mask_url(m):
             nonlocal counter
@@ -82,10 +92,12 @@ class TranslatorService:
 
         # 2. Perform translation in thread pool with automatic chunking for long texts
         loop = asyncio.get_running_loop()
-        translator = self._get_translator(source=source_lang, target=target_lang)
         sem = self._get_semaphore()
+        executor = self._get_executor()
+        failed = False
 
         async def _translate_chunk(chunk_str: str) -> str:
+            nonlocal failed
             if not chunk_str or not chunk_str.strip():
                 return chunk_str
             async with sem:
@@ -97,8 +109,20 @@ class TranslatorService:
 
                 for attempt in range(3):
                     try:
-                        res = await loop.run_in_executor(None, translator.translate, chunk_str)
+                        translator = self._get_translator(source=source_lang, target=target_lang)
+                        res = await asyncio.wait_for(
+                            loop.run_in_executor(executor, translator.translate, chunk_str),
+                            timeout=TRANSLATE_TIMEOUT_SECONDS
+                        )
+                        if not res:
+                            failed = True
                         return res if res else chunk_str
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"Google Translate did not answer within {TRANSLATE_TIMEOUT_SECONDS:.0f}s "
+                            f"({source_lang}->{target_lang}); keeping the original text."
+                        )
+                        break
                     except Exception as ex:
                         err_str = str(ex).lower()
                         if ("too many requests" in err_str or "5 requests" in err_str or "quota" in err_str) and attempt < 2:
@@ -106,6 +130,7 @@ class TranslatorService:
                             continue
                         logger.warning(f"Google Translate chunk notice ({source_lang}->{target_lang}, attempt {attempt+1}): {ex}")
                         break
+                failed = True
                 return chunk_str
 
         def _split_into_chunks(txt: str, max_chunk_size: int = 3500) -> Tuple[List[str], str]:
@@ -161,9 +186,11 @@ class TranslatorService:
             translated
         )
 
-        self._cache[cache_key] = translated
-        if len(self._cache) > 2000:
-            self._cache.popitem(last=False)
+        # A chunk that timed out or failed stays untranslated; such results are not cached so the next post retries
+        if not failed:
+            self._cache[cache_key] = translated
+            if len(self._cache) > 2000:
+                self._cache.popitem(last=False)
         return translated
 
 translator_service = TranslatorService()

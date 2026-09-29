@@ -1,8 +1,7 @@
 import os
 import unittest
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
-from aiogram import Bot, Dispatcher
+from aiogram import Bot
 from aiogram.types import User, Chat, Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage, StorageKey
@@ -15,50 +14,53 @@ import bot.handlers.help_guide as help_guide_mod
 import bot.handlers.cloner_menu as cloner_menu_mod
 import bot.handlers.settings_menu as settings_menu_mod
 import bot.handlers.stars_billing as stars_billing_mod
-import bot.handlers.history_clone as history_clone_mod
 
 import admin_bot.handlers.dashboard as admin_dashboard_mod
 import admin_bot.handlers.system_status as admin_status_mod
 import admin_bot.handlers.user_management as admin_user_mod
-import admin_bot.handlers.broadcast as admin_broadcast_mod
 import admin_bot.handlers.backup as admin_backup_mod
-import admin_bot.handlers.mtproto_auth as admin_auth_mod
 
 class TestAllButtonsAndFlows(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         import tempfile
-        self.temp_dir = tempfile.TemporaryDirectory()
+        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp_dir.cleanup)
         self.test_db_path = os.path.join(self.temp_dir.name, "test_e2e.db")
         self.db = DatabaseManager(self.test_db_path)
+        self.addAsyncCleanup(self.db.close)
         await self.db.init_db()
 
-        # Patch global db_manager across all handlers
-        self.patchers = [
+        self.user_id = 7770001
+        self.admin_id = 9990001
+        self.public_bot = AsyncMock(spec=Bot)
+
+        # Every patch is undone by a cleanup, which also runs when asyncSetUp fails halfway
+        patchers = [
+            patch.object(settings, "ADMIN_IDS_RAW", f"{self.admin_id}"),
+            patch.object(settings, "PRIMARY_SUPER_ADMIN_ID", 0),
             patch("bot.handlers.start.db_manager", self.db),
             patch("bot.handlers.cloner_menu.db_manager", self.db),
             patch("bot.handlers.settings_menu.db_manager", self.db),
             patch("bot.handlers.stars_billing.db_manager", self.db),
             patch("bot.handlers.history_clone.db_manager", self.db),
+            patch("bot.filters.admin_filter.db_manager", self.db),
             patch("admin_bot.handlers.dashboard.db_manager", self.db),
             patch("admin_bot.handlers.system_status.db_manager", self.db),
             patch("admin_bot.handlers.user_management.db_manager", self.db),
             patch("admin_bot.handlers.broadcast.db_manager", self.db),
             patch("admin_bot.handlers.backup.db_manager", self.db),
             patch("services.disaster_recovery.db_manager", self.db),
-            patch("admin_bot.handlers.user_management.Bot"),
-            patch("admin_bot.handlers.broadcast.Bot"),
+            # Notifications go through the public bot: a mock, never a real Bot API session
+            patch("admin_bot.handlers.user_management.get_public_bot", return_value=self.public_bot),
+            patch("admin_bot.handlers.broadcast.get_public_bot", return_value=self.public_bot),
         ]
-        for p in self.patchers:
+        for p in patchers:
             p.start()
+            self.addCleanup(p.stop)
 
-        # Setup user and pair
-        self.user_id = 7770001
-        self.admin_id = 9990001
-        settings.ADMIN_IDS_RAW = f"{self.admin_id}"
-
-        await self.db.get_or_create_user(self.user_id, "Test User", "testuser", is_admin=False)
-        await self.db.get_or_create_user(self.admin_id, "Super Admin", "superadmin", is_admin=True)
+        await self.db.get_or_create_user(self.user_id, "Test User", "testuser")
+        await self.db.get_or_create_user(self.admin_id, "Super Admin", "superadmin")
         await self.db.activate_subscription(self.user_id, "vip", 300, "test_vip_charge", days=30)
 
         self.pair_id = await self.db.add_channel_pair(
@@ -70,18 +72,6 @@ class TestAllButtonsAndFlows(unittest.IsolatedAsyncioTestCase):
         )
 
         self.storage = MemoryStorage()
-
-    async def asyncTearDown(self):
-        for p in self.patchers:
-            p.stop()
-        try:
-            await self.db.close()
-        except Exception:
-            pass
-        try:
-            self.temp_dir.cleanup()
-        except Exception:
-            pass
 
     def _create_mock_message(self, user_id: int, text: str = "") -> Message:
         msg = MagicMock(spec=Message)
@@ -150,11 +140,12 @@ class TestAllButtonsAndFlows(unittest.IsolatedAsyncioTestCase):
         await stars_billing_mod.cb_billing_menu(cb_stars, state)
         cb_stars.message.edit_text.assert_called_once()
 
-        # Test buying pro plan
+        # The user has an active VIP plan: the lower Pro tier is not sold (it could only add VIP time)
         cb_pro = self._create_mock_callback(self.user_id, "buy_plan_pro")
         cb_pro.bot.send_invoice = AsyncMock()
         await stars_billing_mod.cb_buy_plan(cb_pro)
-        cb_pro.bot.send_invoice.assert_called_once()
+        cb_pro.bot.send_invoice.assert_not_called()
+        self.assertTrue(cb_pro.answer.await_args.kwargs.get("show_alert"))
 
         # Test buying vip plan
         cb_vip = self._create_mock_callback(self.user_id, "buy_plan_vip")
@@ -265,14 +256,10 @@ class TestAllButtonsAndFlows(unittest.IsolatedAsyncioTestCase):
         p = await self.db.get_pair_by_id(self.pair_id)
         self.assertFalse(p.backup_enabled)
 
-        # 13. Channel Pair Stats & Preview
+        # 13. Channel Pair Stats
         cb_stats = self._create_mock_callback(self.user_id, f"pair_stats_{self.pair_id}")
         await cloner_menu_mod.cb_pair_stats(cb_stats)
         cb_stats.message.edit_text.assert_called_once()
-
-        cb_preview = self._create_mock_callback(self.user_id, f"pair_preview_{self.pair_id}")
-        await cloner_menu_mod.cb_preview_pair(cb_preview)
-        cb_preview.message.edit_text.assert_called_once()
 
     # --- TEST ADMIN BOT FLOWS ---
 
@@ -305,9 +292,14 @@ class TestAllButtonsAndFlows(unittest.IsolatedAsyncioTestCase):
         sub = await self.db.get_user_subscription(self.user_id)
         self.assertEqual(sub.tier, "vip")
 
-        # 6. Revoke tier
+        # 6. Revoke tier: the first tap only asks for confirmation
         cb_revoke = self._create_mock_callback(self.admin_id, f"adm_revoke_{self.user_id}")
         await admin_user_mod.cb_revoke_tier(cb_revoke)
+        sub = await self.db.get_user_subscription(self.user_id)
+        self.assertEqual(sub.tier, "vip")
+
+        cb_revoke_ok = self._create_mock_callback(self.admin_id, f"adm_revoke_ok_{self.user_id}")
+        await admin_user_mod.cb_revoke_tier_confirm(cb_revoke_ok)
         sub = await self.db.get_user_subscription(self.user_id)
         self.assertEqual(sub.tier, "free")
 
@@ -319,8 +311,12 @@ class TestAllButtonsAndFlows(unittest.IsolatedAsyncioTestCase):
 
         # 8. Restart listener
         cb_restart = self._create_mock_callback(self.admin_id, "admin_restart_listener")
-        await admin_dashboard_mod.cb_restart_listener(cb_restart)
+        listener = admin_dashboard_mod.telethon_listener
+        with patch.object(listener, "is_connected", return_value=False),              patch.object(listener, "start", new=AsyncMock()) as start_mock:
+            await admin_dashboard_mod.cb_restart_listener(cb_restart, state)
+        start_mock.assert_awaited_once()
         cb_restart.message.edit_text.assert_called_once()
+        self.assertIn("ulanmadi", cb_restart.message.edit_text.call_args.kwargs["text"])
 
 if __name__ == "__main__":
     unittest.main()

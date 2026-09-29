@@ -1,14 +1,12 @@
 import pytest
-import os
 import asyncio
 from datetime import datetime, timezone, timedelta
 from config.settings import Settings
-from database.models import Subscription, ChannelPair, DripQueueItem, ChannelBackup
+from database.models import Subscription
 from database.db_manager import DatabaseManager
-from services.cache_manager import HighLoadCacheManager, LRUSet
+from services.cache_manager import HighLoadCacheManager
 from services.text_processor import TextProcessor
 from services.video_watermark_service import video_watermark_service
-from services.telethon_listener import TelethonListener
 from deploy.anti_reclaim import OracleAntiReclaimDaemon
 
 def test_settings_admin_ids_flexible_parsing():
@@ -64,11 +62,20 @@ def test_text_processor_fit_caption_limit_lifo_stack():
     assert overflow.startswith('<a href="https://t.me/test"><b>')
 
 def test_text_processor_attach_signature_html_safe():
-    """Verify attach_signature never cuts inside an HTML tag"""
-    long_html = "<div>" + ("A" * 4090) + "</div>"
+    """attach_signature never truncates the post; the send path splits it into chunks that fit the limit
+    without cutting inside an HTML tag, and the signature ends up in the last chunk"""
+    long_html = "<b>" + ("A" * 4090) + "</b>"
     res = TextProcessor.attach_signature(long_html, "MySignature")
-    assert len(res) <= 4096
-    assert "MySignature" in res
+    assert res.startswith(long_html)
+    assert res.endswith("MySignature")
+
+    chunks = TextProcessor.fit_text_limit(res, max_limit=4096)
+    assert len(chunks) >= 2
+    assert all(TextProcessor.get_visible_text_length(chunk) <= 4096 for chunk in chunks)
+    assert all(chunk.count("<b>") == chunk.count("</b>") for chunk in chunks)
+    assert chunks[-1].rstrip().endswith("MySignature")
+    # Nothing of the post body is lost
+    assert sum(chunk.count("A") for chunk in chunks) == 4090
 
 def test_video_watermark_font_finder():
     """Verify _find_default_fontfile returns a valid font or None without exception"""

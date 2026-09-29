@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { History, Play, RefreshCw, Layers } from 'lucide-react';
 import { ChannelPair } from '../../types';
 import { telegram } from '../../services/telegram';
+import { errorText } from '../../services/api';
 
 interface BackfillTabProps {
   pairs: ChannelPair[];
@@ -14,6 +15,13 @@ export const BackfillTab: React.FC<BackfillTabProps> = ({ pairs, onTriggerBackfi
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [logMessages, setLogMessages] = useState<string[]>([]);
 
+  // Keep the selection valid when pairs load later or the selected pair is deleted
+  useEffect(() => {
+    if (!pairs.some((p) => p.id === selectedPairId)) {
+      setSelectedPairId(pairs[0]?.id || 0);
+    }
+  }, [pairs, selectedPairId]);
+
   const handleStart = async () => {
     if (!selectedPairId) {
       telegram.notification('error');
@@ -22,21 +30,20 @@ export const BackfillTab: React.FC<BackfillTabProps> = ({ pairs, onTriggerBackfi
     telegram.impact('medium');
     setIsRunning(true);
     setLogMessages([
-      `[Boshlandi] Tarixiy ${postCount} ta xabarni ko'chirish navbati tuzildi.`,
-      `[Telegram MTProto] Manba kanalidan xabarlar olinmoqda...`
+      `[Yuborildi] Tarixiy ${postCount} ta xabarni ko'chirish so'rovi yuborilmoqda...`
     ]);
 
     try {
       await onTriggerBackfill(selectedPairId, postCount);
       setLogMessages((prev) => [
         ...prev,
-        `[Muvaffaqiyatli] ${postCount} ta post nishon kanaliga ko'chirildi! 🚀`,
+        `[Navbatga qo'yildi] ${postCount} ta post orqa fonda ko'chiriladi. Yakunlanganda bot sizga xabar yuboradi. 🚀`,
       ]);
       telegram.notification('success');
-    } catch (err: any) {
+    } catch (err) {
       setLogMessages((prev) => [
         ...prev,
-        `[Xatolik] ${err.message || 'Xatolik yuz berdi'}`,
+        `[Xatolik] ${errorText(err, 'Xatolik yuz berdi')}`,
       ]);
       telegram.notification('error');
     } finally {

@@ -1,18 +1,14 @@
-import os
-import asyncio
 import datetime
-from datetime import timezone, timedelta
+from datetime import timezone
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.exceptions import TelegramBadRequest
 
 from database.models import ChannelPair
 from services.video_watermark_service import VideoWatermarkService
 from services.dynamic_affiliate_engine import DynamicAffiliateEngine
 from services.drip_feed_queue import DripFeedQueueService, UZB_TZ
 from services.disaster_recovery import DisasterRecoveryService
-from services.translator_service import TranslatorService
 from bot.handlers.settings_menu import process_new_wm_text
 from bot.handlers.history_clone import cb_cancel_history_clone
 from admin_bot.handlers.backup import cb_download_backup
@@ -143,9 +139,10 @@ async def test_settings_menu_preserves_watermark_position():
     mock_message.answer = AsyncMock()
     
     with patch("database.db_manager.db_manager.get_pair_by_id", new_callable=AsyncMock) as mock_get_pair, \
-         patch("database.db_manager.db_manager.update_watermark_settings", new_callable=AsyncMock) as mock_update_wm:
+         patch("database.db_manager.db_manager.update_watermark_settings", new_callable=AsyncMock) as mock_update_wm, \
+         patch("bot.handlers.settings_menu._has_paid_plan", new=AsyncMock(return_value=True)):
         mock_get_pair.return_value = mock_pair
-        
+
         await process_new_wm_text(mock_message, state)
         
         mock_update_wm.assert_called_once()
@@ -154,23 +151,28 @@ async def test_settings_menu_preserves_watermark_position():
 
 
 @pytest.mark.asyncio
-async def test_backup_delete_wait_msg_resilient():
-    """Verify that cb_download_backup does not alert failure if wait_msg.delete() throws"""
+async def test_backup_delete_wait_msg_resilient(tmp_path):
+    """cb_download_backup delivers the encrypted backup and does not report a failure when only the
+    deletion of its progress message fails; temporary files are removed afterwards"""
+    snapshot = tmp_path / "cloner_snapshot.db"
+    snapshot.write_bytes(b"SQLite format 3\x00" + b"0" * 2048)
+
     mock_event = AsyncMock()
     mock_wait_msg = AsyncMock()
     mock_wait_msg.delete.side_effect = Exception("Cannot delete message")
     mock_wait_msg.edit_text = AsyncMock()
     mock_event.message.answer.return_value = mock_wait_msg
     mock_event.from_user.id = 12345
-    
-    with patch("database.db_manager.db_manager.create_backup_file", return_value="/tmp/test_backup.db"), \
-         patch("zipfile.ZipFile"), \
-         patch("os.path.exists", return_value=True), \
-         patch("os.path.getsize", return_value=1024), \
-         patch("admin_bot.handlers.backup.FSInputFile"):
+
+    with patch("admin_bot.handlers.backup.ensure_super_admin", new=AsyncMock(return_value=True)), \
+         patch("database.db_manager.db_manager.create_backup_file", new=AsyncMock(return_value=str(snapshot))):
         await cb_download_backup(mock_event)
-        
+
+    mock_event.bot.send_document.assert_awaited_once()
+    assert mock_event.bot.send_document.await_args.kwargs["chat_id"] == 12345
     mock_wait_msg.edit_text.assert_not_called()
+    assert not snapshot.exists()
+    assert not (tmp_path / "cloner_snapshot.db.zip.enc").exists()
 
 
 @pytest.mark.asyncio
@@ -178,6 +180,7 @@ async def test_history_cancel_keyboard_attached():
     """Verify that cb_cancel_history_clone provides reply_markup on cancellation"""
     mock_callback = AsyncMock()
     mock_callback.data = "hist_cancel_77"
+    mock_callback.from_user.id = 999
     mock_callback.message.edit_text = AsyncMock()
     
     mock_pair = ChannelPair(
@@ -221,13 +224,9 @@ async def test_disaster_recovery_safe_send_resilience():
 
 
 def test_video_watermark_escape_drawtext_apostrophe():
-    """Verify that _escape_drawtext properly escapes apostrophes for FFmpeg without breaking syntax"""
+    """The watermark text reaches FFmpeg through textfile= with expansion=none, so it is kept verbatim
+    (apostrophes, colons, percent signs and brackets need no escaping); only tags and line breaks go"""
     service = VideoWatermarkService()
-    text = "O'zbekiston: Yangiliklar [2026] & 100%"
-    escaped = service._escape_drawtext(text)
-    assert "'\\''" not in escaped, "Shell-style quote escaping should not be present"
-    assert r"O\'zbekiston" in escaped
-    assert r"\:" in escaped
-    assert r"\%" in escaped
-    assert r"\[" in escaped and r"\]" in escaped
-
+    text = "<b>O'zbekiston: Yangiliklar</b>\n[2026] &amp; 100%"
+    prepared = service._prepare_watermark_text(text)
+    assert prepared == "O'zbekiston: Yangiliklar [2026] & 100%"

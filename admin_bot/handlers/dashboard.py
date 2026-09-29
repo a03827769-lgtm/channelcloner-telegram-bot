@@ -1,9 +1,7 @@
+import asyncio
 import logging
-from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
-from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
-from aiogram.exceptions import TelegramBadRequest
 from admin_bot.keyboards.admin_keyboards import (
     get_admin_dashboard_keyboard,
     get_admin_reply_keyboard,
@@ -17,9 +15,13 @@ from services.custom_emojis import (
 )
 
 from bot.utils import safe_answer, html_escape
+from admin_bot.ui import show_screen
 
 logger = logging.getLogger(__name__)
-router = Router(name="admin_dashboard_router")
+
+_listener_restart_lock = asyncio.Lock()
+_catchup_lock = asyncio.Lock()
+
 
 async def get_dashboard_text() -> str:
     me = await telethon_listener.get_me()
@@ -27,9 +29,10 @@ async def get_dashboard_text() -> str:
     is_private = await db_manager.is_private_mode()
     mode_badge = f"{ERROR} Yopiq (Private)" if is_private else f"{SUCCESS} Ommaviy (Public)"
     status_icon = LOCK_LOCKED if is_private else LOCK_UNLOCKED
-    
+
     if me:
-        telethon_status = f"{SUCCESS} Faol (<b>{html_escape(me.first_name or '')}</b>, @{me.username or 'mavjud_emas'})"
+        username = f"@{html_escape(me.username)}" if getattr(me, "username", None) else "username yo'q"
+        telethon_status = f"{SUCCESS} Faol (<b>{html_escape(me.first_name or '')}</b>, {username})"
     else:
         telethon_status = f"{WARN} Ulanmagan"
 
@@ -47,13 +50,14 @@ async def get_dashboard_text() -> str:
 <i>Barcha boshqaruv amallari faqat ushbu bot orqali xavfsiz amalga oshiriladi.</i>
 """
 
-@router.message(CommandStart())
-@router.message(Command("admin"))
-@router.message(F.text.contains("Boshqaruv Paneli"))
+
+async def _edit_dashboard(callback: CallbackQuery, text: str, reply_markup) -> None:
+    await show_screen(callback, text, reply_markup)
+
+
 async def cmd_admin_start(message: Message, state: FSMContext):
     await state.clear()
     me = await telethon_listener.get_me()
-    is_auth = me is not None
     is_private = await db_manager.is_private_mode()
 
     await message.answer(
@@ -61,111 +65,115 @@ async def cmd_admin_start(message: Message, state: FSMContext):
         parse_mode="HTML",
         reply_markup=get_admin_reply_keyboard()
     )
-
-    text = await get_dashboard_text()
     await message.answer(
-        text=text,
+        text=await get_dashboard_text(),
         parse_mode="HTML",
-        reply_markup=get_admin_dashboard_keyboard(is_auth=is_auth, is_private=is_private)
+        reply_markup=get_admin_dashboard_keyboard(is_auth=me is not None, is_private=is_private)
     )
 
-@router.callback_query(F.data == "admin_main_dashboard")
+
 async def cb_admin_dashboard(callback: CallbackQuery, state: FSMContext):
     await safe_answer(callback)
     await state.clear()
     me = await telethon_listener.get_me()
-    is_auth = me is not None
     is_private = await db_manager.is_private_mode()
+    await _edit_dashboard(
+        callback,
+        await get_dashboard_text(),
+        get_admin_dashboard_keyboard(is_auth=me is not None, is_private=is_private)
+    )
 
-    text = await get_dashboard_text()
-    try:
-        await callback.message.edit_text(
-            text=text,
-            parse_mode="HTML",
-            reply_markup=get_admin_dashboard_keyboard(is_auth=is_auth, is_private=is_private)
-        )
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e).lower():
-            raise
 
-@router.callback_query(F.data == "admin_restart_listener")
-async def cb_restart_listener(callback: CallbackQuery):
-    await safe_answer(callback, "MTProto qayta ishga tushirilmoqda...", show_alert=True)
-    try:
-        if not telethon_listener.is_connected():
-            await telethon_listener.start()
-        else:
-            await telethon_listener.refresh_monitored_channels()
-        dashboard_text = await get_dashboard_text()
-        is_private = await db_manager.is_private_mode()
+async def cb_restart_listener(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if _listener_restart_lock.locked():
+        await safe_answer(callback, "MTProto qayta ulanishi allaqachon davom etmoqda...", show_alert=True)
+        return
+    await safe_answer(callback, "MTProto qayta ishga tushirilmoqda...")
+    async with _listener_restart_lock:
         try:
-            await callback.message.edit_text(
-                text=f"{SUCCESS} <b>MTProto Tinglovchi muvaffaqiyatli sinxronlandi!</b>\n\n{dashboard_text}",
-                parse_mode="HTML",
-                reply_markup=get_admin_dashboard_keyboard(is_auth=telethon_listener.is_connected(), is_private=is_private)
-            )
-        except TelegramBadRequest as e:
-            if "message is not modified" not in str(e).lower():
-                raise
-    except Exception as e:
-        logger.error(f"Listener restart error: {e}")
-        await callback.message.answer(f"{ERROR} Xatolik: {e}")
+            if not telethon_listener.is_connected():
+                await telethon_listener.start()
+            else:
+                telethon_listener.invalidate_pairs_cache()
+                await telethon_listener.refresh_monitored_channels()
+        except Exception as e:
+            logger.error(f"Listener restart error: {e}", exc_info=True)
 
-@router.message(Command("catchup"))
+        connected = telethon_listener.is_connected()
+        if connected:
+            header = f"{SUCCESS} <b>MTProto tinglovchi faol va kanallar sinxronlandi.</b>"
+        else:
+            header = (
+                f"{ERROR} <b>MTProto tinglovchi ulanmadi.</b>\n"
+                f"<i>Hisob ulanmagan bo'lishi yoki Telegram bilan aloqa yo'qligi mumkin. MTProto Hisob bo'limini tekshiring.</i>"
+            )
+        is_private = await db_manager.is_private_mode()
+        await _edit_dashboard(
+            callback,
+            f"{header}\n{await get_dashboard_text()}",
+            get_admin_dashboard_keyboard(is_auth=connected, is_private=is_private)
+        )
+
+
 async def cmd_admin_catchup(message: Message):
-    """Admin command to trigger gap catchup across all active channels in the system"""
+    """Admin command to trigger gap catch-up across all active channels in the system"""
     if not telethon_listener.is_connected():
         await message.answer(f"{WARN} <b>Telethon MTProto ulanmagan!</b>", parse_mode="HTML")
         return
+    if _catchup_lock.locked():
+        await message.answer(f"{INFO} Catch-Up allaqachon davom etmoqda. Tugashini kuting.", parse_mode="HTML")
+        return
 
-    status_msg = await message.answer(
-        f"{REFRESH} <b>Barcha faol kanallar uchun oflayn yetkazish (Catch-Up) boshlandi...</b>",
-        parse_mode="HTML"
-    )
-
-    try:
-        results = await telethon_listener.catch_up_all_active_pairs()
-        total_caught = sum(r.get("caught_up", 0) for r in results.values() if isinstance(r, dict))
-        await status_msg.edit_text(
-            f"{SUCCESS} <b>Global Catch-Up yakunlandi!</b>\n\n"
-            f"Jami tekshirilgan juftliklar: <b>{len(results)} ta</b>\n"
-            f"Yetkazilgan yangi postlar: <b>{total_caught} ta</b>",
+    async with _catchup_lock:
+        status_msg = await message.answer(
+            f"{REFRESH} <b>Barcha faol kanallar uchun oflayn yetkazish (Catch-Up) boshlandi...</b>",
             parse_mode="HTML"
         )
-    except Exception as e:
-        logger.error(f"Global catchup error: {e}")
-        await status_msg.edit_text(f"{ERROR} Xatolik yuz berdi: {e}", parse_mode="HTML")
+        try:
+            results = await telethon_listener.catch_up_all_active_pairs()
+            total_caught = sum(r.get("caught_up", 0) for r in results.values() if isinstance(r, dict))
+            await status_msg.edit_text(
+                f"{SUCCESS} <b>Global Catch-Up yakunlandi!</b>\n\n"
+                f"Jami tekshirilgan juftliklar: <b>{len(results)} ta</b>\n"
+                f"Yetkazilgan yangi postlar: <b>{total_caught} ta</b>",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Global catchup error: {e}", exc_info=True)
+            await status_msg.edit_text(f"{ERROR} Catch-Up xatolik bilan to'xtadi: <code>{html_escape(str(e)[:300])}</code>", parse_mode="HTML")
 
-@router.message(Command("help"))
+
 async def cmd_admin_help(message: Message, state: FSMContext):
     await state.clear()
     help_text = f"""
-{SHIELD} <b>SUPER ADMIN BUYRUQLAR RO'YXATI:</b>
+{SHIELD} <b>ADMIN BUYRUQLAR RO'YXATI:</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
 ├ <code>/admin</code> yoki <code>/start</code> — Asosiy boshqaruv markazi
-├ <code>/status</code> — Tizim va server holati (RAM, CPU, 24/7)
-├ <code>/logs</code> — Jonli loglarni ko'rish (oxirgi 30 ta qator)
+├ <code>/status</code> — Tizim va server holati
+├ <code>/logs</code> — Jonli loglar (oxirgi 30 ta qator, faqat Super Admin)
 ├ <code>/users</code> — Foydalanuvchilar va obunalar ro'yxati
-├ <code>/backup</code> — Bazaning AES-128 shifrlangan zaxira nusxasi
+├ <code>/backup</code> — Bazaning shifrlangan zaxira nusxasi (faqat Super Admin)
 ├ <code>/mode</code> yoki <code>/access</code> — Bot kirish rejimi (Public/Private) va Whitelist
 ├ <code>/catchup</code> — Barcha kanallar uchun majburiy oflayn yangilash (Catch-Up)
-├ <code>/check_origin</code> — Rasmdagi ko'rinmas steganografiya mualliflik belgisini tekshirish
-└ <code>/cancel</code> — Har qanday joriy jarayonni bekor qilish
+├ <code>/check_origin</code> — Rasmdagi ko'rinmas mualliflik belgisini tekshirish
+└ <code>/cancel</code> — Joriy jarayonni bekor qilish
 ━━━━━━━━━━━━━━━━━━━━━━━
-<i>Barcha buyruqlar faqat Super Adminlar uchun faol!</i>
+<i>MTProto hisob, xabar tarqatish, zaxira nusxa, bot rejimi va tariflar faqat Super Adminlar uchun.</i>
 """
     await message.answer(text=help_text, parse_mode="HTML", reply_markup=get_back_to_admin_keyboard())
 
-@router.message(Command("cancel"))
-@router.message(F.text.lower() == "bekor qilish")
+
 async def cmd_admin_cancel(message: Message, state: FSMContext):
     current_state = await state.get_state()
     await state.clear()
+    if message.from_user:
+        await telethon_listener.cancel_login(message.from_user.id)
     if current_state:
         await message.answer(f"{INFO} Joriy amal bekor qilindi.", reply_markup=get_admin_reply_keyboard())
     else:
         await message.answer(f"{INFO} Hech qanday faol jarayon yo'q.", reply_markup=get_admin_reply_keyboard())
 
-@router.callback_query(F.data == "noop")
+
 async def cb_admin_noop(callback: CallbackQuery):
     await safe_answer(callback)

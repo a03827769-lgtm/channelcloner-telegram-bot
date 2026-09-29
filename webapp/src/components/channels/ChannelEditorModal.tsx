@@ -10,27 +10,65 @@ import {
   Type,
   Shield,
   Plus,
-  AlertTriangle
+  AlertTriangle,
+  Lock
 } from 'lucide-react';
-import { ChannelPair } from '../../types';
+import { ChannelPair, Subscription, WatermarkType } from '../../types';
 import { Switch } from '../ui/Switch';
 import { PostPreviewSimulator } from './PostPreviewSimulator';
 import { telegram } from '../../services/telegram';
+import { ErrorExplanation, explainError } from '../../services/api';
 
 interface ChannelEditorModalProps {
   pair: ChannelPair;
+  subscription: Subscription | null;
+  isAdmin: boolean;
   onClose: () => void;
-  onSave: (updated: ChannelPair) => Promise<void>;
+  onSave: (pairId: number, changes: Partial<ChannelPair>) => Promise<void>;
   onDelete: (id: number) => Promise<void>;
   onTestPost: (id: number) => Promise<void>;
+  onOpenBilling: () => void;
 }
+
+// Limits enforced by the API (config/limits.py)
+const SIGNATURE_MAX_CHARS = 1024;
+const BLACKLIST_MAX_CHARS = 4000;
+const WATERMARK_TEXT_MAX_CHARS = 64;
+
+// Fields this editor can change; only the ones that differ from the stored pair are sent
+const EDITABLE_FIELDS: (keyof ChannelPair)[] = [
+  'is_active', 'clone_mode', 'clean_links', 'custom_signature', 'auto_translate', 'target_lang',
+  'blacklist_words', 'image_watermark_type', 'image_watermark_text', 'image_watermark_pos',
+  'ai_paraphrase_mode', 'drip_delay_minutes'
+];
+
+const UPGRADE_CODES = new Set(['PRO_REQUIRED', 'VIP_REQUIRED', 'PLAN_LIMIT', 'SUBSCRIPTION_INACTIVE']);
+
+function diffPair(original: ChannelPair, edited: ChannelPair): Partial<ChannelPair> {
+  const changes: Record<string, unknown> = {};
+  for (const key of EDITABLE_FIELDS) {
+    if (original[key] !== edited[key]) {
+      changes[key] = edited[key];
+    }
+  }
+  return changes as Partial<ChannelPair>;
+}
+
+const ProBadge: React.FC = () => (
+  <span className="px-2 py-0.5 rounded-full bg-[#0A84FF]/20 text-[#64D2FF] text-[10px] font-bold uppercase flex items-center gap-1">
+    <Lock size={9} /> PRO
+  </span>
+);
 
 export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
   pair,
+  subscription,
+  isAdmin,
   onClose,
   onSave,
   onDelete,
   onTestPost,
+  onOpenBilling,
 }) => {
   const [formData, setFormData] = useState<ChannelPair>({ ...pair });
   const [activeSubTab, setActiveSubTab] = useState<'general' | 'watermark' | 'text' | 'ai'>('general');
@@ -38,41 +76,74 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
   const [isSaving, setIsSaving] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [notice, setNotice] = useState<ErrorExplanation | null>(null);
 
-  const handleToggle = (key: keyof ChannelPair) => {
+  // Paid features are gated on the server as well; this only avoids pointless round trips
+  const hasPro = isAdmin || Boolean(
+    subscription?.is_active && (subscription.tier === 'pro' || subscription.tier === 'vip')
+  );
+
+  const requirePro = (feature: string) => {
+    telegram.notification('warning');
+    setNotice({
+      message: `${feature} faqat PRO va VIP tariflarida mavjud.`,
+      hint: "«Tariflar» bo'limidan tarifni oshiring.",
+      code: 'PRO_REQUIRED'
+    });
+  };
+
+  const handleToggle = (key: 'is_active' | 'clean_links' | 'auto_translate') => {
     setFormData((prev) => ({ ...prev, [key]: !prev[key] }));
   };
 
-  const handleChange = (key: keyof ChannelPair, value: any) => {
+  const handleChange = <K extends keyof ChannelPair>(key: K, value: ChannelPair[K]) => {
     setFormData((prev) => ({ ...prev, [key]: value }));
   };
 
+  const blacklistWords = (formData.blacklist_words || '')
+    .split(',')
+    .map((w) => w.trim())
+    .filter(Boolean);
+
   const handleAddBlacklist = () => {
-    if (!newBlacklistWord.trim()) return;
+    const word = newBlacklistWord.trim();
+    if (!word) return;
     telegram.impact('light');
-    const words = formData.blacklist_words ? formData.blacklist_words.split(',').map(w => w.trim()) : [];
-    if (!words.includes(newBlacklistWord.trim())) {
-      words.push(newBlacklistWord.trim());
-      handleChange('blacklist_words', words.join(', '));
+    if (!blacklistWords.includes(word)) {
+      const joined = [...blacklistWords, word].join(', ');
+      if (joined.length > BLACKLIST_MAX_CHARS) {
+        setNotice({ message: `Taqiqlangan so'zlar ro'yxati ${BLACKLIST_MAX_CHARS} belgidan oshmasligi kerak.` });
+        return;
+      }
+      handleChange('blacklist_words', joined);
     }
     setNewBlacklistWord('');
   };
 
   const handleRemoveBlacklist = (wordToRemove: string) => {
     telegram.impact('light');
-    const words = formData.blacklist_words
-      .split(',')
-      .map(w => w.trim())
-      .filter(w => w !== wordToRemove);
-    handleChange('blacklist_words', words.join(', '));
+    handleChange('blacklist_words', blacklistWords.filter((w) => w !== wordToRemove).join(', '));
+  };
+
+  const setWatermarkType = (type: WatermarkType) => {
+    telegram.selection();
+    if (type !== 'none' && type !== pair.image_watermark_type && !hasPro) {
+      requirePro('Rasmga suv belgisi (Watermark)');
+      return;
+    }
+    handleChange('image_watermark_type', type);
   };
 
   const handleSave = async () => {
+    const changes = diffPair(pair, formData);
     setIsSaving(true);
+    setNotice(null);
     telegram.impact('medium');
     try {
-      await onSave(formData);
+      await onSave(pair.id, changes);
       onClose();
+    } catch (err) {
+      setNotice(explainError(err, 'Saqlashda xatolik'));
     } finally {
       setIsSaving(false);
     }
@@ -96,19 +167,24 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
 
   const positions = [
     { id: 'top_left', label: 'Yuqori Chap' },
-    { id: 'top_center', label: 'Yuqori O\'rta' },
-    { id: 'top_right', label: 'Yuqori O\'ng' },
-    { id: 'center_left', label: 'O\'rta Chap' },
+    { id: 'top_center', label: "Yuqori O'rta" },
+    { id: 'top_right', label: "Yuqori O'ng" },
+    { id: 'center_left', label: "O'rta Chap" },
     { id: 'center', label: 'Markaz' },
-    { id: 'center_right', label: 'O\'rta O\'ng' },
+    { id: 'center_right', label: "O'rta O'ng" },
     { id: 'bottom_left', label: 'Pastki Chap' },
-    { id: 'bottom_center', label: 'Pastki O\'rta' },
-    { id: 'bottom_right', label: 'Pastki O\'ng' },
+    { id: 'bottom_center', label: "Pastki O'rta" },
+    { id: 'bottom_right', label: "Pastki O'ng" },
   ];
+
+  // A logo watermark needs an image on the server, which the Mini App cannot upload: the option is only
+  // shown for pairs that already use one.
+  const watermarkTypes: WatermarkType[] = pair.image_watermark_type === 'logo' ? ['none', 'text', 'logo'] : ['none', 'text'];
+  const watermarkEditable = hasPro || formData.image_watermark_type === 'none';
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black/60 backdrop-blur-2xl animate-fade-in">
-      <div 
+      <div
         className="w-full max-h-[92vh] rounded-t-[32px] bg-[#1A191F]/90 backdrop-blur-3xl border-t border-white/25 flex flex-col overflow-hidden shadow-2xl animate-slide-up"
         style={{ paddingBottom: 'max(env(safe-area-inset-bottom, 0px), 12px)', borderTopColor: 'rgba(255,255,255,0.40)' }}
       >
@@ -145,12 +221,12 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
         {/* Cupertino Segmented Subtabs */}
         <div className="px-4 py-2 shrink-0">
           <div className="vision-segmented-container">
-            {[
+            {([
               { id: 'general', label: 'Asosiy', icon: Layers },
               { id: 'watermark', label: 'Suv Belgisi', icon: Sparkles },
               { id: 'text', label: 'Matn', icon: Type },
               { id: 'ai', label: 'AI & Drip', icon: Shield },
-            ].map((tab) => {
+            ] as const).map((tab) => {
               const Icon = tab.icon;
               const isActive = activeSubTab === tab.id;
               return (
@@ -158,7 +234,7 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
                   key={tab.id}
                   onClick={() => {
                     telegram.selection();
-                    setActiveSubTab(tab.id as any);
+                    setActiveSubTab(tab.id);
                   }}
                   className={`vision-segment-pill gap-1.5 ${isActive ? 'active' : ''}`}
                 >
@@ -172,7 +248,7 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
 
         {/* Form Body */}
         <div className="flex-1 min-h-0 overflow-y-auto p-4 flex flex-col gap-3.5">
-          
+
           {/* Post Preview Simulator */}
           <PostPreviewSimulator
             sourceTitle={formData.source_title}
@@ -182,6 +258,7 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
             watermarkType={formData.image_watermark_type}
             watermarkText={formData.image_watermark_text}
             watermarkPos={formData.image_watermark_pos}
+            targetLang={formData.target_lang}
             autoTranslate={formData.auto_translate}
           />
 
@@ -257,23 +334,23 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
           {activeSubTab === 'watermark' && (
             <div className="vision-grouped-list shrink-0 p-4 flex flex-col gap-3.5">
               <div className="flex flex-col gap-2">
-                <div className="text-[13px] font-semibold text-white">Rasmga Suv Belgisi</div>
-                <div className="grid grid-cols-3 gap-2">
-                  {(['none', 'text', 'logo'] as const).map((type) => (
+                <div className="flex items-center justify-between">
+                  <span className="text-[13px] font-semibold text-white">Rasmga Suv Belgisi</span>
+                  {!hasPro && <ProBadge />}
+                </div>
+                <div className={`grid gap-2 ${watermarkTypes.length === 3 ? 'grid-cols-3' : 'grid-cols-2'}`}>
+                  {watermarkTypes.map((type) => (
                     <button
                       key={type}
                       type="button"
-                      onClick={() => {
-                        telegram.selection();
-                        handleChange('image_watermark_type', type);
-                      }}
+                      onClick={() => setWatermarkType(type)}
                       className={`py-2 rounded-[14px] text-xs font-semibold transition-all border ${
                         formData.image_watermark_type === type
                           ? 'bg-white/[0.18] border-[#0A84FF] text-[#64D2FF]'
                           : 'bg-white/[0.04] border-white/10 text-white/60'
                       }`}
                     >
-                      {type === 'none' ? 'Yo\'q' : type === 'text' ? 'Matn' : 'Logo'}
+                      {type === 'none' ? "Yo'q" : type === 'text' ? 'Matn' : 'Logo'}
                     </button>
                   ))}
                 </div>
@@ -285,9 +362,11 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
                   <input
                     type="text"
                     value={formData.image_watermark_text}
+                    maxLength={WATERMARK_TEXT_MAX_CHARS}
+                    disabled={!watermarkEditable}
                     onChange={(e) => handleChange('image_watermark_text', e.target.value)}
                     placeholder="@sizning_kanalingiz"
-                    className="vision-input"
+                    className="vision-input disabled:opacity-50"
                   />
                 </div>
               )}
@@ -302,6 +381,10 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
                         type="button"
                         onClick={() => {
                           telegram.impact('light');
+                          if (!watermarkEditable) {
+                            requirePro('Rasmga suv belgisi (Watermark)');
+                            return;
+                          }
                           handleChange('image_watermark_pos', pos.id);
                         }}
                         className={`py-2 px-1 text-[11px] font-medium rounded-[12px] border text-center transition-all ${
@@ -327,6 +410,7 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
                 <textarea
                   rows={2}
                   value={formData.custom_signature}
+                  maxLength={SIGNATURE_MAX_CHARS}
                   onChange={(e) => handleChange('custom_signature', e.target.value)}
                   placeholder="👉 @mening_kanalim ga obuna bo'ling!"
                   className="vision-input resize-none"
@@ -382,6 +466,7 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
                   <input
                     type="text"
                     value={newBlacklistWord}
+                    maxLength={100}
                     onChange={(e) => setNewBlacklistWord(e.target.value)}
                     placeholder="So'z qo'shish..."
                     className="vision-input flex-1"
@@ -395,25 +480,21 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
                   </button>
                 </div>
                 <div className="flex flex-wrap gap-1.5 mt-1">
-                  {formData.blacklist_words
-                    ?.split(',')
-                    .map((w) => w.trim())
-                    .filter(Boolean)
-                    .map((word) => (
-                      <span
-                        key={word}
-                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full vision-btn-glass text-[11px] text-white/80"
+                  {blacklistWords.map((word) => (
+                    <span
+                      key={word}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full vision-btn-glass text-[11px] text-white/80"
+                    >
+                      {word}
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveBlacklist(word)}
+                        className="hover:text-rose-400 p-0.5"
                       >
-                        {word}
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveBlacklist(word)}
-                          className="hover:text-rose-400 p-0.5"
-                        >
-                          <X size={11} />
-                        </button>
-                      </span>
-                    ))}
+                        <X size={11} />
+                      </button>
+                    </span>
+                  ))}
                 </div>
               </div>
             </div>
@@ -425,7 +506,7 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
               <div className="flex flex-col gap-2">
                 <div className="flex items-center justify-between">
                   <span className="text-[13px] font-semibold text-white">AI Content Paraphraser</span>
-                  <span className="px-2 py-0.5 rounded-full bg-[#FFD60A]/20 text-[#FFD60A] text-[10px] font-bold uppercase">VIP</span>
+                  {!hasPro && <ProBadge />}
                 </div>
                 <div className="grid grid-cols-4 gap-1.5">
                   {[
@@ -439,6 +520,10 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
                       type="button"
                       onClick={() => {
                         telegram.selection();
+                        if (mode.id !== 'off' && mode.id !== pair.ai_paraphrase_mode && !hasPro) {
+                          requirePro('AI Content Paraphraser');
+                          return;
+                        }
                         handleChange('ai_paraphrase_mode', mode.id);
                       }}
                       className={`py-1.5 rounded-[12px] text-xs font-medium transition-all border ${
@@ -458,7 +543,9 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
               {/* Drip Feed */}
               <div className="flex flex-col gap-2">
                 <div className="flex items-center justify-between">
-                  <span className="text-[13px] font-semibold text-white">Drip Feed Kechikishi</span>
+                  <span className="text-[13px] font-semibold text-white flex items-center gap-2">
+                    Drip Feed Kechikishi {!hasPro && <ProBadge />}
+                  </span>
                   <span className="text-xs text-[#0A84FF] font-mono">
                     {formData.drip_delay_minutes === 0 ? 'Darhol' : `${formData.drip_delay_minutes} daqiqa`}
                   </span>
@@ -470,6 +557,10 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
                       type="button"
                       onClick={() => {
                         telegram.impact('light');
+                        if (mins > 0 && mins !== pair.drip_delay_minutes && !hasPro) {
+                          requirePro('Drip Feed kechikishi');
+                          return;
+                        }
                         handleChange('drip_delay_minutes', mins);
                       }}
                       className={`py-1.5 rounded-[12px] text-xs font-medium transition-all border ${
@@ -486,6 +577,32 @@ export const ChannelEditorModal: React.FC<ChannelEditorModalProps> = ({
             </div>
           )}
         </div>
+
+        {/* Validation / plan notices from the client checks or the server */}
+        {notice && (
+          <div
+            role="alert"
+            className="mx-4 mb-2 p-3 rounded-[18px] bg-rose-950/70 border border-rose-500/40 text-rose-200 text-xs flex items-start gap-2 shrink-0"
+          >
+            <AlertTriangle size={14} className="text-rose-400 shrink-0 mt-0.5" />
+            <div className="flex-1 flex flex-col gap-1">
+              <span className="leading-relaxed">{notice.message}</span>
+              {notice.hint && <span className="text-rose-100/70 leading-relaxed">{notice.hint}</span>}
+              {notice.code && UPGRADE_CODES.has(notice.code) && (
+                <button
+                  type="button"
+                  onClick={onOpenBilling}
+                  className="self-start mt-1 py-1 px-3 rounded-full vision-btn-gold text-[11px] font-bold"
+                >
+                  Tariflar
+                </button>
+              )}
+            </div>
+            <button type="button" onClick={() => setNotice(null)} className="text-white/40 hover:text-white p-0.5 shrink-0">
+              <X size={12} />
+            </button>
+          </div>
+        )}
 
         {/* In-App Delete Confirmation Bar (Replaces raw browser confirm!) */}
         {showDeleteConfirm ? (

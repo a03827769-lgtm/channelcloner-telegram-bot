@@ -5,8 +5,7 @@ import urllib.request
 import urllib.parse
 import subprocess
 
-AUDIO_DIR = os.path.abspath("assets/audio")
-os.makedirs(AUDIO_DIR, exist_ok=True)
+AUDIO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "audio")
 
 TRACKS = [
     {
@@ -280,6 +279,7 @@ def download_or_generate_track(t_info):
     return True
 
 if __name__ == "__main__":
+    os.makedirs(AUDIO_DIR, exist_ok=True)
     print(f"Setting up audio library in {AUDIO_DIR}...")
     for t in TRACKS:
         download_or_generate_track(t)

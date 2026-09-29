@@ -1,8 +1,5 @@
 import unittest
-import asyncio
-import os
 from unittest.mock import MagicMock, AsyncMock, patch
-from aiogram.exceptions import TelegramBadRequest
 
 from database.models import ChannelPair, Subscription
 from services.telethon_listener import TelethonListener
@@ -136,14 +133,21 @@ class TestAuditProductionFixes(unittest.IsolatedAsyncioTestCase):
             clean_links=True,
             affiliate_rules="aliexpress.com=https://s.click.aliexpress.com/e/_my_promo"
         )
-
         raw_text = "Mana bu havola: https://aliexpress.com/item/100 and telegram: @bad_channel"
-        processed = await engine.process_post_text(raw_text, pair)
 
-        # Affiliate tag must be added
+        # Affiliate rules are a Pro/VIP feature: applied for a paying owner, before link cleaning
+        pro_sub = Subscription(user_id=123, tier="pro", expires_at="2099-01-01T00:00:00")
+        with patch.object(ClonerEngine, "_privileges", AsyncMock(return_value=(pro_sub, False))):
+            processed = await engine.process_post_text(raw_text, pair)
         self.assertIn("https://s.click.aliexpress.com/e/_my_promo", processed)
-        # Telegram username must be cleaned
         self.assertNotIn("@bad_channel", processed)
+
+        # A trial owner keeps the original link (only the link cleaning applies)
+        trial_sub = Subscription(user_id=123, tier="free", trial_expires_at="2099-01-01T00:00:00")
+        with patch.object(ClonerEngine, "_privileges", AsyncMock(return_value=(trial_sub, False))):
+            processed_trial = await engine.process_post_text(raw_text, pair)
+        self.assertNotIn("s.click.aliexpress.com", processed_trial)
+        self.assertNotIn("@bad_channel", processed_trial)
 
     async def test_cloner_engine_media_group_compatible_partitioning(self):
         bot = MagicMock()
@@ -194,6 +198,8 @@ class TestAuditProductionFixes(unittest.IsolatedAsyncioTestCase):
             self.assertIn("VIP", cb.answer.call_args[1].get("text", ""))
 
     async def test_premium_emoji_trial_and_real_estate_conversion(self):
+        """Premium animated emojis are a VIP feature: a trial owner's post keeps its plain emojis, a VIP
+        owner's post gets the real-estate premium set"""
         engine = ClonerEngine()
         pair = ChannelPair(
             id=11,
@@ -202,24 +208,19 @@ class TestAuditProductionFixes(unittest.IsolatedAsyncioTestCase):
             target_channel="@arieltor_uz",
             auto_premium_emojis=True
         )
+        post_text = "🏢 Bino sotiladi! 🔹 3 xona ❗️ Chegirma bor"
 
-        # User on active 14-day trial (tier free, is_trial_active True)
-        mock_sub = Subscription(
-            user_id=777888,
-            tier="free",
-            trial_expires_at="2099-01-01T00:00:00"
-        )
+        trial_sub = Subscription(user_id=777888, tier="free", trial_expires_at="2099-01-01T00:00:00")
+        with patch.object(ClonerEngine, "_privileges", AsyncMock(return_value=(trial_sub, False))):
+            processed_trial = await engine.process_post_text(post_text, pair)
+        self.assertNotIn("<tg-emoji", processed_trial)
 
-        with patch("services.cloner_engine.db_manager.get_user_subscription", AsyncMock(return_value=mock_sub)), \
-             patch("services.cloner_engine.db_manager.is_admin", AsyncMock(return_value=False)):
-
-            post_text = "🏢 Bino sotiladi! 🔹 3 xona ❗️ Chegirma bor"
+        vip_sub = Subscription(user_id=777888, tier="vip", expires_at="2099-01-01T00:00:00")
+        with patch.object(ClonerEngine, "_privileges", AsyncMock(return_value=(vip_sub, False))):
             processed = await engine.process_post_text(post_text, pair)
-
-            # Assert all emojis were converted into tg-emoji tags
-            self.assertIn('<tg-emoji emoji-id="5319084384962248505">🏢</tg-emoji>', processed)
-            self.assertIn('<tg-emoji emoji-id="5427168083074628963">🔹</tg-emoji>', processed)
-            self.assertIn('<tg-emoji emoji-id="5447644880824181073">❗️</tg-emoji>', processed)
+        self.assertIn('<tg-emoji emoji-id="5319084384962248505">🏢</tg-emoji>', processed)
+        self.assertIn('<tg-emoji emoji-id="5427168083074628963">🔹</tg-emoji>', processed)
+        self.assertIn('<tg-emoji emoji-id="5447644880824181073">❗️</tg-emoji>', processed)
 
 if __name__ == "__main__":
     unittest.main()

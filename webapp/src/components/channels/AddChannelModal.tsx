@@ -1,65 +1,79 @@
 import React, { useState } from 'react';
-import { X, ArrowRight, ArrowLeft, CheckCircle2, ShieldCheck, Radio, Plus } from 'lucide-react';
-import { ChannelPair } from '../../types';
+import { X, ArrowRight, ArrowLeft, CheckCircle2, ShieldCheck, Radio } from 'lucide-react';
+import { NewPairRequest } from '../../types';
 import { Switch } from '../ui/Switch';
 import { telegram } from '../../services/telegram';
+import { ErrorExplanation, explainError } from '../../services/api';
 
 interface AddChannelModalProps {
   onClose: () => void;
-  onAdd: (data: Partial<ChannelPair>) => Promise<void>;
+  onAdd: (data: NewPairRequest) => Promise<void>;
 }
 
+type WizardStep = 1 | 2 | 3;
+
+// Errors about the target channel send the user back to step 2, errors about the source to step 1
+const TARGET_ERROR_CODES = new Set(['USER_NOT_ADMIN', 'BOT_NOT_ADMIN', 'TARGET_NOT_FOUND', 'TARGET_INVALID', 'SELF_LOOP']);
+const SOURCE_ERROR_CODES = new Set(['SOURCE_NOT_FOUND', 'SOURCE_INVALID', 'INVALID_CHANNEL']);
+
 export const AddChannelModal: React.FC<AddChannelModalProps> = ({ onClose, onAdd }) => {
-  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [step, setStep] = useState<WizardStep>(1);
   const [sourceChannel, setSourceChannel] = useState('');
   const [sourceTitle, setSourceTitle] = useState('');
   const [targetChannel, setTargetChannel] = useState('');
-  const [targetTitle, setTargetTitle] = useState('');
   const [cloneMode, setCloneMode] = useState<'clean' | 'forward'>('clean');
   const [cleanLinks, setCleanLinks] = useState(true);
   const [autoTranslate, setAutoTranslate] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [error, setError] = useState('');
+  const [error, setError] = useState<ErrorExplanation | null>(null);
+
+  const showError = (message: string) => {
+    setError({ message });
+    telegram.notification('error');
+  };
 
   const handleNextStep1 = () => {
     if (!sourceChannel.trim()) {
-      setError('Iltimos, manba kanalini kiriting');
-      telegram.notification('error');
+      showError('Iltimos, manba kanalini kiriting');
       return;
     }
-    setError('');
+    setError(null);
     telegram.impact('light');
     setStep(2);
   };
 
   const handleNextStep2 = () => {
     if (!targetChannel.trim()) {
-      setError('Iltimos, o\'zingizning kanalingizni kiriting');
-      telegram.notification('error');
+      showError("Iltimos, o'zingizning kanalingizni kiriting");
       return;
     }
-    setError('');
+    setError(null);
     telegram.impact('light');
     setStep(3);
   };
 
   const handleSubmit = async () => {
     setIsSubmitting(true);
+    setError(null);
     telegram.impact('medium');
     try {
       await onAdd({
         source_channel: sourceChannel.trim(),
-        source_title: sourceTitle.trim() || sourceChannel.trim(),
+        source_title: sourceTitle.trim() || undefined,
         target_channel: targetChannel.trim(),
-        target_title: targetTitle.trim() || targetChannel.trim(),
         clone_mode: cloneMode,
         clean_links: cleanLinks,
-        auto_translate: autoTranslate,
-        is_active: true
+        auto_translate: autoTranslate
       });
       onClose();
-    } catch (err: any) {
-      setError(err.message || 'Xatolik yuz berdi');
+    } catch (err) {
+      const explained = explainError(err, 'Xatolik yuz berdi');
+      setError(explained);
+      if (explained.code && TARGET_ERROR_CODES.has(explained.code)) {
+        setStep(2);
+      } else if (explained.code && SOURCE_ERROR_CODES.has(explained.code)) {
+        setStep(1);
+      }
       telegram.notification('error');
     } finally {
       setIsSubmitting(false);
@@ -68,7 +82,7 @@ export const AddChannelModal: React.FC<AddChannelModalProps> = ({ onClose, onAdd
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black/60 backdrop-blur-2xl animate-fade-in">
-      <div 
+      <div
         className="w-full max-h-[90vh] rounded-t-[32px] bg-[#1A191F]/90 backdrop-blur-3xl border-t border-white/25 flex flex-col overflow-hidden shadow-2xl animate-slide-up"
         style={{ paddingBottom: 'max(env(safe-area-inset-bottom, 0px), 12px)', borderTopColor: 'rgba(255,255,255,0.40)' }}
       >
@@ -109,9 +123,15 @@ export const AddChannelModal: React.FC<AddChannelModalProps> = ({ onClose, onAdd
         {/* Modal Body */}
         <div className="flex-1 min-h-0 p-5 flex flex-col gap-4 overflow-y-auto">
           {error && (
-            <div className="p-3 rounded-[18px] bg-rose-950/70 border border-rose-500/40 text-rose-200 text-xs flex items-center gap-2 animate-in fade-in">
-              <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
-              <span>{error}</span>
+            <div
+              role="alert"
+              className="p-3 rounded-[18px] bg-rose-950/70 border border-rose-500/40 text-rose-200 text-xs flex items-start gap-2 animate-in fade-in"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-rose-400 mt-1.5 shrink-0" />
+              <div className="flex flex-col gap-1">
+                <span className="leading-relaxed">{error.message}</span>
+                {error.hint && <span className="text-rose-100/70 leading-relaxed">{error.hint}</span>}
+              </div>
             </div>
           )}
 
@@ -131,6 +151,7 @@ export const AddChannelModal: React.FC<AddChannelModalProps> = ({ onClose, onAdd
                 <input
                   type="text"
                   value={sourceChannel}
+                  maxLength={200}
                   onChange={(e) => setSourceChannel(e.target.value)}
                   placeholder="@yangiliklar_kanali"
                   className="vision-input"
@@ -142,6 +163,7 @@ export const AddChannelModal: React.FC<AddChannelModalProps> = ({ onClose, onAdd
                 <input
                   type="text"
                   value={sourceTitle}
+                  maxLength={128}
                   onChange={(e) => setSourceTitle(e.target.value)}
                   placeholder="Masalan: Tezkor Yangiliklar"
                   className="vision-input"
@@ -157,11 +179,13 @@ export const AddChannelModal: React.FC<AddChannelModalProps> = ({ onClose, onAdd
                 <Radio size={16} className="text-[#30D158]" />
                 <span>2-Qadam: O'zingizning Kanalingiz (Qayerga?)</span>
               </div>
-              
+
               <div className="p-3 rounded-[16px] bg-[#FFD60A]/10 border border-[#FFD60A]/25 text-[#FFD60A] text-xs flex items-start gap-2.5">
                 <ShieldCheck size={16} className="shrink-0 mt-0.5" />
                 <span className="text-white/85 leading-relaxed text-[12px]">
-                  <b className="text-[#FFD60A]">Muhim:</b> Botingiz kanalingizda <b>administrator</b> bo'lishi va post joylash huquqiga ega bo'lishi kerak!
+                  <b className="text-[#FFD60A]">Muhim:</b> Kanal sizniki bo'lishi (siz egasi yoki post joylash huquqiga ega{' '}
+                  <b>administrator</b> bo'lishingiz) va botimiz ham kanalda <b>administrator</b> bo'lib, post joylash
+                  huquqiga ega bo'lishi kerak!
                 </span>
               </div>
 
@@ -170,19 +194,9 @@ export const AddChannelModal: React.FC<AddChannelModalProps> = ({ onClose, onAdd
                 <input
                   type="text"
                   value={targetChannel}
+                  maxLength={200}
                   onChange={(e) => setTargetChannel(e.target.value)}
                   placeholder="@mening_kanalim"
-                  className="vision-input"
-                />
-              </div>
-
-              <div className="flex flex-col gap-1.5">
-                <label className="text-[11px] font-medium text-white/70">Kanalingiz Nomi (Ixtiyoriy)</label>
-                <input
-                  type="text"
-                  value={targetTitle}
-                  onChange={(e) => setTargetTitle(e.target.value)}
-                  placeholder="Masalan: Mening Yangi Kanalim"
                   className="vision-input"
                 />
               </div>
@@ -271,7 +285,8 @@ export const AddChannelModal: React.FC<AddChannelModalProps> = ({ onClose, onAdd
               type="button"
               onClick={() => {
                 telegram.selection();
-                setStep((prev) => (prev - 1) as any);
+                setError(null);
+                setStep((prev) => (prev === 3 ? 2 : 1));
               }}
               className="py-2.5 px-4 rounded-full vision-btn-glass text-xs font-semibold text-white/80 flex items-center gap-1.5 active:scale-95"
             >

@@ -1,5 +1,4 @@
 import os
-import pytest
 from PIL import Image
 
 from services.story_video_generator import StoryVideoGenerator, story_video_generator

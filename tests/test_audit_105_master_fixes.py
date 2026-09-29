@@ -1,7 +1,5 @@
 import pytest
 import os
-import html
-import asyncio
 from PIL import Image
 
 from config.settings import Settings
@@ -147,16 +145,16 @@ class TestMasterAuditFixes:
         assert formal2.count("Rasmiy Axborot:") == 1
 
     def test_system_status_log_html_escaping_order(self):
+        from admin_bot.handlers.system_status import LOG_TAIL_MAX_CHARS, format_log_tail
         raw_lines = [f"2026-09-08 Line {i}: <error code='u00%'> & 'critical'" for i in range(100)]
-        raw_text = "\n".join(raw_lines)
-        if len(raw_text) > 3500:
-            raw_text = raw_text[-3500:]
-            if "\n" in raw_text:
-                raw_text = raw_text.split("\n", 1)[1]
-        log_text = html.escape(raw_text)
+        log_text = format_log_tail(raw_lines)
 
         assert "<error" not in log_text
         assert "&lt;error" in log_text
         assert "&amp;" in log_text
-        assert not log_text.startswith("t;")
-        assert not log_text.startswith("mp;")
+        # The tail is cut before escaping, at a line boundary: no half entity, no partial first line
+        assert not log_text.startswith(("t;", "mp;", "lt;"))
+        assert log_text.startswith("2026-09-08 Line ")
+        assert log_text.endswith("Line 99: &lt;error code=&#x27;u00%&#x27;&gt; &amp; &#x27;critical&#x27;")
+        import html as html_module
+        assert len(html_module.unescape(log_text)) <= LOG_TAIL_MAX_CHARS

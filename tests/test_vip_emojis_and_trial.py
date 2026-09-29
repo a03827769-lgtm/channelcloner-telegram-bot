@@ -1,8 +1,11 @@
 import unittest
 import asyncio
 import os
+import tempfile
 import uuid
 from datetime import datetime, timedelta
+from unittest.mock import patch
+from config.settings import settings
 from database.db_manager import DatabaseManager
 from database.models import ChannelPair
 from services.emoji_converter import emoji_converter
@@ -10,14 +13,19 @@ from services.cloner_engine import ClonerEngine
 
 class TestVipEmojisAndTrial(unittest.TestCase):
     def setUp(self):
-        self.db_path = f"temp_media/test_vip_trial_{uuid.uuid4().hex[:8]}.db"
-        os.makedirs("temp_media", exist_ok=True)
+        # Tests below assign settings.ADMIN_IDS_RAW; the patcher restores the original value afterwards
+        self._admin_ids_patch = patch.object(settings, "ADMIN_IDS_RAW", settings.ADMIN_IDS_RAW)
+        self._admin_ids_patch.start()
+        self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.db_path = os.path.join(self._tmp_dir.name, f"test_vip_trial_{uuid.uuid4().hex[:8]}.db")
         self.db = DatabaseManager(self.db_path)
         asyncio.run(self.db.init_db())
 
     def tearDown(self):
         from tests.test_utils import safe_cleanup_db
         asyncio.run(safe_cleanup_db(self.db_path, self.db))
+        self._tmp_dir.cleanup()
+        self._admin_ids_patch.stop()
 
     def test_emoji_converter_preserves_html(self):
         raw_text = "Salom! ✅ To'lov o'tdi. 🚀 <a href=\"https://t.me\">Kanal 🔗</a> va <code>⚠️ Code</code>."

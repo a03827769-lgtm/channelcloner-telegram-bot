@@ -2,12 +2,21 @@ import re
 import glob
 import os
 
+# Paths are resolved from the project root, so the test means the same from any working directory
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _project_glob(pattern):
+    return glob.glob(os.path.join(PROJECT_ROOT, pattern))
+
+
 def test_all_keyboard_callbacks_have_matching_handlers():
     """
-    Automated regression test verifying that every single button callback_data
-    defined across all inline keyboards in the project has a corresponding handler.
+    Static check: every literal callback_data prefix written in the keyboard modules has a handler filter
+    (== / in_ / startswith / regexp) in the handler modules. Callback data built from variables is
+    covered by the dispatcher-level test in test_fix_bot.py.
     """
-    files_kb = glob.glob('bot/keyboards/*.py') + glob.glob('admin_bot/keyboards/*.py')
+    files_kb = _project_glob('bot/keyboards/*.py') + _project_glob('admin_bot/keyboards/*.py')
     kb_callbacks = []
     for f in files_kb:
         with open(f, 'r', encoding='utf-8') as fh:
@@ -16,7 +25,9 @@ def test_all_keyboard_callbacks_have_matching_handlers():
             for m in matches:
                 kb_callbacks.append((f, m))
 
-    files_h = glob.glob('bot/handlers/*.py') + glob.glob('admin_bot/handlers/*.py') + ['admin_bot/bot_instance.py']
+    files_h = (_project_glob('bot/handlers/*.py') + _project_glob('admin_bot/handlers/*.py')
+               + [os.path.join(PROJECT_ROOT, 'admin_bot', 'bot_instance.py')])
+    assert len(files_kb) >= 4 and len(files_h) >= 10, "keyboard / handler modules not found"
     handler_filters = []
     for f in files_h:
         with open(f, 'r', encoding='utf-8') as fh:
@@ -43,9 +54,12 @@ def test_all_keyboard_callbacks_have_matching_handlers():
             for rg in regexps:
                 handler_filters.append((f, f'regexp("{rg}")'))
 
+    assert len(kb_callbacks) >= 50, "no callback_data literals were found"
     unmatched = []
     for f_kb, raw_cb in kb_callbacks:
         pattern_prefix = raw_cb.split('{')[0] if '{' in raw_cb else raw_cb
+        if not pattern_prefix:
+            continue  # fully dynamic value: checked by the dispatcher-level test
         
         matched = False
         for f_h, h_filter in handler_filters:

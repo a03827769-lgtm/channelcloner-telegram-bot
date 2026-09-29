@@ -1,19 +1,25 @@
+# OPTIONAL template — NOT installed by deploy/oracle_master_setup.sh.
+# The documented path does not need it: the container's `restart: unless-stopped` policy brings the bot
+# back after a reboot. Use it only if you want `systemctl start|stop|reload telegram-cloner`.
+# Render and install (replace the user and the clone directory):
+#   sed -e "s#__APP_USER__#ubuntu#g" -e "s#__APP_DIR__#/home/ubuntu/channelcloner#g" \
+#       deploy/systemd/telegram-cloner.service | sudo tee /etc/systemd/system/telegram-cloner.service
 [Unit]
-Description=Telegram Channel Cloner Multi-Bot Production Service
+Description=Telegram Channel Cloner bot (docker compose, profile docker-bot)
 Requires=docker.service
-After=docker.service network.target
+After=docker.service network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/home/ubuntu/app
-User=ubuntu
-Group=docker
-ExecStart=/usr/bin/docker compose up -d --build --remove-orphans
-ExecStop=/usr/bin/docker compose down
-ExecReload=/usr/bin/docker compose pull && /usr/bin/docker compose up -d --build
-Restart=no
-TimeoutStartSec=300
+User=__APP_USER__
+WorkingDirectory=__APP_DIR__
+ExecStart=/usr/bin/docker compose --profile docker-bot up -d --build telegram-cloner
+ExecStop=/usr/bin/docker compose --profile docker-bot stop telegram-cloner
+# systemd does not interpret shell operators such as && — run the sequence through a shell
+ExecReload=/bin/sh -c '/usr/bin/docker compose --profile docker-bot build telegram-cloner && /usr/bin/docker compose --profile docker-bot up -d telegram-cloner'
+TimeoutStartSec=900
 StandardOutput=journal
 StandardError=journal
 

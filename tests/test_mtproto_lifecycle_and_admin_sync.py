@@ -1,11 +1,8 @@
 import pytest
 import pytest_asyncio
-import asyncio
 from database.db_manager import DatabaseManager
 from services.telethon_listener import TelethonListener
 from services.rate_limiter import SmartDelayEngine
-from bot.handlers.settings_menu import is_admin_user
-from config.settings import settings
 
 @pytest_asyncio.fixture
 async def test_db(tmp_path):
@@ -21,12 +18,22 @@ async def test_db(tmp_path):
 @pytest.mark.asyncio
 async def test_database_granted_admin_can_add_channel(test_db):
     test_user_id = 9988776655
+    # Registering a user never grants admin rights; only an explicit grant does
     await test_db.get_or_create_user(test_user_id, "Test DB Admin", "testdbadmin", is_admin=True)
+    assert await test_db.is_admin(test_user_id) is False
+
+    assert await test_db.set_admin_status(test_user_id, True) is True
     assert await test_db.is_admin(test_user_id) is True
-    
+    assert test_db.is_admin_sync(test_user_id) is True
+
     can_add, max_allowed, current_count = await test_db.can_user_add_channel(test_user_id)
     assert can_add is True
     assert max_allowed == 999
+
+    # Revoking takes effect immediately, for the cached check as well
+    assert await test_db.set_admin_status(test_user_id, False) is True
+    assert await test_db.is_admin(test_user_id) is False
+    assert test_db.is_admin_sync(test_user_id) is False
 
 @pytest.mark.asyncio
 async def test_rate_limiter_prune_stale_locks():

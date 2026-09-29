@@ -55,9 +55,20 @@ def get_cipher(custom_key: str = None) -> list:
     except Exception:
         logger.debug("Ignored exception", exc_info=True)
 
-    # 3. Check database/.vault_key file
-    vault_path = PROJECT_ROOT / "database" / ".vault_key"
-    if vault_path.exists():
+    # 3. Machine vault key file: VAULT_KEY_PATH (resolved like services/security_vault.py), then the default
+    vault_paths = []
+    try:
+        from config.settings import settings
+        configured = settings.VAULT_KEY_PATH or "database/.vault_key"
+        vault_paths.append(Path(configured) if os.path.isabs(configured) else PROJECT_ROOT / configured)
+    except Exception:
+        logger.debug("Ignored exception", exc_info=True)
+    default_vault_path = PROJECT_ROOT / "database" / ".vault_key"
+    if default_vault_path not in vault_paths:
+        vault_paths.append(default_vault_path)
+    for vault_path in vault_paths:
+        if not vault_path.exists():
+            continue
         try:
             with open(vault_path, "r", encoding="utf-8") as f:
                 disk_key = f.read().strip()
@@ -103,7 +114,7 @@ def decrypt_backup(file_path: str, output_path: str = None, extract: bool = Fals
 
     ciphers = get_cipher(custom_key)
     if not ciphers:
-        print("[-] Error: No encryption keys found in .env, database/.vault_key, or --key.")
+        print("[-] Error: No encryption keys found in .env, the vault key file (VAULT_KEY_PATH), or --key.")
         return False
 
     decrypted_bytes = None

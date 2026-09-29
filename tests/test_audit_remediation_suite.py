@@ -1,16 +1,13 @@
-import os
 import uuid
 import pytest
-import asyncio
 from unittest.mock import AsyncMock, patch
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, User as TgUser, Chat
+from aiogram.types import CallbackQuery, User as TgUser
 from database.db_manager import DatabaseManager
 from database.fsm_storage import SQLiteStorage
-from database.models import ChannelPair
 from bot.handlers.history_clone import cb_cancel_history_clone
-from admin_bot.handlers.broadcast import process_broadcast_message, _broadcast_lock, BroadcastStates
+from admin_bot.handlers.broadcast import _broadcast_lock, BroadcastStates
 
 import pytest_asyncio
 
@@ -19,9 +16,8 @@ class DemoStates(StatesGroup):
     step_two = State()
 
 @pytest_asyncio.fixture
-async def test_db():
-    db_name = f"temp_media/test_audit_{uuid.uuid4().hex[:8]}.db"
-    os.makedirs("temp_media", exist_ok=True)
+async def test_db(tmp_path):
+    db_name = str(tmp_path / f"test_audit_{uuid.uuid4().hex[:8]}.db")
     db = DatabaseManager(db_name)
     await db.init_db()
     yield db
@@ -161,23 +157,30 @@ async def test_user_lifecycle_blocked_and_unblocked(test_db):
 @pytest.mark.asyncio
 async def test_broadcast_concurrency_lock():
     """
-    Verify broadcast cannot be run concurrently by multiple requests.
+    A confirmed broadcast cannot start while another one is running; the draft is kept so the admin can
+    confirm it again later.
     """
     from aiogram.fsm.context import FSMContext
     from aiogram.fsm.storage.memory import MemoryStorage
+    from admin_bot.handlers.broadcast import cb_broadcast_confirm
 
     storage = MemoryStorage()
     state = FSMContext(storage=storage, key=StorageKey(bot_id=1, chat_id=1, user_id=1))
+    await state.set_state(BroadcastStates.waiting_for_confirm)
+    await state.update_data(broadcast_draft={"kind": "text", "text": "E'lon matni"})
 
-    mock_msg = AsyncMock(spec=Message)
-    mock_msg.text = "E'lon matni"
-    mock_msg.caption = None
-    mock_msg.answer = AsyncMock()
+    callback = AsyncMock(spec=CallbackQuery)
+    callback.from_user = TgUser(id=1, is_bot=False, first_name="Admin")
+    callback.answer = AsyncMock()
+    bot = AsyncMock()
 
-    # Simulate broadcast lock is currently held
-    async with _broadcast_lock:
-        await process_broadcast_message(mock_msg, state, AsyncMock())
-        # Should be rejected because lock is held
-        mock_msg.answer.assert_called_once()
-        args, kwargs = mock_msg.answer.call_args
-        assert "allaqachon ketmoqda" in args[0]
+    with patch("admin_bot.handlers.broadcast.ensure_super_admin", new=AsyncMock(return_value=True)):
+        async with _broadcast_lock:
+            await cb_broadcast_confirm(callback, state, bot)
+
+    callback.answer.assert_called_once()
+    assert "ketmoqda" in callback.answer.call_args.kwargs["text"]
+    assert callback.answer.call_args.kwargs["show_alert"] is True
+    bot.send_message.assert_not_called()
+    assert await state.get_state() == BroadcastStates.waiting_for_confirm.state
+    assert (await state.get_data())["broadcast_draft"]["text"] == "E'lon matni"

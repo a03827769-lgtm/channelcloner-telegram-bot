@@ -1,17 +1,21 @@
+# Template — installed by `sudo bash deploy/oracle_master_setup.sh --with-anti-reclaim`, which replaces
+# __APP_USER__ and __APP_DIR__. Only useful on Oracle Cloud Always Free instances (see deploy/anti_reclaim.py).
 [Unit]
-Description=Oracle Cloud Always Free Anti-Reclamation Service
-After=network.target
+Description=Oracle Cloud Always Free anti-reclamation helper (optional)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=opc
-WorkingDirectory=/home/opc/app/deploy
-ExecStart=/usr/bin/python3 /home/opc/app/deploy/anti_reclaim.py
+User=__APP_USER__
+WorkingDirectory=__APP_DIR__/deploy
+ExecStart=/usr/bin/python3 __APP_DIR__/deploy/anti_reclaim.py
 Restart=always
 RestartSec=5
+Nice=19
+NoNewPrivileges=true
 StandardOutput=journal
 StandardError=journal
-Nice=19
 
 [Install]
 WantedBy=multi-user.target

@@ -1,196 +1,157 @@
-# Telegram Channel Cloner — 24/7 Production Deployment Guide
+# Telegram Channel Cloner — ishga tushirish va joylashtirish (deployment)
 
-Bu qo'llanma Telegram Channel Cloner tizimini (`@klonlabot`, `@klonlaadminbot`, Telethon MTProto Userbot) 24/7 to'xtovsiz, mutlaqo bepul (Zero-Cost PaaS), eng yuqori xavfsizlik va tezlikda bulutli platformalarga joylashtirish bo'yicha to'liq ko'rsatmalarni o'z ichiga oladi.
+## 1. Asosiy qoida: faqat BITTA nusxa
 
----
+Bitta `BOT_TOKEN` / Telethon sessiyasi bir vaqtda faqat **bitta jarayonda** ishlashi mumkin. Ikkinchi nusxa
+(Windows + Docker, ikkita server, "zero-downtime" deploy) quyidagilarga olib keladi:
 
-## Mundarija
-1. [Arxitektura va Keep-Alive Tizimi](#1-arxitektura-va-keep-alive-tizimi)
-2. [Atrof-muhit O'zgaruvchilari (Environment Variables)](#2-atrof-muhit-ozgaruvchilari-environment-variables)
-3. [Koyeb PaaS orqali 24/7 Bepul Joylashtirish](#3-koyeb-paas-orqali-247-bepul-joylashtirish)
-4. [Render PaaS orqali Joylashtirish](#4-render-paas-orqali-joylashtirish)
-5. [Docker va Docker Compose orqali VPS/Serverda Ishga Tushirish](#5-docker-va-docker-compose-orqali-vpsserverda-ishga-tushirish)
-6. [24/7 Doimiy Uyg'oq Tutish (Uptime Monitoring)](#6-247-doimiy-uygoq-tutish-uptime-monitoring)
-7. [Telethon MTProto Sessiyasini Bulutga O'tkazish](#7-telethon-mtproto-sessiyasini-bulutga-otkazish)
-8. [Nosozliklarni Bartaraf Qilish (Troubleshooting)](#8-nosozliklarni-bartaraf-qilish-troubleshooting)
+* `TelegramConflictError` (ikki poller), postlarning takrorlanishi;
+* `AUTH_KEY_DUPLICATED` — Telegram Telethon sessiyasini bekor qiladi, qayta login kerak bo'ladi;
+* SQLite bazasining ikki joyda bo'linib ketishi (to'lovlar va sozlamalar yo'qoladi).
 
----
+Shuning uchun quyidagi yo'llardan **faqat bittasini** tanlang:
 
-## 1. Arxitektura va Keep-Alive Tizimi
+| Yo'l | Qachon | Holat (state) qayerda |
+|---|---|---|
+| **A. Windows host** (watchdog + `python run.py`) | hozirgi production | `database/cloner.db`, `database/.vault_key`, `data/`, `logs/` |
+| **B. VPS / Linux: Docker** (`docker-bot` profili) | alohida server | Docker volume `channelcloner_bot_data` → `/app/data` |
+| **C. Render** (pullik tarif + disk) | PaaS kerak bo'lsa | Render disk → `/app/data` |
 
-Bot quyidagi komponentlardan tashkil topgan:
-- **Aiogram 3 Dispatcher**: Ommaviy bot (`@klonlabot`) va Admin boshqaruv boti (`@klonlaadminbot`) uchun yuqori tezlikdagi asinxron polling.
-- **Telethon MTProto Listener**: Xususiy/yopiq kanallardagi yangi xabarlarni real vaqt rejimida ushlab oluvchi userbot mexanizmi.
-- **Embedded aiohttp Keep-Alive Server**: `0.0.0.0:${PORT:-8080}` portida ishlovchi yengil HTTP server (`/` va `/health` yo'llari). U tashqi monitoring so'rovlariga `<2ms` ichida `200 OK` JSON qaytaradi va bepul bulutli konteynerlarning uxlab qolishini (idle sleep) 100% oldini oladi.
+Bepul PaaS tariflari (Render Free, Koyeb Free va h.k.) **qo'llab-quvvatlanmaydi**: doimiy disk yo'q (baza,
+to'lovlar va vault kaliti har deployda yo'qoladi), servis uxlab qoladi va rolling deploy ikki nusxani
+bir vaqtda ishga tushiradi.
 
-```
-                  ┌────────────────────────────────────────┐
-                  │          Tashqi Pinger                 │
-                  │   (UptimeRobot / Koyeb Healthcheck)    │
-                  └───────────────────┬────────────────────┘
-                                      │ HTTP GET /health
-                                      ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│                   Docker Container (Port 8080)                           │
-│                                                                          │
-│  ┌──────────────────────┐  ┌──────────────────────────────────────────┐  │
-│  │ aiohttp Keep-Alive   │  │           Aiogram 3 Polling              │  │
-│  │ Healthcheck Server   │  │   (@klonlabot & @klonlaadminbot)         │  │
-│  └──────────────────────┘  └──────────────────────────────────────────┘  │
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                 Telethon MTProto Userbot Listener                 │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-│  ┌─────────────────────────────┐    ┌─────────────────────────────────┐  │
-│  │ SQLite WAL DB (cloner.db)   │    │ FFmpeg Video & Media Engine     │  │
-│  └─────────────────────────────┘    └─────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+## 2. Sozlamalar (`.env`)
 
----
-
-## 2. Atrof-muhit O'zgaruvchilari (Environment Variables)
-
-Barcha platformalar uchun quyidagi 9 ta o'zgaruvchi talab qilinadi:
+`cp .env.example .env` yoki `python setup_wizard.py`. `.env` doim loyiha ildizidan o'qiladi (ish katalogidan qat'i nazar)
+va hech qachon git'ga qo'shilmaydi.
 
 | O'zgaruvchi | Majburiy | Standart | Tavsif |
 |---|---|---|---|
-| `BOT_TOKEN` | **Ha** | — | Telegram BotFather'dan olingan ommaviy bot tokeni (`@klonlabot`) |
-| `ADMIN_BOT_TOKEN` | Yo'q (Tavsiya) | — | Admin boshqaruv boti tokeni (`@klonlaadminbot`) |
-| `TELEGRAM_API_ID` | **Ha** | — | my.telegram.org'dan olingan raqamli App ID |
-| `TELEGRAM_API_HASH` | **Ha** | — | my.telegram.org'dan olingan 32 belgili App Hash |
-| `TELETHON_SESSION` | Yo'q (Tavsiya) | — | Bulut uchun shifrlangan/xom Telethon StringSession qatori |
-| `ADMIN_IDS` | **Ha** | — | Super admin Telegram ID raqamlari (vergul bilan ajratilgan) |
-| `DB_PATH` | Yo'q | `database/cloner.db` | SQLite ma'lumotlar bazasi fayli yo'li |
-| `TEMP_DOWNLOAD_DIR` | Yo'q | `temp_media` | Vaqtinchalik media yuklab olish katalogi |
-| `PORT` | Yo'q | `8080` | Keep-Alive HTTP healthcheck porti |
+| `BOT_TOKEN` | **Ha** | — | Asosiy bot tokeni (@BotFather) |
+| `ADMIN_BOT_TOKEN` | Tavsiya | — | Alohida admin bot tokeni (`BOT_TOKEN` dan farqli bo'lsin) |
+| `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | **Ha** | — | my.telegram.org dan olinadi |
+| `TELETHON_SESSION` | Yo'q | — | StringSession; bo'lmasa admin bot (MTProto bo'limi) orqali OTP bilan ulanadi |
+| `PRIMARY_SUPER_ADMIN_ID` | Tavsiya | `0` | Asosiy super admin Telegram ID |
+| `ADMIN_IDS` | Yo'q | — | Qo'shimcha super adminlar (vergul bilan) |
+| `ENCRYPTION_KEY` | Tavsiya | — | Sessiya va zaxiralar uchun master kalit. Bo'sh bo'lsa `VAULT_KEY_PATH` fayli yaratiladi |
+| `VAULT_KEY_PATH` | Yo'q | `database/.vault_key` | Mashina kaliti fayli (Docker/Render: `/app/data/.vault_key`) |
+| `WEBAPP_URL` | Mini App uchun | `http://localhost:8080` | Mini App'ning doimiy HTTPS manzili (nomli tunnel domeni) |
+| `SUPPORT_USERNAME` | Yo'q | `admin` | Private rejimda ko'rsatiladigan admin @username |
+| `PROXY_URL` | Yo'q | — | Bot API uchun HTTP/SOCKS proksi |
+| `GEMINI_API_KEY` | Yo'q | — | AI parafraz (Google Gemini) |
+| `DB_PATH` | Yo'q | `database/cloner.db` | SQLite fayli (Docker/Render: `/app/data/cloner.db`) |
+| `TEMP_DOWNLOAD_DIR` | Yo'q | `temp_media` | Vaqtinchalik media |
+| `PORT` | Yo'q | `8080` | HTTP server (health, Mini App, API). Jarayon muhitidagi `PORT` `.env` dan ustun |
+| `ENABLE_PLAYWRIGHT` | Yo'q | `false` | Chromium renderi (ko'p RAM); o'chiq bo'lsa Pillow ishlatiladi |
+| `DROP_PENDING_UPDATES` | Yo'q | `false` | Ishga tushganda kutilayotgan yangilanishlarni tashlash |
+| `AUTO_RELOAD` | Yo'q | `false` | Kod o'zgarsa jarayonni qayta ishga tushirish (faqat ishlab chiqishda) |
 
----
+Infratuzilma o'zgaruvchilari (ixtiyoriy): `CLOUDFLARED_TUNNEL_NAME` (watchdog kuzatadigan tunnel, standart `miniapp`),
+`MINIAPP_WEB_PORT` (8081), `BOT_HTTP_PORT` (8080, `docker-bot` loopback porti), `INSTALL_PLAYWRIGHT` (Docker build arg),
+`CLONER_ENV_FILE` (o'qiladigan `.env` yo'li; standart — loyiha ildizidagi `.env`, bo'sh qiymat faylni o'qimaydi).
 
-## 3. Koyeb PaaS orqali 24/7 Bepul Joylashtirish
+**Kalitlar haqida:** `ENCRYPTION_KEY` yoki vault kaliti yo'qolsa, shifrlangan sessiyalar va zaxiralarni ochib bo'lmaydi.
+Bazani boshqa joyga ko'chirsangiz, kalitni ham ko'chiring (yoki bir xil `ENCRYPTION_KEY` bering).
 
-[Koyeb](https://www.koyeb.com) — 512MB RAM, Frankfurt (Yevropa) hududi va yuqori tezlikdagi bepul konteynerlarni taqdim etuvchi zamonaviy PaaS.
+## 3. HTTP endpointlar
 
-### Bosqichma-bosqich qo'llanma:
-1. **GitHub Repozitoriyasini ulash**:
-   - Koyeb boshqaruv paneliga kiring ([app.koyeb.com](https://app.koyeb.com)).
-   - **Create App** tugmasini bosing va **GitHub** manbasini tanlang.
-   - `a03827769-lgtm/channelcloner-telegram-bot` shaxsiy repozitoriyasini tanlang (`main` branch).
+* `GET /health` — liveness: jarayon ishlayotgan bo'lsa **har doim 200**; tanasida `status` (`ok` yoki ishga tushish /
+  polling uzilishi paytida `degraded`), `pid`, `uptime`, `db_ready`, `polling_alive`, `telethon_connected`.
+* `GET /ready` — readiness: baza tayyor va bot polling qilayotgan bo'lsa 200, aks holda 503. PaaS / deploy tekshiruvlari
+  shundan foydalanadi.
+* `/` va `/app` — Mini App (React/Vite, `webapp/dist`), `/api/*` — Mini App REST API.
 
-2. **Builder & Konfiguratsiya**:
-   - **Deployment method**: `Dockerfile` avtomatik aniqlanadi.
-   - **Region**: `Frankfurt (fra)` tanlang (Telegram serverlariga eng yaqin va eng past ping).
-   - **Instance type**: `Free` (Eco tier: 512MB RAM, 0.1 vCPU).
-   - **Scaling**: `min: 1`, `max: 1` (Qat'iy 1 ta nusxa, aks holda MTProto sessiya to'qnashuvi yuz beradi).
+## 4. Yo'l A — Windows host (hozirgi production)
 
-3. **Port va Healthcheck**:
-   - **Port**: `8080` (HTTP).
-   - **Health check path**: `/health`.
-   - **Initial delay**: `15` soniya.
-   - **Timeout**: `5` soniya.
+1. Python 3.11, keyin: `pip install -r requirements.txt`
+2. `python setup_wizard.py` (yoki `.env` ni qo'lda to'ldiring)
+3. Mini App: `cd webapp && npm ci && npm run build` (natija `webapp/dist`, bot o'zi tarqatadi)
+4. Nomli Cloudflare tunnel (bir marta): `cloudflared tunnel login`, `cloudflared tunnel create miniapp`,
+   `cloudflared tunnel route dns miniapp app.example.com`; ingress `http://127.0.0.1:8080` ga yo'naltiriladi
+   (namuna: `.cloudflared/config.yml.example`). `.env` da `WEBAPP_URL=https://app.example.com`.
+5. Avtomatik ishga tushish (bitta, admin huquqisiz mexanizm — Startup papkasidagi yorliq):
+   `python scripts/setup_autostart.py install --start`
+   (eski Run-kalit / Task Scheduler / Docker-watchdog yozuvlarini ham olib tashlaydi; `uninstall` — teskarisi)
+6. Quvvat sozlamalari (faqat tarmoqqa ulanganda uxlamaslik): `powershell -File scripts\configure_power_24_7.ps1`
 
-4. **Environment Variables**:
-   Koyeb **Environment variables** bo'limida quyidagi o'zgaruvchilarni kiriting:
-   - `BOT_TOKEN` (Secret sifatida saqlang)
-   - `ADMIN_BOT_TOKEN` (Secret)
-   - `TELEGRAM_API_ID` (Secret)
-   - `TELEGRAM_API_HASH` (Secret)
-   - `TELETHON_SESSION` (Secret — `cloud_env_ready.txt` dagi qiymat)
-   - `ADMIN_IDS` (Secret)
-   - `PORT`: `8080`
-   - `DB_PATH`: `database/cloner.db`
-   - `TEMP_DOWNLOAD_DIR`: `temp_media`
+Watchdog (`scripts/windows_keepalive_watchdog.py`) Windows'ni uyg'oq ushlaydi, `run.py` ni yashirin konsol jarayoni
+sifatida boshqaradi va `cloudflared tunnel run <nom>` ni kuzatadi:
 
-5. **Deploy**:
-   - **Deploy** tugmasini bosing. Loyiha 60-90 soniya ichida avtomatik yig'iladi va ishga tushadi.
-
----
-
-## 4. Render PaaS orqali Joylashtirish
-
-[Render](https://render.com) — bepul Docker Web Service qo'llab-quvvatlaydigan bulutli platforma.
-
-### Bosqichma-bosqich qo'llanma:
-1. [dashboard.render.com](https://dashboard.render.com) ga kiring.
-2. **New +** -> **Web Service** ni tanlang.
-3. GitHub repozitoriyangizni (`channelcloner-telegram-bot`) ulang.
-4. Parametrlarni quyidagicha belgilang:
-   - **Name**: `channelcloner-telegram-bot`
-   - **Region**: `Frankfurt (EU Central)`
-   - **Branch**: `main`
-   - **Runtime**: `Docker`
-   - **Instance Type**: `Free`
-   - **Health Check Path**: `/health`
-5. **Environment Variables** bo'limida `.env.example` dagi 9 ta o'zgaruvchini kiriting.
-6. **Create Web Service** tugmasini bosing.
-
-*(Yoki to'g'ridan-to'g'ri `render.yaml` Blueprint orqali 1 ta tugma bilan deploy qiling).*
-
----
-
-## 5. Docker va Docker Compose orqali VPS/Serverda Ishga Tushirish
-
-Agar shaxsiy Linux VPS (Ubuntu/Debian) da ishlatmoqchi bo'lsangiz:
-
-```bash
-# 1. Repozitoriyani klonlash
-git clone https://github.com/a03827769-lgtm/channelcloner-telegram-bot.git
-cd channelcloner-telegram-bot
-
-# 2. Atrof-muhit faylini yaratish
-cp .env.example .env
-nano .env  # O'z tokenlaringizni kiriting
-
-# 3. Docker Compose orqali fonga ishga tushirish
-docker-compose up -d --build
-
-# 4. Holatni tekshirish
-docker-compose ps
-curl -i http://127.0.0.1:8080/health
-
-# 5. Loglarni kuzatish
-docker-compose logs -f --tail=100
+```powershell
+python scripts\windows_keepalive_watchdog.py --status          # holat
+python scripts\windows_keepalive_watchdog.py --reload          # faqat botni ohista qayta ishga tushirish
+python scripts\windows_keepalive_watchdog.py --restart         # watchdog'ni qayta ishga tushirish (fon rejimida)
+python scripts\windows_keepalive_watchdog.py --stop            # to'xtatish (bot va tunnel ham)
+python scripts\windows_keepalive_watchdog.py --stop --force    # javob bermayotgan (eski) watchdog uchun
 ```
 
----
+* Bot `CTRL_BREAK` bilan ohista to'xtatiladi, 30 soniyadan keyin jarayon daraxti majburan yopiladi.
+* Qayta ishga tushirish faqat uzoq davom etgan nosozlikda: kamida 4 ta muvaffaqiyatsiz tekshiruv, 60+ soniya davomida,
+  ishga tushgandan keyingi 240 soniyada emas. `degraded` (HTTP 200) qayta ishga tushirishga sabab bo'lmaydi.
+* `telegram_channel_cloner` Docker konteyneri ishlayotgan bo'lsa, host bot ishga tushirilmaydi; host bot ishlayotganda
+  konteyner paydo bo'lsa, u to'xtatiladi (`--keep-conflicting-container` — faqat log).
+* Loglar: `logs/watchdog.log`, `logs/bot_stdout.log` (10 MB gacha), `logs/cloudflared.log`, `data/app.log`.
 
-## 6. 24/7 Doimiy Uyg'oq Tutish (Uptime Monitoring)
+## 5. Yo'l B — VPS / Linux (Docker, `docker-bot` profili)
 
-Koyeb va Render bepul tariflarida tashqi HTTP so'rov kelmasa, konteyner 15 daqiqada uxlab qolishi mumkin. Buni 100% bartaraf etish uchun:
+Kod serverga **git orqali** keladi (release tegi); maxfiy fayllar hech qachon avtomatik yuborilmaydi.
 
-1. [UptimeRobot.com](https://uptimerobot.com) saytida bepul ro'yxatdan o'ting.
-2. **Add New Monitor** tugmasini bosing:
-   - **Monitor Type**: `HTTP(s)`
-   - **Friendly Name**: `Telegram Channel Cloner Healthcheck`
-   - **URL (or IP)**: `https://<sizning-koyeb-yoki-render-app>.koyeb.app/health`
-   - **Monitoring Interval**: `Every 5 minutes`
-3. **Create Monitor** ni bosing.
+```bash
+# serverda (Ubuntu/Debian yoki Oracle Linux, x86_64/ARM64)
+git clone --branch v1.4.0 https://github.com/<owner>/<repo>.git ~/channelcloner
+cd ~/channelcloner && cp .env.example .env && nano .env
+sudo bash deploy/oracle_master_setup.sh --domain app.example.com --email admin@example.com
+docker compose --profile docker-bot up -d --build telegram-cloner
+curl -fsS http://127.0.0.1:8080/ready
+```
 
-Endi UptimeRobot har 5 daqiqada `/health` manziliga GET so'rov yuborib turadi. Natijada bot hech qachon uxlamaydi va 24/7 uzluksiz ishlaydi.
+`deploy/oracle_master_setup.sh` (idempotent): Docker + compose, nginx, certbot; firewall faqat 22/80/443 (8080 va 9000
+tashqariga ochilmaydi, Docker soketi `chmod 666` qilinmaydi); nginx `127.0.0.1:8080` ga proksi qiladi; `--domain` bilan
+certbot sertifikatni oladi va HTTPS (443) ni o'zi qo'shadi. Oracle Cloud'da VCN Security List'da ham 80/443 ni oching.
+Ixtiyoriy: `--with-anti-reclaim` (Oracle Always Free: CPU/RAM/tarmoq chegarasini ushlab turadi, ataylab resurs sarflaydi),
+`--with-webhook` (GitHub'da `v*` teg push qilinganda avtomatik deploy; `127.0.0.1:9000`, nginx orqali
+`https://<domen>/deploy-webhook`, sirli kalit `/etc/channelcloner/webhook.env` da).
 
----
+Yangilash (Windows'dan):
 
-## 7. Telethon MTProto Sessiyasini Bulutga O'tkazish
+```powershell
+.\deploy_one_click.ps1 -VpsIp 203.0.113.10 -User ubuntu -KeyPath $HOME\.ssh\oracle_arm_key -Ref v1.4.1
+# birinchi marta: -Repo https://github.com/<owner>/<repo>.git -Bootstrap -AcceptNewHostKey -Domain ... -Email ...
+```
 
-Bulutli konteynerlar har qayta ishga tushganda diskdagi fayllar yangilanishi mumkin. Userbot sessiyasini yo'qotmaslik uchun:
+Bu `scripts/deploy_remote.py` ni chaqiradi: SSH host kaliti tekshiriladi, serverda teg checkout qilinadi, konteyner qayta
+yig'iladi va `/ready` kutiladi; har qanday xato — nol bo'lmagan exit code. SSH kalit: `ssh-keygen -t ed25519 -f ~/.ssh/oracle_arm_key`.
 
-1. Lokal kompyuterda yoki `@klonlaadminbot` orqali MTProto tizimiga OTP kodi bilan kiring.
-2. Shifrlangan `TELETHON_SESSION` qatorini oling (`enc:gAAAAAB...` formati).
-3. Ushbu qatorni Koyeb/Render panelida `TELETHON_SESSION` o'zgaruvchisiga kiriting.
-4. Bot qayta yonganda ushbu sessiyani avtomatik o'qiydi va qayta telefon raqam yoki kod so'ramaydi.
+Mavjud bazani volume'ga ko'chirish (avval eski nusxani to'xtating, shunda WAL bazaga birlashadi):
 
----
+```bash
+docker compose --profile docker-bot run --rm --no-deps --user root -v "$PWD/database:/import:ro" \
+  --entrypoint sh telegram-cloner -c "cp /import/cloner.db /import/.vault_key /app/data/ && chown appuser:appuser /app/data/cloner.db /app/data/.vault_key"
+```
 
-## 8. Nosozliklarni Bartaraf Qilish (Troubleshooting)
+`docker compose up -d` (profilsiz) faqat edge xizmatlarini (`miniapp_web` nginx + `cloudflared`) ishga tushiradi — ular
+Windows hostdagi bot uchun; `docker-bot` bilan birga kerak emas.
 
-### 1. `telethon_connected: false` holati
-- Sababi: API_ID/API_HASH xato yoki TELETHON_SESSION kiritilmagan.
-- Yechim: `@klonlaadminbot` orqali `/start` -> **MTProto Userbot** bo'limiga kirib qayta OTP login qiling yoki `TELETHON_SESSION` ni yangilang.
+## 6. Yo'l C — Render
 
-### 2. Video watermark qo'yishda sekinlik
-- Sababi: Kam yadroli vCPU da og'ir 4K videolarni qayta ishlash.
-- Yechim: `services/video_watermark_service.py` da `-preset veryfast` va `-threads 1` rejimlari sozlangan.
+`render.yaml` Blueprint: `starter` (pullik) tarif, `/app/data` ga ulangan disk (disk bo'lganda Render eski instansiyani
+yangisidan oldin to'xtatadi — ikki nusxa bo'lmaydi), `autoDeploy: false`, `healthCheckPath: /ready`, bitta instansiya.
+Maxfiy qiymatlarni (`BOT_TOKEN`, `ENCRYPTION_KEY`, ...) panelda kiriting. Obraz `appuser` (uid 1000) bilan ishlaydi:
+disk shu foydalanuvchi uchun yoziladigan bo'lishi kerak. `koyeb.yaml` — Koyeb uchun xuddi shu talablarning ma'lumotnomasi
+(volume, `immediate` deploy strategiyasi, bitta instansiya).
 
-### 3. Port bandligi yoki HTTP xatosi
-- Konteyner ichida port doimo `8080` ga bog'lanadi. Tashqi portni `PORT` o'zgaruvchisi orqali boshqarishingiz mumkin.
+## 7. Zaxira nusxa va tiklash
+
+* Admin bot → "Baza Nusxasi": shifrlangan `.zip.enc` (Fernet). Ochish:
+  `python scripts/decrypt_backup.py backup.zip.enc --extract` (kalit `.env`/vault faylidan yoki `--key`).
+* Bazani tekshirish/tiklash (bot to'xtatilgan bo'lishi shart): `python scripts/repair_db.py` va `--rebuild`
+  (avval SQLite backup API bilan to'liq nusxa oladi; qatorlar soni mos kelmasa almashtirmaydi).
+
+## 8. Nosozliklar
+
+* **`TelegramConflictError` / postlar takrorlanmoqda** — ikkinchi nusxa ishlayapti. Tekshiring:
+  `python scripts\windows_keepalive_watchdog.py --status`, `docker ps -a` (eski `telegram_channel_cloner` konteynerini
+  `docker compose --profile docker-bot down` yoki `docker rm -f telegram_channel_cloner` bilan olib tashlang).
+* **`AUTH_KEY_DUPLICATED`** — sessiya ikki joyda ishlatilgan; bitta nusxa qoldirib, admin bot orqali qayta login qiling.
+* **`/ready` 503** — baza yoki polling tayyor emas: `data/app.log` va `logs/bot_stdout.log` ni ko'ring.

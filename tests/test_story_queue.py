@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import pytest
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from services.story_queue_service import story_queue_service, UZB_TZ
 from database.models import StorySettings
 
@@ -69,15 +69,14 @@ async def test_calculate_scheduled_time_daytime(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_process_due_item_retry_on_failure():
+async def test_process_due_item_retry_on_failure(tmp_path):
     import uuid
     import json
     from unittest.mock import AsyncMock, MagicMock, patch
     from database.db_manager import DatabaseManager
-    from database.models import StoryQueueItem, StorySettings
     from tests.test_utils import safe_cleanup_db
 
-    db_path = f"temp_media/test_sq_retry_{uuid.uuid4().hex[:8]}.db"
+    db_path = str(tmp_path / f"test_sq_retry_{uuid.uuid4().hex[:8]}.db")
     db = DatabaseManager(db_path)
     try:
         await db.init_db()
@@ -158,12 +157,12 @@ async def test_process_due_item_retry_on_failure():
 
 
 @pytest.mark.asyncio
-async def test_clean_old_cloned_messages_prunes_story_queue():
+async def test_clean_old_cloned_messages_prunes_story_queue(tmp_path):
     import uuid
     from database.db_manager import DatabaseManager
     from tests.test_utils import safe_cleanup_db
 
-    db_path = f"temp_media/test_sq_prune_{uuid.uuid4().hex[:8]}.db"
+    db_path = str(tmp_path / f"test_sq_prune_{uuid.uuid4().hex[:8]}.db")
     db = DatabaseManager(db_path)
     try:
         await db.init_db()

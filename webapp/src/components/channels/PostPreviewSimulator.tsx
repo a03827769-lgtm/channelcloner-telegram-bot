@@ -1,5 +1,5 @@
 import React from 'react';
-import { Eye, Forward } from 'lucide-react';
+import { Eye, Forward, Globe } from 'lucide-react';
 
 interface PostPreviewSimulatorProps {
   sourceTitle: string;
@@ -85,6 +85,11 @@ export const PostPreviewSimulator: React.FC<PostPreviewSimulatorProps> = ({
 
         {/* Message Caption */}
         <div className="text-[12px] text-white/85 leading-relaxed font-normal">
+          {autoTranslate && targetLang && (
+            <span className="inline-flex items-center gap-1 mb-1 px-1.5 py-0.5 rounded-full bg-[#0A84FF]/15 text-[#64D2FF] text-[10px] font-semibold">
+              <Globe size={10} /> {targetLang.toUpperCase()} tarjima
+            </span>
+          )}
           {autoTranslate ? (
             <p>
               Toshkent markazida hashamatli yangi xonadon sotuvga qo'yildi! Barcha qulayliklar mavjud, yevro ta'mir.

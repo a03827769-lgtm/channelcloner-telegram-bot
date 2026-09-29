@@ -1,102 +1,47 @@
 # ============================================================
-# ChannelCloner Pro — Production Multi-Container Stack
-# PHP 8.3-FPM + MySQL 8.0 + Nginx + Python Telethon Worker
-# Adheres to DOCKER_PRODUCTION_STANDARDS.md
+# ChannelCloner Pro — Container stack
+#
+# ONE BOT INSTANCE ONLY. A bot token / Telethon session may be used by exactly one process:
+# either the host runtime (Windows watchdog -> python run.py) OR the `docker-bot` profile below,
+# never both (two pollers -> TelegramConflictError, AUTH_KEY_DUPLICATED, duplicate posts).
+# The Windows watchdog refuses to start the host bot while the container runs and stops the
+# container when it appears next to a running host bot.
+#
+# Default services (`docker compose up -d`) — edge for the HOST bot on a Windows machine:
+#   miniapp_web  – nginx edge proxy: forwards the Mini App (SPA + /api) to the bot process
+#                  on the Docker host (host.docker.internal:8080)
+#   cloudflared  – named Cloudflare tunnel (config in ./.cloudflared, see config.yml.example)
+#
+# Optional profile (never started implicitly):
+#   docker-bot   – runs the bot itself in Docker INSTEAD of the host process (VPS / Linux).
+#                  Start:  docker compose --profile docker-bot up -d --build telegram-cloner
+#                  Stop:   docker compose --profile docker-bot stop telegram-cloner
+#                  State (SQLite DB, vault key, logs, backups) lives in the named volume
+#                  `channelcloner_bot_data` mounted at /app/data — never on a bind mount
+#                  (SQLite WAL over a Windows/WSL bind mount is not safe). See DEPLOYMENT.md
+#                  for moving an existing database into the volume.
 # ============================================================
 
-version: '3.8'
-
 services:
-  # ── 1. MySQL 8.0 Enterprise Relational Database ──────────────
-  mysql:
-    image: mysql:8.0
-    container_name: channelcloner_mysql
-    restart: unless-stopped
-    mem_limit: 512m
-    mem_reservation: 128m
-    cpus: 1.0
-    environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-cloner_root_pass_2026}
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-channelcloner}
-      MYSQL_USER: ${MYSQL_USER:-cloner_user}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-cloner_pass_2026}
-    ports:
-      - "${MYSQL_PORT:-3307}:3306"
-    volumes:
-      - cloner_mysql_data:/var/lib/mysql
-      - ./miniapp/sql/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
-      - ./miniapp/sql/seed_data.sql:/docker-entrypoint-initdb.d/02_seed.sql:ro
-    command: >
-      --default-authentication-plugin=mysql_native_password
-      --character-set-server=utf8mb4
-      --collation-server=utf8mb4_unicode_ci
-      --max_connections=200
-      --innodb_buffer_pool_size=256M
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-cloner_root_pass_2026}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "3"
-    networks:
-      - cloner_net
-
-  # ── 2. PHP 8.3-FPM Backend API ────────────────────────────
-  miniapp_php:
-    image: channelcloner_miniapp_php:latest
-    build:
-      context: .
-      dockerfile: docker/miniapp/Dockerfile
-    container_name: channelcloner_miniapp_php
-    restart: unless-stopped
-    depends_on:
-      mysql:
-        condition: service_healthy
-    mem_limit: 256m
-    mem_reservation: 64m
-    cpus: 0.5
-    environment:
-      - MYSQL_HOST=mysql
-      - MYSQL_PORT=3306
-      - MYSQL_DATABASE=${MYSQL_DATABASE:-channelcloner}
-      - MYSQL_USER=${MYSQL_USER:-cloner_user}
-      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-cloner_pass_2026}
-      - BOT_TOKEN=${BOT_TOKEN:-}
-      - APP_ENV=${APP_ENV:-production}
-    volumes:
-      - ./miniapp:/var/www/html
-      - ./assets/audio:/app/assets/audio:ro
-      - ./data:/app/data
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "3"
-    networks:
-      - cloner_net
-
-  # ── 3. Nginx Web Server & Static Cache ───────────────────
+  # ── Edge proxy for the Telegram Mini App ─────────────────────
   miniapp_web:
-    image: nginx:alpine
+    image: nginx:stable-alpine
     container_name: channelcloner_miniapp_web
     restart: unless-stopped
-    depends_on:
-      - miniapp_php
     mem_limit: 128m
     mem_reservation: 32m
     cpus: 0.5
     ports:
-      - "${PORT:-8080}:80"
+      # Local debugging only; public traffic arrives through cloudflared on the internal network
+      - "127.0.0.1:${MINIAPP_WEB_PORT:-8081}:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
-      - ./miniapp:/var/www/html:ro
       - ./docker/nginx/miniapp.conf:/etc/nginx/conf.d/default.conf:ro
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/"]
-      interval: 15s
+      # Liveness of the proxied host bot (/health). Readiness for load balancers is /ready.
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/health"]
+      interval: 30s
       timeout: 5s
       retries: 3
     logging:
@@ -107,17 +52,19 @@ services:
     networks:
       - cloner_net
 
-  # ── 4. Cloudflare 24/7 Global Edge Tunnel ────────────────
+  # ── Cloudflare named tunnel ──────────────────────────────────
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    # Pinned release; bump deliberately (https://github.com/cloudflare/cloudflared/releases)
+    image: cloudflare/cloudflared:2026.9.1
     container_name: channelcloner_cloudflared
-    restart: always
+    restart: unless-stopped
     depends_on:
       miniapp_web:
-        condition: service_healthy
+        condition: service_started
     volumes:
-      - ./.cloudflared:/etc/cloudflared
-    command: tunnel run
+      # config.yml + tunnel credentials JSON (both git-ignored); read-only for the container
+      - ./.cloudflared:/etc/cloudflared:ro
+    command: tunnel --no-autoupdate run
     networks:
       - cloner_net
     logging:
@@ -126,44 +73,36 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # ── 5. Python Telethon MTProto Cloner Daemon ───────────────
+  # ── OPTIONAL: the bot inside Docker (profile: docker-bot) ─────
   telegram-cloner:
+    profiles: ["docker-bot"]
     container_name: telegram_channel_cloner
-    image: channelcloner-telegram-cloner:latest
+    image: channelcloner-telegram-cloner:local
     build:
       context: .
       dockerfile: Dockerfile
-    init: true
-    restart: always
+      args:
+        # Playwright Chromium adds ~400 MB; only needed with ENABLE_PLAYWRIGHT=true
+        INSTALL_PLAYWRIGHT: ${INSTALL_PLAYWRIGHT:-false}
+    restart: unless-stopped
     mem_limit: 1536m
     mem_reservation: 384m
     cpus: 1.5
-    depends_on:
-      mysql:
-        condition: service_healthy
     env_file:
       - .env
     environment:
-      - MYSQL_HOST=mysql
-      - MYSQL_PORT=3306
-      - MYSQL_DATABASE=${MYSQL_DATABASE:-channelcloner}
-      - MYSQL_USER=${MYSQL_USER:-cloner_user}
-      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-cloner_pass_2026}
-      - DB_PATH=/home/appuser/cloner.db
-      - PYTHONUNBUFFERED=1
-      - WEBAPP_URL=https://app.abdulloh.me
-      - CLOUDFLARE_TUNNEL_DOMAIN=app.abdulloh.me
+      # Container paths win over the host paths from .env: all persistent state is in /app/data
+      DB_PATH: /app/data/cloner.db
+      VAULT_KEY_PATH: /app/data/.vault_key
+      TEMP_DOWNLOAD_DIR: temp_media
+      PORT: "8080"
+      PYTHONUNBUFFERED: "1"
+    ports:
+      # Loopback only: a host reverse proxy (deploy/nginx/channelcloner.conf) publishes it via HTTPS
+      - "127.0.0.1:${BOT_HTTP_PORT:-8080}:8080"
     volumes:
-      - ./data:/app/data
-      - ./temp_media:/app/temp_media
-      - ./bot:/app/bot:ro
-      - ./admin_bot:/app/admin_bot:ro
-      - ./config:/app/config:ro
-      - ./services:/app/services:ro
-      - ./database:/app/database:ro
-      - ./assets:/app/assets:ro
-      - ./run.py:/app/run.py:ro
-    stop_grace_period: 15s
+      - cloner_bot_data:/app/data
+    stop_grace_period: 30s
     logging:
       driver: "json-file"
       options:
@@ -173,8 +112,8 @@ services:
       - cloner_net
 
 volumes:
-  cloner_mysql_data:
-    name: channelcloner_mysql_data
+  cloner_bot_data:
+    name: channelcloner_bot_data
 
 networks:
   cloner_net:

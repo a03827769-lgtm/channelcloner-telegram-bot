@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 from services.text_processor import TextProcessor
 from services.cloner_engine import ClonerEngine, is_private_chat_target
 from database.models import ChannelPair

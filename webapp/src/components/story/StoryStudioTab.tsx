@@ -9,7 +9,7 @@ import {
   Home,
   DollarSign
 } from 'lucide-react';
-import { StorySettings, AudioTrack, StoryQueueItem } from '../../types';
+import { StorySettings, AudioTrack, StoryQueueItem, StoryPostedItem, StoryBackground } from '../../types';
 import { Switch } from '../ui/Switch';
 import { CupertinoSlider } from '../ui/CupertinoSlider';
 import { telegram } from '../../services/telegram';
@@ -18,10 +18,29 @@ interface StoryStudioTabProps {
   settings: StorySettings | null;
   audioTracks: AudioTrack[];
   queue: StoryQueueItem[];
-  posted: any[];
+  posted: StoryPostedItem[];
   isVip: boolean;
-  onSaveSettings: (updated: Partial<StorySettings>) => Promise<void>;
+  /** Receives only the fields that differ from the saved settings */
+  onSaveSettings: (changes: Partial<StorySettings>) => Promise<void>;
   onOpenBilling: () => void;
+}
+
+// Same choices as the bot's story design menu (the API accepts only these)
+const BACKGROUND_STYLES: { id: StoryBackground; label: string; color: string }[] = [
+  { id: 'telegram_green', label: 'Telegram Yashil', color: '#10B981' },
+  { id: 'listing_blur', label: "Xiralashgan Rasm", color: '#64748B' },
+  { id: 'luxury_dark', label: "To'q Lux", color: '#1E293B' },
+  { id: 'emerald', label: 'Zumrad', color: '#047857' },
+];
+
+function diffSettings(original: StorySettings | null, edited: Partial<StorySettings>): Partial<StorySettings> {
+  const changes: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(edited)) {
+    if (!original || original[key as keyof StorySettings] !== value) {
+      changes[key] = value;
+    }
+  }
+  return changes as Partial<StorySettings>;
 }
 
 export const StoryStudioTab: React.FC<StoryStudioTabProps> = ({
@@ -68,7 +87,7 @@ export const StoryStudioTab: React.FC<StoryStudioTabProps> = ({
         audioRef.current.pause();
         setIsPlayingAudio(false);
       } else {
-        audioRef.current.src = `/api/audio.php?track=${trackFile}`;
+        audioRef.current.src = `/api/audio-tracks/${encodeURIComponent(trackFile)}`;
         audioRef.current.play().catch(() => {});
         setSelectedTrack(trackFile);
         setIsPlayingAudio(true);
@@ -80,7 +99,7 @@ export const StoryStudioTab: React.FC<StoryStudioTabProps> = ({
     setIsSaving(true);
     telegram.impact('medium');
     try {
-      await onSaveSettings(formData);
+      await onSaveSettings(diffSettings(settings, formData));
     } finally {
       setIsSaving(false);
     }
@@ -119,16 +138,16 @@ export const StoryStudioTab: React.FC<StoryStudioTabProps> = ({
 
       {/* visionOS Segmented Control Container */}
       <div className="vision-segmented-container animate-fade-up stagger-1">
-        {[
+        {([
           { id: 'preview', label: '9:16 Simulyator' },
           { id: 'settings', label: 'Sozlamalar' },
           { id: 'queue', label: `Navbat (${queue.length})` },
-        ].map((tab) => (
+        ] as const).map((tab) => (
           <button
             key={tab.id}
             onClick={() => {
               telegram.selection();
-              setActiveTab(tab.id as any);
+              setActiveTab(tab.id);
             }}
             className={`vision-segment-pill ${activeTab === tab.id ? 'active' : ''}`}
           >
@@ -323,12 +342,7 @@ export const StoryStudioTab: React.FC<StoryStudioTabProps> = ({
           <div className="vision-grouped-list p-4 flex flex-col gap-2.5">
             <div className="text-[13px] font-semibold text-white">Istoriya Fon Uslubi</div>
             <div className="grid grid-cols-2 gap-2">
-              {[
-                { id: 'telegram_green', label: 'Telegram Green', color: '#10B981' },
-                { id: 'luxury_black', label: 'Luxury Black', color: '#1E293B' },
-                { id: 'modern_indigo', label: 'Modern Indigo', color: '#6366F1' },
-                { id: 'penthouse_amber', label: 'Penthouse Amber', color: '#F59E0B' },
-              ].map((style) => (
+              {BACKGROUND_STYLES.map((style) => (
                 <button
                   key={style.id}
                   type="button"

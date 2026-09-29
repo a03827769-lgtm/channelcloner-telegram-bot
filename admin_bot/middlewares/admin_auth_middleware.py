@@ -1,19 +1,19 @@
 import logging
 from typing import Callable, Dict, Any, Awaitable
 from aiogram import BaseMiddleware
-from aiogram.types import TelegramObject, Message, CallbackQuery
+from aiogram.types import TelegramObject, CallbackQuery
 from config.settings import settings
+from database.db_manager import db_manager
 
 logger = logging.getLogger(__name__)
 
-from services.custom_emojis import ERROR
-
-from database.db_manager import db_manager
 
 class AdminStrictAuthMiddleware(BaseMiddleware):
     """
-    Strict security middleware for Admin Bot:
-    Blocks and drops any interaction from non-admin users immediately.
+    Strict security middleware for the dedicated admin bot:
+    drops every interaction from users who are neither super admins (environment) nor
+    delegated admins (promoted from the admin bot). Super-admin-only actions are checked
+    additionally inside the individual handlers.
     """
     async def __call__(
         self,
@@ -25,15 +25,15 @@ class AdminStrictAuthMiddleware(BaseMiddleware):
         if not user:
             return None
 
-        is_authorized = (user.id == settings.PRIMARY_SUPER_ADMIN_ID or user.id in settings.admin_ids) or await db_manager.is_admin(user.id)
+        is_authorized = user.id in settings.admin_ids or await db_manager.is_admin(user.id)
         if not is_authorized:
-            logger.warning(f"UNAUTHORIZED access attempt on Admin Bot by user_id={user.id} ({user.full_name}, @{user.username})")
+            logger.warning(f"UNAUTHORIZED access attempt on Admin Bot by user_id={user.id}")
             if isinstance(event, CallbackQuery):
                 try:
-                    await event.answer("Ruxsat berilmagan! Ushbu bot faqat Super Adminlar uchun!", show_alert=True)
+                    await event.answer("Ruxsat berilmagan! Ushbu bot faqat administratorlar uchun.", show_alert=True)
                 except Exception:
-                    logger.debug("Ignored exception", exc_info=True)
-            # Silently drop unauthorized messages to protect dedicated admin bot from FloodWait attacks
+                    logger.debug("Could not answer unauthorized callback", exc_info=True)
+            # Messages from strangers are dropped silently so the admin bot cannot be used to trigger FloodWait
             return None
 
         return await handler(event, data)

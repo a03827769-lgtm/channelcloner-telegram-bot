@@ -1,5 +1,4 @@
 import unittest
-import asyncio
 import os
 import time
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -13,38 +12,39 @@ from bot.handlers.settings_menu import get_watermark_pos_keyboard
 from bot.middlewares.user_registration_middleware import UserRegistrationMiddleware
 from config.settings import settings
 
-TEST_DB_PATH = "database/test_audit_complete.db"
-
 class TestAuditCompleteFixes(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        if os.path.exists(TEST_DB_PATH):
-            try:
-                os.remove(TEST_DB_PATH)
-            except Exception:
-                pass
-        self.db = DatabaseManager(TEST_DB_PATH)
+        import tempfile
+        # Temporary directory (never next to the live database/cloner.db)
+        self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.test_db_path = os.path.join(self._tmp_dir.name, "test_audit_complete.db")
+        self.db = DatabaseManager(self.test_db_path)
         await self.db.init_db()
 
     async def asyncTearDown(self):
-        await self.db.close()
-        if os.path.exists(TEST_DB_PATH):
-            try:
-                os.remove(TEST_DB_PATH)
-            except Exception:
-                pass
+        from tests.test_utils import safe_cleanup_db
+        await safe_cleanup_db(self.test_db_path, self.db)
+        self._tmp_dir.cleanup()
 
     async def test_1_init_db_admin_insertion_no_tier_column_error(self):
-        """1. Verify init_db properly inserts configured admins without 'no column named tier' error"""
+        """1. init_db with configured admins succeeds. Environment admins are recognised dynamically (nothing
+        is written for them), always have the VIP plan, and lose every right once removed from the config"""
         test_admin_id = 999888777
-        with patch.object(settings, "ADMIN_IDS_RAW", str(test_admin_id)):
+        with patch.object(settings, "ADMIN_IDS_RAW", str(test_admin_id)), \
+             patch.object(settings, "PRIMARY_SUPER_ADMIN_ID", 0):
             await self.db.init_db()
-            user = await self.db.get_user_by_id(test_admin_id)
-            self.assertIsNotNone(user)
-            self.assertTrue(user.is_admin)
+            self.assertIsNone(await self.db.get_user_by_id(test_admin_id))
+            self.assertTrue(await self.db.is_admin(test_admin_id))
+            self.assertTrue(self.db.is_admin_sync(test_admin_id))
 
             sub = await self.db.get_user_subscription(test_admin_id)
             self.assertEqual(sub.tier, "vip")
             self.assertTrue(sub.is_active)
+
+        with patch.object(settings, "ADMIN_IDS_RAW", ""), patch.object(settings, "PRIMARY_SUPER_ADMIN_ID", 0):
+            self.assertFalse(await self.db.is_admin(test_admin_id))
+            self.assertFalse(self.db.is_admin_sync(test_admin_id))
+            self.assertNotEqual((await self.db.get_user_subscription(test_admin_id)).tier, "vip")
 
     async def test_2_save_channel_backup_idempotent_on_conflict(self):
         """2. Verify save_channel_backup does not crash on unique constraint violation and updates text"""
@@ -117,12 +117,18 @@ class TestAuditCompleteFixes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "ANOR sharbati, Anor mevasi va anor daraxti.")
 
     async def test_6_text_processor_attach_signature_boundary(self):
-        """6. Verify attach_signature prevents message length from exceeding Telegram's 4096 limit"""
+        """6. A signature on a post near the 4096 limit is kept whole: the post is split, never cut"""
         sig = "📢 Bizning kanal: @kanalim"
         long_text = "A" * 4090
         res = TextProcessor.attach_signature(long_text, sig)
-        self.assertLessEqual(len(res), 4096)
+        self.assertTrue(res.startswith(long_text))
         self.assertTrue(res.endswith(sig))
+
+        chunks = TextProcessor.fit_text_limit(res, max_limit=4096)
+        self.assertEqual(len(chunks), 2)
+        for chunk in chunks:
+            self.assertLessEqual(TextProcessor.get_visible_text_length(chunk), 4096)
+        self.assertTrue(chunks[-1].rstrip().endswith(sig))
 
     async def test_7_safe_answer_truncates_long_alerts(self):
         """7. Verify safe_answer truncates callback alert texts > 195 chars to avoid 200-char API crash"""

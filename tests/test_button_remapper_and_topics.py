@@ -1,13 +1,11 @@
 import os
-import time
-import asyncio
 import tempfile
 import unittest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, AsyncMock
 
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup
 
-from services.button_remapper import SmartButtonRemapper, button_remapper
+from services.button_remapper import SmartButtonRemapper
 from services.session_pool import SessionPoolManager
 from database.db_manager import DatabaseManager
 from database.models import ChannelPair

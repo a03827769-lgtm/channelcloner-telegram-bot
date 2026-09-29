@@ -1,26 +1,38 @@
+import asyncio
 import logging
-from typing import Union
+from typing import Optional, Set, Union
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.enums import ChatType
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, MenuButtonWebApp, WebAppInfo
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from database.db_manager import db_manager
+from bot.access import is_admin_user
+from bot.filters import IsAdminFilter
 from bot.keyboards.inline_buttons import (
+    MENU_STORY,
+    MENU_STATS,
+    get_active_webapp_url,
     get_main_menu_keyboard,
     get_back_to_main_keyboard,
     get_quickstart_keyboard,
     get_main_reply_keyboard
 )
-from config.settings import settings
-from bot.utils import safe_answer
+from bot.utils import safe_answer, edit_or_send
 from services.custom_emojis import (
     TELEGRAM, CROWN, SUCCESS, FLASH, WARN, ERROR,
     TRANSLATE, IMAGE, LOCK_UNLOCKED, MONEY, CLEAN, SIGNATURE, REFRESH,
-    STATS, ROCKET, NUM_1, NUM_2, LINK, STARS, ARROW_DOWN, VIDEO, clean_for_alert
+    STATS, ROCKET, NUM_1, NUM_2, LINK, STARS, ARROW_DOWN, VIDEO
 )
 
 logger = logging.getLogger(__name__)
 router = Router(name="start_router")
+# Menus, wizards and keyword buttons belong to the private chat with the bot: in groups (where the bot
+# may be a member for comment moderation) none of these handlers may answer
+router.message.filter(F.chat.type == ChatType.PRIVATE)
+router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
+
+_briefing_tasks: Set[asyncio.Task] = set()
 
 
 def get_welcome_text() -> str:
@@ -35,7 +47,7 @@ def get_welcome_text() -> str:
 ├ {LOCK_UNLOCKED} <b>Protected Content Mode:</b> Forward taqiqlangan yopiq darslik kanallarini ko'chirish.
 ├ {MONEY} <b>Referal Almashtirgich:</b> Begona linklarni o'z referal havolalaringizga almashtirish.
 ├ {CLEAN} <b>Reklamani Tozalash:</b> Begona kanal havolalari avtomatik tozalanadi.
-├ {VIDEO} <b>Real Estate Auto-Story Cloner (VIP):</b> $700+ hashamatli uylarni avtomatik aniqlab, 4K Playwright kollaj va Ken Burns video ko'rinishida Telegram Istoriyasiga avto-joylash.
+├ {VIDEO} <b>Real Estate Auto-Story Cloner (VIP):</b> $700+ hashamatli uylarni avtomatik aniqlab, 4K kollaj va Ken Burns video ko'rinishida Telegram Istoriyasiga avto-joylash.
 ├ {SIGNATURE} <b>Shaxsiy Imzo:</b> Xabar ostiga o'z kanalingiz havolasini joylash.
 └ {REFRESH} <b>Tarixni Ko'chirish (Backfill):</b> Manba kanaldagi eski postlarni ham ko'chirish.
 
@@ -48,23 +60,13 @@ async def cmd_start(message: Message, state: FSMContext):
     user = message.from_user
     is_admin = False
     if user:
-        is_admin = (user.id in settings.admin_ids)
-        await db_manager.get_or_create_user(
-            user_id=user.id,
-            full_name=user.full_name,
-            username=user.username,
-            is_admin=is_admin
-        )
-        if not is_admin:
-            is_admin = await db_manager.is_admin(user.id)
+        # UserRegistrationMiddleware has already registered / refreshed the user for this update
+        is_admin = is_admin_user(user.id)
 
-    # Set persistent chat menu button to WebApp for this user
-    if user:
-        from bot.keyboards.inline_buttons import get_active_webapp_url
+        # Set persistent chat menu button to WebApp for this user
         active_url = get_active_webapp_url()
         if active_url and active_url.startswith("https://"):
             try:
-                from aiogram.types import MenuButtonWebApp, WebAppInfo
                 await message.bot.set_chat_menu_button(
                     chat_id=user.id,
                     menu_button=MenuButtonWebApp(text="📱 Mini App", web_app=WebAppInfo(url=active_url))
@@ -86,10 +88,7 @@ async def cmd_start(message: Message, state: FSMContext):
     )
 
 @router.message(Command("app", "miniapp"))
-@router.message(F.text.in_({"📱 Mini Appni Ochish", "Mini App", "📱 Mini App"}))
 async def cmd_open_miniapp(message: Message):
-    from bot.keyboards.inline_buttons import get_active_webapp_url
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
     active_url = get_active_webapp_url()
     if active_url.startswith("https://"):
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -111,29 +110,11 @@ async def cmd_open_miniapp(message: Message):
             parse_mode="HTML"
         )
 
-@router.callback_query(F.data == "menu_open_miniapp")
-async def cb_open_miniapp(callback: CallbackQuery):
-    await safe_answer(callback)
-    from bot.keyboards.inline_buttons import get_active_webapp_url
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
-    active_url = get_active_webapp_url()
-    if active_url.startswith("https://"):
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Mini Appni Ochish", web_app=WebAppInfo(url=active_url))],
-            [InlineKeyboardButton(text="⬅️ Ortga", callback_data="menu_main")]
-        ])
-        await callback.message.answer(
-            f"{ROCKET} <b>ChannelCloner Pro — Telegram Mini App</b>\n\n"
-            f"Quyidagi tugma orqali ilovani ochishingiz mumkin:",
-            parse_mode="HTML",
-            reply_markup=kb
-        )
-    else:
-        await safe_answer(callback, "⚠️ Mini App hozir ulanmoqda. Bir necha soniyadan so'ng qayta urinib ko'ring.", show_alert=True)
-
 @router.callback_query(F.data == "menu_quickstart")
-async def cb_quickstart(callback: CallbackQuery):
+async def cb_quickstart(callback: CallbackQuery, state: Optional[FSMContext] = None):
     await safe_answer(callback)
+    if state is not None:
+        await state.clear()
     text = f"""
 {ROCKET} <b>Tezkor Boshlash Qo'llanmasi (30 Soniyada):</b>
 
@@ -149,25 +130,18 @@ Botdan to'liq foydalanish uchun bor-yo'g'i 2 ta oddiy qadam:
 
 Quyidagi tugmalar orqali hoziroq boshlang:
 """
-    await callback.message.edit_text(
-        text=text,
-        parse_mode="HTML",
-        reply_markup=get_quickstart_keyboard()
-    )
+    await edit_or_send(callback, text, parse_mode="HTML", reply_markup=get_quickstart_keyboard())
 
 @router.callback_query(F.data == "menu_main")
 async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
     await safe_answer(callback)
     await state.clear()
-    user_id = callback.from_user.id
-    is_admin = (user_id in settings.admin_ids) or await db_manager.is_admin(user_id)
-    await callback.message.edit_text(
-        text=get_welcome_text(),
-        parse_mode="HTML",
-        reply_markup=get_main_menu_keyboard(is_admin=is_admin)
-    )
+    is_admin = is_admin_user(callback.from_user.id)
+    await edit_or_send(callback, get_welcome_text(), parse_mode="HTML", reply_markup=get_main_menu_keyboard(is_admin=is_admin))
 
-@router.callback_query(F.data == "menu_admin")
+# Admins reach the admin dashboard of the embedded admin router with this button; everybody else
+# (e.g. an old menu message after admin rights were revoked) gets this explanation
+@router.callback_query(F.data == "menu_admin", ~IsAdminFilter())
 async def cb_menu_admin_fallback(callback: CallbackQuery):
     await safe_answer(callback, "Ushbu bo'lim faqat bot administratorlari uchun ruxsat etilgan!", show_alert=True)
 
@@ -178,7 +152,7 @@ async def cb_check_private_access(callback: CallbackQuery, state: FSMContext):
     if is_allowed:
         await safe_answer(callback, "Ruxsat tasdiqlandi! Xush kelibsiz!", show_alert=True)
         await state.clear()
-        is_admin = (user_id in settings.admin_ids) or await db_manager.is_admin(user_id)
+        is_admin = is_admin_user(user_id)
         try:
             await callback.message.delete()
         except Exception:
@@ -201,7 +175,7 @@ async def cb_check_private_access(callback: CallbackQuery, state: FSMContext):
         )
 
 
-@router.message(F.text.contains("Istoriya"))
+@router.message(F.text == MENU_STORY, ~F.forward_origin)
 async def handle_story_button_text(message: Message, state: FSMContext):
     from bot.handlers.story_menu import render_story_main_menu, check_is_vip, get_story_vip_upgrade_text_and_keyboard
     await state.clear()
@@ -216,14 +190,24 @@ async def handle_story_button_text(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "menu_stats")
 @router.message(Command("stats"))
-@router.message(F.text.contains("Statistika"))
-async def cb_stats(event: Union[CallbackQuery, Message]):
+@router.message(F.text == MENU_STATS, ~F.forward_origin)
+async def cb_stats(event: Union[CallbackQuery, Message], state: Optional[FSMContext] = None):
+    # Opening a menu ends any unfinished wizard
+    if state is not None:
+        await state.clear()
     user_id = event.from_user.id
     user_stats = await db_manager.get_user_stats(user_id)
     sub = user_stats["subscription"]
 
-    is_admin = (user_id in settings.admin_ids) or await db_manager.is_admin(user_id)
-    tier_label = f"{CROWN} VIP Cheksiz" if sub.tier == "vip" or is_admin else (f"{STARS} Pro" if sub.tier == "pro" else "Free (14 kunlik Sinov)")
+    is_admin = is_admin_user(user_id)
+    if sub.tier == "vip" or is_admin:
+        tier_label = f"{CROWN} VIP Cheksiz"
+    elif sub.tier == "pro":
+        tier_label = f"{STARS} Pro"
+    elif sub.is_active:
+        tier_label = "Free (14 kunlik Sinov)"
+    else:
+        tier_label = "Sinov muddati tugagan"
 
     text = f"""
 {STATS} <b>Sizning Shaxsiy Statistikangiz:</b>
@@ -238,11 +222,7 @@ async def cb_stats(event: Union[CallbackQuery, Message]):
 """
     if isinstance(event, CallbackQuery):
         await safe_answer(event)
-        await event.message.edit_text(
-            text=text,
-            parse_mode="HTML",
-            reply_markup=get_back_to_main_keyboard()
-        )
+        await edit_or_send(event, text, parse_mode="HTML", reply_markup=get_back_to_main_keyboard())
     else:
         await event.answer(
             text=text,
@@ -254,27 +234,27 @@ async def cb_stats(event: Union[CallbackQuery, Message]):
 async def cmd_cancel(message: Message, state: FSMContext):
     from services.telethon_listener import telethon_listener
     user_id = message.from_user.id
-    is_admin = user_id in settings.admin_ids or await db_manager.is_admin(user_id)
+    is_admin = is_admin_user(user_id)
 
-    # Clear any active FSM state
+    # Clear any active FSM state (and an unfinished MTProto login of an admin using the embedded tools)
     await state.clear()
+    await telethon_listener.cancel_login(user_id)
 
-    # BUG #19 fix: only cancel tasks belonging to this user (admin cancels all)
+    # Only the user's own history copies are cancelled (an admin cancels all of them)
     cancelled_pairs = []
     for pair_id, task in list(telethon_listener.active_history_tasks.items()):
-        if task and not task.done():
-            # Check ownership — only cancel if admin or pair belongs to this user
+        if task is None or task.done():
+            continue
+        if not is_admin:
             try:
                 pair = await db_manager.get_pair_by_id(pair_id)
-                if is_admin or (pair and pair.user_id == user_id):
-                    task.cancel()
-                    telethon_listener.active_history_tasks.pop(pair_id, None)
-                    cancelled_pairs.append(pair_id)
             except Exception:
-                if is_admin:
-                    task.cancel()
-                    telethon_listener.active_history_tasks.pop(pair_id, None)
-                    cancelled_pairs.append(pair_id)
+                logger.warning(f"/cancel: could not check the owner of pair #{pair_id}", exc_info=True)
+                continue
+            if not pair or pair.user_id != user_id:
+                continue
+        if telethon_listener.cancel_history_clone(pair_id):
+            cancelled_pairs.append(pair_id)
 
     if cancelled_pairs:
         await message.answer(
@@ -293,22 +273,39 @@ async def cmd_cancel(message: Message, state: FSMContext):
         )
 
 
+async def _send_market_briefing(message: Message, status_msg: Message):
+    from services.market_analytics import market_analytics_service
+    try:
+        await market_analytics_service.send_daily_briefing(message.bot, message.chat.id, user_id=message.from_user.id)
+        try:
+            await status_msg.delete()
+        except Exception:
+            logger.debug("Ignored exception", exc_info=True)
+    except Exception as e:
+        logger.error(f"Error generating market briefing: {e}", exc_info=True)
+        try:
+            await message.answer(f"{ERROR} Xatolik yuz berdi. Iltimos keyinroq urinib ko'ring.", parse_mode="HTML")
+        except Exception:
+            logger.debug("Ignored exception", exc_info=True)
+
+
 @router.message(Command("briefing", "digest"))
 async def cmd_market_briefing(message: Message):
-    """Generates today's Executive Real Estate Market Analytics and Audio Briefing (VIP Only)"""
+    """Today's real estate digest of the user's own channel pairs (VIP only)"""
     user_id = message.from_user.id
-    is_vip = await db_manager.is_vip(user_id) or (user_id in settings.admin_ids)
+    # is_vip() also covers administrators
+    is_vip = await db_manager.is_vip(user_id)
     if not is_vip:
         from bot.keyboards.story_keyboards import get_story_vip_upgrade_keyboard
         await message.answer(
             f"{CROWN} <b>VIP Cheksiz Tarif Talab Qilinadi!</b>\n\n"
-            f"Kunlik Toshkent ko'chmas mulk bozori tahlili va audio podkasti faqat <b>VIP Cheksiz</b> foydalanuvchilariga taqdim etiladi.",
+            f"Kanallaringiz bo'yicha kunlik ko'chmas mulk bozori tahlili faqat <b>VIP Cheksiz</b> foydalanuvchilariga taqdim etiladi.",
             parse_mode="HTML",
             reply_markup=get_story_vip_upgrade_keyboard()
         )
         return
 
-    # Rate limiting: prevent spamming expensive audio briefing generation
+    # At most one digest a minute per user
     cache_key = f"briefing_ratelimit_{user_id}"
     from services.cache_manager import cache_manager
     if await cache_manager.seen_users_cache.get(cache_key):
@@ -316,16 +313,8 @@ async def cmd_market_briefing(message: Message):
         return
     await cache_manager.seen_users_cache.set(cache_key, True, ttl=60.0)
 
-    from services.market_analytics import market_analytics_service
-    status_msg = await message.answer("⏳ <i>Kunlik bozor tahlili va audio podkast tayyorlanmoqda...</i>", parse_mode="HTML")
-    try:
-        await market_analytics_service.send_daily_briefing(message.bot, message.chat.id)
-        try:
-            await status_msg.delete()
-        except Exception:
-            logger.debug("Ignored exception", exc_info=True)
-    except Exception as e:
-        logger.error(f"Error generating market briefing: {e}", exc_info=True)
-        await message.answer(f"{ERROR} Xatolik yuz berdi. Iltimos keyinroq urinib ko'ring.", parse_mode="HTML")
-
-
+    status_msg = await message.answer("⏳ <i>Kunlik bozor tahlili tayyorlanmoqda...</i>", parse_mode="HTML")
+    # Generated in the background: the user's other updates are not held up meanwhile
+    task = asyncio.create_task(_send_market_briefing(message, status_msg))
+    _briefing_tasks.add(task)
+    task.add_done_callback(_briefing_tasks.discard)

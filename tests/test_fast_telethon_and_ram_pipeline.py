@@ -1,16 +1,13 @@
 import unittest
-import asyncio
 import io
 import os
 import tempfile
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from PIL import Image
 
 from services.fast_telethon import FastTelethonEngine, fast_telethon
 from services.watermark_service import watermark_service
 from services.media_handler import media_handler
-from database.models import ChannelPair
-from services.cloner_engine import ClonerEngine
 
 class TestFastTelethonAndRamPipeline(unittest.IsolatedAsyncioTestCase):
 

@@ -1,15 +1,37 @@
+# ==============================================================================
+# Koyeb service settings — Telegram Channel Cloner (reference; mirror them in the Koyeb control panel
+# or `koyeb service create/update`).
+#
+# SINGLE INSTANCE ONLY. A bot token and a Telethon session may be used by exactly one process. Two
+# overlapping instances (rolling / blue-green deploy, scaling > 1, the same bot on another host) cause
+# TelegramConflictError, AUTH_KEY_DUPLICATED (the Telethon session is revoked) and duplicate posts.
+#
+# Required settings:
+#   * scaling min = max = 1
+#   * deployment strategy "immediate" (old instance stopped before the new one starts) — never rolling
+#     or blue-green; autodeploy on git push disabled (deploy manually)
+#   * a persistent volume mounted at /app/data (SQLite DB, vault key, logs, backups). The free instance
+#     type has no volume: every deploy would lose the database, payments and the vault key.
+#   * ENCRYPTION_KEY set as a secret (keep a copy outside Koyeb)
+#   * health check on /ready (answers 503 until the bot is ready)
+# Never run this service while the bot also runs anywhere else.
+# ==============================================================================
 name: channelcloner-telegram-bot
 type: web
 
 regions:
-  - fra # Frankfurt, Europe (Lowest latency for Telegram MTProto)
+  - fra # Frankfurt, Europe (low latency to Telegram)
 
 scalings:
   - min: 1
-    max: 1 # Strictly 1 instance to prevent MTProto auth conflict and SQLite split-brain
+    max: 1
 
 instance_types:
-  - type: free # Koyeb Eco / Free tier instance (512MB RAM, 0.1 vCPU)
+  - type: small # any paid type that supports volumes; NOT "free"
+
+volumes:
+  - name: channelcloner-data
+    path: /app/data
 
 ports:
   - port: 8080
@@ -22,8 +44,8 @@ routes:
 health_checks:
   - protocol: http
     port: 8080
-    path: /health
-    initial_delay: 15
+    path: /ready
+    initial_delay: 60
     interval: 30
     timeout: 5
     healthy_threshold: 1
@@ -33,7 +55,9 @@ env:
   - key: PORT
     value: "8080"
   - key: DB_PATH
-    value: "database/cloner.db"
+    value: "/app/data/cloner.db"
+  - key: VAULT_KEY_PATH
+    value: "/app/data/.vault_key"
   - key: TEMP_DOWNLOAD_DIR
     value: "temp_media"
   - key: BOT_TOKEN
@@ -46,9 +70,13 @@ env:
     secret: TELEGRAM_API_HASH
   - key: TELETHON_SESSION
     secret: TELETHON_SESSION
+  - key: PRIMARY_SUPER_ADMIN_ID
+    secret: PRIMARY_SUPER_ADMIN_ID
   - key: ADMIN_IDS
     secret: ADMIN_IDS
   - key: ENCRYPTION_KEY
     secret: ENCRYPTION_KEY
+  - key: WEBAPP_URL
+    secret: WEBAPP_URL
   - key: ENABLE_PLAYWRIGHT
     value: "false"

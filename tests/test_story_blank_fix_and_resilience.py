@@ -5,7 +5,7 @@ from PIL import Image
 
 from services.story_renderer import story_card_renderer, StoryCardRenderer
 from services.story_video_generator import story_video_generator
-from services.story_cloner_service import StoryClonerService, story_cloner_service
+from services.story_cloner_service import StoryClonerService
 from database.models import StorySettings
 
 

@@ -6,8 +6,22 @@ declare global {
   }
 }
 
+export interface TelegramUser {
+  id: number;
+  first_name: string;
+  last_name?: string;
+  username?: string;
+  is_premium?: boolean;
+}
+
 class TelegramService {
   private tg = typeof window !== 'undefined' ? window.Telegram?.WebApp : null;
+
+  private refresh() {
+    if (typeof window !== 'undefined' && window.Telegram?.WebApp) {
+      this.tg = window.Telegram.WebApp;
+    }
+  }
 
   init() {
     if (this.tg) {
@@ -29,36 +43,25 @@ class TelegramService {
     }
   }
 
+  /** True only inside Telegram, where the WebApp SDK provides signed initData. */
   isAvailable(): boolean {
-    if (typeof window !== 'undefined' && window.Telegram?.WebApp) {
-      this.tg = window.Telegram.WebApp;
-    }
+    this.refresh();
     return Boolean(this.tg && this.tg.initData && this.tg.initData.length > 0);
   }
 
   getInitData(): string {
-    if (typeof window !== 'undefined' && window.Telegram?.WebApp) {
-      this.tg = window.Telegram.WebApp;
-    }
+    this.refresh();
     return this.tg?.initData || '';
   }
 
-  getUser() {
-    if (this.tg?.initDataUnsafe?.user) {
-      return this.tg.initDataUnsafe.user;
-    }
-    // Development fallback
-    return {
-      id: 99999999,
-      first_name: 'VIP Developer',
-      last_name: '',
-      username: 'channelcloner_vip',
-      is_premium: true
-    };
-  }
-
-  getUserId(): number {
-    return this.getUser().id;
+  /**
+   * The (unsigned) user object Telegram passes to the page, or null outside Telegram.
+   * Display only: the backend identifies the user exclusively from the signed initData.
+   */
+  getUser(): TelegramUser | null {
+    this.refresh();
+    const user = this.tg?.initDataUnsafe?.user;
+    return user && typeof user.id === 'number' ? (user as TelegramUser) : null;
   }
 
   // Haptic feedback

@@ -1,12 +1,9 @@
 import os
 import unittest
-import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from database.db_manager import DatabaseManager
-from database.models import ChannelPair
 from services.ai_paraphraser import ai_paraphraser
 from services.dynamic_affiliate_engine import dynamic_affiliate_engine
-from services.drip_feed_queue import drip_feed_service
 from services.video_watermark_service import video_watermark_service
 from services.disaster_recovery import disaster_recovery_service
 
@@ -130,12 +127,25 @@ class TestNextGenFeatures(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0]["text"], "Test post text")
 
-        # Test mock restore
+        # Restore on behalf of the pair owner into a destination they may post in
         mock_bot = AsyncMock()
-        res = await disaster_recovery_service.restore_channel(mock_bot, pair_id, "@restored_chan", db=self.db)
+        destination = MagicMock(id=-1009876543210)
+        with patch("services.disaster_recovery.verify_destination_access",
+                   new=AsyncMock(return_value=(True, destination, None))):
+            res = await disaster_recovery_service.restore_channel(
+                mock_bot, pair_id, "@restored_chan", db=self.db, requester_id=12345
+            )
         self.assertEqual(res["total_archived"], 1)
         self.assertEqual(res["restored"], 1)
         mock_bot.send_photo.assert_called_once()
+
+        # Anybody else is refused before anything is sent
+        other_bot = AsyncMock()
+        refused = await disaster_recovery_service.restore_channel(
+            other_bot, pair_id, "@restored_chan", db=self.db, requester_id=999
+        )
+        self.assertEqual(refused["error"], "forbidden")
+        other_bot.send_photo.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

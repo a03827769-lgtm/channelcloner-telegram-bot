@@ -2,14 +2,12 @@ import os
 import pytest
 import numpy as np
 from PIL import Image
-from unittest.mock import AsyncMock, MagicMock, patch
 
 from services.aesthetic_scorer import aesthetic_scorer
 from services.steganography_service import steganography_service
 from services.tts_narrator_service import tts_narrator_service
 from services.story_video_generator import story_video_generator
 from database.db_manager import db_manager
-from database.models import StorySettings
 
 
 def test_aesthetic_scorer_scoring_and_reordering(tmp_path):
@@ -117,6 +115,8 @@ def test_story_video_generator_ffmpeg_audio_ducking(tmp_path):
 @pytest.mark.asyncio
 async def test_story_settings_enable_ai_voice_db(tmp_path):
     orig_path = db_manager.db_path
+    # Close the shared connection first, otherwise it keeps serving the previous database file
+    await db_manager.close()
     try:
         test_db = str(tmp_path / "test_voice_settings.db")
         db_manager.db_path = test_db

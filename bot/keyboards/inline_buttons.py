@@ -1,64 +1,78 @@
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
-from config.settings import settings
-from database.models import ChannelPair
+import os
+import logging
 from typing import List, Optional
+
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from config.settings import settings, PROJECT_ROOT
+from config.limits import BACKFILL_MAX_MESSAGES
+from database.models import ChannelPair
 from services.custom_emojis import (
-    ID_ROCKET, ID_REFRESH, ID_STARS, ID_BOOK, ID_STATS, ID_INFO, ID_CROWN,
-    ID_KEY, ID_SUCCESS, ID_ERROR, ID_WARN, ID_HOME, ID_BACK, ID_BROADCAST, ID_BACKUP,
-    ID_LOGOUT, ID_TRASH, ID_CLEAN, ID_TRANSLATE, ID_IMAGE, ID_MONEY,
-    ID_LOCK_UNLOCKED, ID_LOCK_LOCKED, ID_SIGNATURE, ID_DOCUMENT, ID_SPARKLE,
+    ID_ROCKET, ID_REFRESH, ID_STARS, ID_BOOK, ID_STATS, ID_CROWN,
+    ID_SUCCESS, ID_ERROR, ID_HOME, ID_BACK, ID_BACKUP,
+    ID_TRASH, ID_CLEAN, ID_TRANSLATE, ID_IMAGE, ID_MONEY,
+    ID_LOCK_UNLOCKED, ID_SIGNATURE, ID_DOCUMENT, ID_SPARKLE,
     ID_HISTORY_CLOCK, ID_SERVER_CPU, ID_FLASH,
     ID_FLAG_UZ, ID_FLAG_RU, ID_FLAG_EN, ID_FLAG_TR, ID_SETTINGS, ID_FORWARD
 )
 
-from pathlib import Path
-import logging
 logger = logging.getLogger(__name__)
+
+# Persistent reply-keyboard labels. Handlers match these texts exactly (never with `contains`), so a
+# forwarded post or wizard input that merely mentions e.g. "Statistika" is not taken as a menu tap.
+MENU_CLONER = "Kanal Kloner"
+MENU_NEW_PAIR = "Yangi Kanal"
+MENU_STORY = "Istoriya Kloner (VIP)"
+MENU_STATS = "Mening Statistikam"
+MENU_BILLING = "Tariflar & Obuna"
+MENU_GUIDE = "Qo'llanma"
+# The guide label is also typed by hand; accept the common apostrophe variants of "Qo'llanma"
+MENU_GUIDE_VARIANTS = frozenset({MENU_GUIDE, "Qoʻllanma", "Qo’llanma", "Qoʼllanma", "Qo`llanma"})
+
+MAIN_REPLY_MENU_LABELS = frozenset({
+    MENU_CLONER, MENU_NEW_PAIR, MENU_STORY, MENU_STATS, MENU_BILLING
+}) | MENU_GUIDE_VARIANTS
+
 
 def get_active_webapp_url() -> str:
     """Reads live HTTPS Cloudflare tunnel URL or falls back to settings.WEBAPP_URL safely"""
-    import os
-    from time import time
-    base_url = ""
-    
-    # 1. First priority: explicit WEBAPP_URL environment variable (permanent domain)
+    # 1. First priority: settings.WEBAPP_URL if permanent custom domain
+    cfg_url = getattr(settings, "WEBAPP_URL", "").strip()
+    if cfg_url.startswith("https://") and "trycloudflare.com" not in cfg_url and len(cfg_url) > 10:
+        return cfg_url.rstrip('/')
+
+    # 2. Second priority: explicit WEBAPP_URL environment variable
     env_url = os.getenv("WEBAPP_URL", "").strip()
-    if env_url.startswith("https://") and len(env_url) > len("https://"):
-        base_url = env_url
-    
-    # 2. Second priority: active_tunnel_url.txt file (dynamic tunnel URL)
-    if not base_url:
-        url_file = Path("data/active_tunnel_url.txt")
-        if url_file.exists():
-            try:
-                url = url_file.read_text(encoding="utf-8").strip()
-                if url.startswith("https://") and len(url) > len("https://"):
-                    base_url = url
-            except Exception:
-                logger.debug("Ignored exception", exc_info=True)
-    
-    # 3. Third priority: settings.WEBAPP_URL
-    if not base_url:
-        base_url = getattr(settings, "WEBAPP_URL", "")
-        
-    if base_url and len(base_url) > len("https://"):
-        return base_url.strip().rstrip('/')
-    return ""
+    if env_url.startswith("https://") and "trycloudflare.com" not in env_url and len(env_url) > 10:
+        return env_url.rstrip('/')
+
+    # 3. Third priority: active_tunnel_url.txt file (dynamic tunnel URL)
+    url_file = PROJECT_ROOT / "data" / "active_tunnel_url.txt"
+    if url_file.exists():
+        try:
+            url = url_file.read_text(encoding="utf-8").strip()
+            if url.startswith("https://") and len(url) > len("https://"):
+                return url.rstrip('/')
+        except Exception:
+            logger.debug("Ignored exception", exc_info=True)
+
+    if env_url.startswith("https://"):
+        return env_url.rstrip('/')
+    return cfg_url.rstrip('/') if cfg_url.startswith("https://") else ""
 
 def get_main_reply_keyboard(is_admin: bool = False, *args, **kwargs) -> ReplyKeyboardMarkup:
     """Persistent bottom Reply Keyboard menu with modern Bot API 9.4 styles and custom animated emojis"""
     buttons = [
         [
-            KeyboardButton(text="Kanal Kloner", style="primary", icon_custom_emoji_id=ID_REFRESH),
-            KeyboardButton(text="Yangi Kanal", style="success", icon_custom_emoji_id=ID_ROCKET)
+            KeyboardButton(text=MENU_CLONER, style="primary", icon_custom_emoji_id=ID_REFRESH),
+            KeyboardButton(text=MENU_NEW_PAIR, style="success", icon_custom_emoji_id=ID_ROCKET)
         ],
         [
-            KeyboardButton(text="Istoriya Kloner (VIP)", style="success", icon_custom_emoji_id=ID_FLASH),
-            KeyboardButton(text="Mening Statistikam", style="primary", icon_custom_emoji_id=ID_STATS)
+            KeyboardButton(text=MENU_STORY, style="success", icon_custom_emoji_id=ID_FLASH),
+            KeyboardButton(text=MENU_STATS, style="primary", icon_custom_emoji_id=ID_STATS)
         ],
         [
-            KeyboardButton(text="Tariflar & Obuna", style="primary", icon_custom_emoji_id=ID_CROWN),
-            KeyboardButton(text="Qo'llanma", style="primary", icon_custom_emoji_id=ID_BOOK)
+            KeyboardButton(text=MENU_BILLING, style="primary", icon_custom_emoji_id=ID_CROWN),
+            KeyboardButton(text=MENU_GUIDE, style="primary", icon_custom_emoji_id=ID_BOOK)
         ]
     ]
     return ReplyKeyboardMarkup(
@@ -114,6 +128,12 @@ def get_cloner_menu_keyboard(has_pairs: bool = False) -> InlineKeyboardMarkup:
     ])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
+def _short_label(value: Optional[str], limit: int = 24) -> str:
+    """Channel title shortened for a button (titles may be up to 128 characters long)."""
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
 def get_pairs_list_keyboard(pairs: List[ChannelPair], page: int = 0, page_size: int = 6) -> InlineKeyboardMarkup:
     keyboard = []
     total = len(pairs)
@@ -126,8 +146,8 @@ def get_pairs_list_keyboard(pairs: List[ChannelPair], page: int = 0, page_size: 
     for idx, pair in enumerate(page_pairs, start=start_idx + 1):
         pair_style = "success" if pair.is_active else "danger"
         pair_icon = ID_SUCCESS if pair.is_active else ID_ERROR
-        src_label = pair.source_title or pair.source_channel
-        tgt_label = pair.target_title or pair.target_channel
+        src_label = _short_label(pair.source_title or pair.source_channel)
+        tgt_label = _short_label(pair.target_title or pair.target_channel)
         button_text = f"#{idx} {src_label} -> {tgt_label}"
         keyboard.append([
             InlineKeyboardButton(text=button_text, callback_data=f"pair_view_{pair.id}", style=pair_style, icon_custom_emoji_id=pair_icon)
@@ -156,7 +176,7 @@ def get_pair_detail_keyboard(pair: ChannelPair) -> InlineKeyboardMarkup:
 
     clean_text = "Link Tozalash: ON" if pair.clean_links else "Link Tozalash: OFF"
     clean_style = "success" if pair.clean_links else "primary"
-    
+
     trans_text = f"Tarjima: {pair.target_lang.upper()}" if pair.auto_translate else "Tarjima: OFF"
     trans_style = "success" if pair.auto_translate else "primary"
 
@@ -181,6 +201,12 @@ def get_pair_detail_keyboard(pair: ChannelPair) -> InlineKeyboardMarkup:
     cta_text = "CTA Tugma: ON" if pair.auto_cta_buttons else "CTA Tugma: OFF"
     cta_style = "success" if pair.auto_cta_buttons else "primary"
 
+    remsig_text = "Manba Imzosini Tozalash: ON" if pair.remove_signature else "Manba Imzosini Tozalash: OFF"
+    remsig_style = "success" if pair.remove_signature else "primary"
+
+    catchup_text = "Oflayn Catch-Up: ON" if pair.auto_catchup else "Oflayn Catch-Up: OFF"
+    catchup_style = "success" if pair.auto_catchup else "primary"
+
     keyboard = [
         [
             InlineKeyboardButton(text=status_text, callback_data=f"pair_toggle_{pair.id}", style=status_style, icon_custom_emoji_id=status_icon),
@@ -201,6 +227,10 @@ def get_pair_detail_keyboard(pair: ChannelPair) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text=emoji_text, callback_data=f"pair_toggle_emoji_{pair.id}", style=emoji_style, icon_custom_emoji_id=ID_SPARKLE),
             InlineKeyboardButton(text=prot_text, callback_data=f"pair_toggle_prot_{pair.id}", style=prot_style, icon_custom_emoji_id=ID_LOCK_UNLOCKED)
+        ],
+        [
+            InlineKeyboardButton(text=remsig_text, callback_data=f"pair_toggle_remsig_{pair.id}", style=remsig_style, icon_custom_emoji_id=ID_SIGNATURE),
+            InlineKeyboardButton(text=catchup_text, callback_data=f"pair_toggle_catchup_{pair.id}", style=catchup_style, icon_custom_emoji_id=ID_HISTORY_CLOCK)
         ],
         [
             InlineKeyboardButton(text="Referal Linklar", callback_data=f"pair_aff_{pair.id}", style="primary", icon_custom_emoji_id=ID_MONEY),
@@ -248,23 +278,23 @@ def get_translate_lang_keyboard(pair_id: int, current_lang: Optional[str] = None
         ]
     ])
 
-def get_history_count_keyboard(pair_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="10 ta post", callback_data=f"hist_start_{pair_id}_10", style="primary", icon_custom_emoji_id=ID_DOCUMENT),
-            InlineKeyboardButton(text="30 ta post", callback_data=f"hist_start_{pair_id}_30", style="primary", icon_custom_emoji_id=ID_DOCUMENT)
-        ],
-        [
-            InlineKeyboardButton(text="50 ta post", callback_data=f"hist_start_{pair_id}_50", style="primary", icon_custom_emoji_id=ID_DOCUMENT),
-            InlineKeyboardButton(text="100 ta post", callback_data=f"hist_start_{pair_id}_100", style="primary", icon_custom_emoji_id=ID_DOCUMENT)
-        ],
-        [
-            InlineKeyboardButton(text="Barcha mavjud tarixni ko'chirish", callback_data=f"hist_start_{pair_id}_all", style="success", icon_custom_emoji_id=ID_ROCKET)
-        ],
-        [
-            InlineKeyboardButton(text="Bekor qilish", callback_data=f"pair_view_{pair_id}", style="danger", icon_custom_emoji_id=ID_ERROR)
-        ]
+def get_history_count_keyboard(pair_id: int, max_count: int = BACKFILL_MAX_MESSAGES) -> InlineKeyboardMarkup:
+    """Backfill sizes offered for a pair; `max_count` is the user's plan cap (there is no unlimited option)."""
+    max_count = max(1, int(max_count))
+    presets = [n for n in (10, 30, 50, 100) if n < max_count]
+    rows = []
+    for i in range(0, len(presets), 2):
+        rows.append([
+            InlineKeyboardButton(text=f"{n} ta post", callback_data=f"hist_start_{pair_id}_{n}", style="primary", icon_custom_emoji_id=ID_DOCUMENT)
+            for n in presets[i:i + 2]
+        ])
+    rows.append([
+        InlineKeyboardButton(text=f"Maksimal: {max_count} ta post", callback_data=f"hist_start_{pair_id}_{max_count}", style="success", icon_custom_emoji_id=ID_ROCKET)
     ])
+    rows.append([
+        InlineKeyboardButton(text="Bekor qilish", callback_data=f"pair_view_{pair_id}", style="danger", icon_custom_emoji_id=ID_ERROR)
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def get_history_progress_keyboard(pair_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -295,7 +325,7 @@ def get_video_watermark_keyboard(pair_id: int, pair: ChannelPair) -> InlineKeybo
     status_btn_text = "O'chirish" if pair.video_watermark_type != "none" else "Yoqish"
     status_btn_style = "danger" if pair.video_watermark_type != "none" else "success"
     status_btn_icon = ID_ERROR if pair.video_watermark_type != "none" else ID_SUCCESS
-    
+
     def _vpos_btn(pos: str, label: str):
         is_sel = (pair.video_watermark_pos == pos)
         return InlineKeyboardButton(
@@ -326,19 +356,27 @@ def get_video_watermark_keyboard(pair_id: int, pair: ChannelPair) -> InlineKeybo
         ]
     ])
 
+def _choice_button(label: str, callback_data: str, selected: bool, icon: str) -> InlineKeyboardButton:
+    """Option button of a settings menu; the active option is marked (as in the watermark position menu)."""
+    return InlineKeyboardButton(
+        text=f"{label} [Faol]" if selected else label,
+        callback_data=callback_data,
+        style="success" if selected else "primary",
+        icon_custom_emoji_id=ID_SUCCESS if selected else icon
+    )
+
 def get_drip_feed_keyboard(pair_id: int, pair: ChannelPair) -> InlineKeyboardMarkup:
     night_text = f"Tungi Rejim: {pair.night_mode.upper()}"
+
+    def delay(minutes: int, label: str, icon: str) -> InlineKeyboardButton:
+        return _choice_button(label, f"drip_delay_{pair_id}_{minutes}", pair.drip_delay_minutes == minutes, icon)
+
     return InlineKeyboardMarkup(inline_keyboard=[
+        [delay(0, "Tezkor (0m)", ID_ROCKET), delay(5, "5 daqiqa", ID_HISTORY_CLOCK)],
+        [delay(15, "15 daqiqa", ID_HISTORY_CLOCK), delay(30, "30 daqiqa", ID_HISTORY_CLOCK)],
         [
-            InlineKeyboardButton(text="Tezkor (0m)", callback_data=f"drip_delay_{pair_id}_0", style="primary", icon_custom_emoji_id=ID_ROCKET),
-            InlineKeyboardButton(text="5 daqiqa", callback_data=f"drip_delay_{pair_id}_5", style="primary", icon_custom_emoji_id=ID_HISTORY_CLOCK)
-        ],
-        [
-            InlineKeyboardButton(text="15 daqiqa", callback_data=f"drip_delay_{pair_id}_15", style="primary", icon_custom_emoji_id=ID_HISTORY_CLOCK),
-            InlineKeyboardButton(text="30 daqiqa", callback_data=f"drip_delay_{pair_id}_30", style="primary", icon_custom_emoji_id=ID_HISTORY_CLOCK)
-        ],
-        [
-            InlineKeyboardButton(text=night_text, callback_data=f"drip_toggle_night_{pair_id}", style="success", icon_custom_emoji_id=ID_LOCK_UNLOCKED)
+            InlineKeyboardButton(text=night_text, callback_data=f"drip_toggle_night_{pair_id}",
+                                 style="success" if pair.night_mode != "off" else "primary", icon_custom_emoji_id=ID_LOCK_UNLOCKED)
         ],
         [
             InlineKeyboardButton(text="Orqaga", callback_data=f"pair_view_{pair_id}", style="danger", icon_custom_emoji_id=ID_BACK)
@@ -346,14 +384,16 @@ def get_drip_feed_keyboard(pair_id: int, pair: ChannelPair) -> InlineKeyboardMar
     ])
 
 def get_ai_paraphrase_keyboard(pair_id: int, pair: ChannelPair) -> InlineKeyboardMarkup:
+    def mode(code: str, label: str, icon: str) -> InlineKeyboardButton:
+        return _choice_button(label, f"ai_set_{pair_id}_{code}", pair.ai_paraphrase_mode == code, icon)
+
+    off_selected = pair.ai_paraphrase_mode == "off"
     return InlineKeyboardMarkup(inline_keyboard=[
+        [mode("formal", "Jurnalistik / Rasmiy", ID_DOCUMENT), mode("hype", "Qaynoq / Hype", ID_ROCKET)],
         [
-            InlineKeyboardButton(text="Jurnalistik / Rasmiy", callback_data=f"ai_set_{pair_id}_formal", style="primary", icon_custom_emoji_id=ID_DOCUMENT),
-            InlineKeyboardButton(text="Qaynoq / Hype", callback_data=f"ai_set_{pair_id}_hype", style="primary", icon_custom_emoji_id=ID_ROCKET)
-        ],
-        [
-            InlineKeyboardButton(text="Qisqa Tezis / TL;DR", callback_data=f"ai_set_{pair_id}_short", style="primary", icon_custom_emoji_id=ID_FLASH),
-            InlineKeyboardButton(text="O'chirish (Asl nusxa)", callback_data=f"ai_set_{pair_id}_off", style="danger", icon_custom_emoji_id=ID_ERROR)
+            mode("short", "Qisqa Tezis / TL;DR", ID_FLASH),
+            InlineKeyboardButton(text="O'chirish (Asl nusxa)" + (" [Faol]" if off_selected else ""),
+                                 callback_data=f"ai_set_{pair_id}_off", style="danger", icon_custom_emoji_id=ID_ERROR)
         ],
         [
             InlineKeyboardButton(text="Orqaga", callback_data=f"pair_view_{pair_id}", style="danger", icon_custom_emoji_id=ID_BACK)
@@ -386,4 +426,3 @@ def get_upgrade_prompt_keyboard(pair_id: int, target_plan: str = "pro") -> Inlin
             InlineKeyboardButton(text="Orqaga", callback_data=f"pair_view_{pair_id}", style="danger", icon_custom_emoji_id=ID_BACK)
         ]
     ])
-

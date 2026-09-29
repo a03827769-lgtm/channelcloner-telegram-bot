@@ -4,6 +4,9 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
+# Lint helper: keyboard buttons with raw emojis or without icon_custom_emoji_id / style.
+# Paths are relative to the project root, whatever the current directory is.
+os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 keyboard_dirs = ['bot', 'admin_bot', 'services']
 emoji_pattern = re.compile(r'[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50\u2b55\u200d\ufe0f]')
@@ -15,7 +18,7 @@ def inspect_file(filepath):
         content = fp.read()
     try:
         tree = ast.parse(content, filename=filepath)
-    except Exception as e:
+    except Exception:
         return
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):

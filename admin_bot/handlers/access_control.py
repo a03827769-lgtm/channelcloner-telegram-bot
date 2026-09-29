@@ -1,27 +1,33 @@
 import logging
-from typing import Optional, Tuple, List, Dict, Any
-from aiogram import Router, F
-from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+import re
+from typing import Tuple, List, Dict, Any
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.exceptions import TelegramBadRequest
 
 from database.db_manager import db_manager
 from admin_bot.keyboards.admin_keyboards import (
     get_bot_mode_keyboard,
     get_whitelist_pagination_keyboard,
-    get_cancel_whitelist_keyboard,
-    get_back_to_admin_keyboard
+    get_cancel_whitelist_keyboard
 )
 from services.custom_emojis import (
     LOCK_LOCKED, LOCK_UNLOCKED, SUCCESS, SUCCESS_V2, ERROR, WARN, INFO, STARS,
-    USERS_GROUP, SHIELD, ADMIN, SUPPORT, KEY, VERIFIED, CALENDAR, clean_for_alert
+    USERS_GROUP, SHIELD, ADMIN, SUPPORT, KEY, VERIFIED, CALENDAR
 )
+from admin_bot.permissions import ensure_super_admin
 from bot.utils import safe_answer, html_escape
+from admin_bot.ui import is_cancel_text, show_screen
 
 logger = logging.getLogger(__name__)
-router = Router(name="admin_access_control_router")
+
+# Telegram usernames: 5-32 characters, latin letters, digits and underscores, starting with a letter.
+_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+MAX_TELEGRAM_USER_ID = 2 ** 53
+
+
+async def _edit_screen(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
+    await show_screen(callback, text, kb)
 
 class AccessControlStates(StatesGroup):
     waiting_for_support_user = State()
@@ -41,7 +47,7 @@ async def render_bot_mode_view() -> Tuple[str, InlineKeyboardMarkup]:
 {status_icon} <b>BOT REJIMI VA KIRISH SOZLAMALARI</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
 ├ {SHIELD} <b>Hozirgi Rejim:</b> {status_text}
-├ {SUPPORT} <b>Admin Aloqa:</b> @{support_user}
+├ {SUPPORT} <b>Admin Aloqa:</b> @{html_escape(support_user)}
 ├ {USERS_GROUP} <b>Whitelist Foydalanuvchilari:</b> <code>{len(all_whitelisted)}</code> ta
 │  ├ {ADMIN} <b>Admin tomonidan:</b> <code>{len(admin_users)}</code> ta
 │  └ {STARS} <b>50 Stars to'laganlar:</b> <code>{len(stars_users)}</code> ta
@@ -88,54 +94,47 @@ def render_whitelist_text(users: List[Dict[str, Any]], page: int = 1, page_size:
     lines.append(f"{INFO} <i>Foydalanuvchi ruxsatini bekor qilish uchun pastdagi tugmani bosing:</i>")
     return "\n".join(lines)
 
-@router.callback_query(F.data == "admin_bot_mode")
-@router.message(Command("mode"))
-@router.message(Command("access"))
 async def cb_admin_bot_mode(event: CallbackQuery | Message, state: FSMContext):
     if isinstance(event, CallbackQuery):
         await safe_answer(event)
     await state.clear()
     text, kb = await render_bot_mode_view()
     if isinstance(event, CallbackQuery):
-        try:
-            await event.message.edit_text(text=text, parse_mode="HTML", reply_markup=kb)
-        except TelegramBadRequest as e:
-            if "message is not modified" not in str(e).lower():
-                raise
+        await _edit_screen(event, text, kb)
     else:
         await event.answer(text=text, parse_mode="HTML", reply_markup=kb)
 
-@router.callback_query(F.data == "admin_toggle_bot_mode")
 async def cb_toggle_bot_mode(callback: CallbackQuery):
+    if not await ensure_super_admin(callback):
+        return
     current = await db_manager.is_private_mode()
     new_mode = not current
     await db_manager.set_private_mode(new_mode)
     alert_msg = "Bot rejimi: Yopiq (Private) ga o'tkazildi!" if new_mode else "Bot rejimi: Ommaviy (Public) ga o'tkazildi!"
     await safe_answer(callback, alert_msg, show_alert=True)
     text, kb = await render_bot_mode_view()
-    try:
-        await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=kb)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e).lower():
-            raise
+    await _edit_screen(callback, text, kb)
 
-@router.callback_query(F.data == "admin_set_support_user")
 async def cb_set_support_user(callback: CallbackQuery, state: FSMContext):
+    if not await ensure_super_admin(callback):
+        return
     await safe_answer(callback)
     await state.set_state(AccessControlStates.waiting_for_support_user)
     current_sup = await db_manager.get_support_username()
     text = f"""
 {INFO} <b>Admin aloqa username'ini o'zgartirish</b>
 
-Hozirgi: @{current_sup}
+Hozirgi: @{html_escape(current_sup)}
 
 Yangi <b>@username</b>ni yuboring (masalan: <code>@admin_support</code> yoki <code>admin_support</code>):
 """
-    await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=get_cancel_whitelist_keyboard())
+    await _edit_screen(callback, text, get_cancel_whitelist_keyboard())
 
-@router.message(AccessControlStates.waiting_for_support_user)
 async def process_support_user_input(message: Message, state: FSMContext):
-    if not message.text or message.text.strip().lower() in ("/cancel", "bekor qilish"):
+    if not await ensure_super_admin(message):
+        await state.clear()
+        return
+    if not message.text or is_cancel_text(message):
         await state.clear()
         text, kb = await render_bot_mode_view()
         await message.answer(f"{INFO} Amaliyot bekor qilindi.\n\n{text}", parse_mode="HTML", reply_markup=kb)
@@ -143,12 +142,13 @@ async def process_support_user_input(message: Message, state: FSMContext):
 
     clean_text = message.text.strip()
     for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
-        if clean_text.startswith(prefix):
+        if clean_text.lower().startswith(prefix):
             clean_text = clean_text[len(prefix):]
+            break
     raw = clean_text.lstrip("@").strip()
-    if not raw or len(raw) < 3 or " " in raw:
+    if not _USERNAME_RE.fullmatch(raw):
         await message.answer(
-            f"{ERROR} <b>Noto'g'ri username formati!</b>\nIltimos, haqiqiy username yuboring (masalan: <code>@support_bot</code>):",
+            f"{ERROR} <b>Noto'g'ri username formati!</b>\nUsername 5-32 ta lotin harfi, raqam yoki _ belgidan iborat bo'lishi va harf bilan boshlanishi kerak (masalan: <code>@support_bot</code>):",
             parse_mode="HTML",
             reply_markup=get_cancel_whitelist_keyboard()
         )
@@ -163,49 +163,35 @@ async def process_support_user_input(message: Message, state: FSMContext):
     text, kb = await render_bot_mode_view()
     await message.answer(text=text, parse_mode="HTML", reply_markup=kb)
 
-@router.callback_query(F.data == "admin_whitelist_list")
 async def cb_whitelist_list(callback: CallbackQuery, state: FSMContext):
     await safe_answer(callback)
     await state.clear()
     users = await db_manager.get_whitelisted_users()
     text = render_whitelist_text(users, page=1, page_size=5, source_filter="")
     kb = get_whitelist_pagination_keyboard(users, page=1, page_size=5, source="")
-    try:
-        await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=kb)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e).lower():
-            raise
+    await _edit_screen(callback, text, kb)
 
-@router.callback_query(F.data == "admin_whitelist_stars")
 async def cb_whitelist_stars(callback: CallbackQuery, state: FSMContext):
     await safe_answer(callback)
     await state.clear()
     users = await db_manager.get_whitelisted_users(source="stars_50")
     text = render_whitelist_text(users, page=1, page_size=5, source_filter="stars_50")
     kb = get_whitelist_pagination_keyboard(users, page=1, page_size=5, source="stars_50")
-    try:
-        await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=kb)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e).lower():
-            raise
+    await _edit_screen(callback, text, kb)
 
-@router.callback_query(F.data.startswith("adm_wl_page_"))
 async def cb_whitelist_page(callback: CallbackQuery):
     await safe_answer(callback)
     parts = callback.data.replace("adm_wl_page_", "").split("_")
     page = int(parts[0]) if parts[0].isdigit() else 1
     source = "_".join(parts[1:]) if len(parts) > 1 else ""
+    if source not in ("", "stars_50", "admin"):
+        source = ""
 
     users = await db_manager.get_whitelisted_users(source=source if source else None)
     text = render_whitelist_text(users, page=page, page_size=5, source_filter=source)
     kb = get_whitelist_pagination_keyboard(users, page=page, page_size=5, source=source)
-    try:
-        await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=kb)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e).lower():
-            raise
+    await _edit_screen(callback, text, kb)
 
-@router.callback_query(F.data.startswith("adm_wl_rm_"))
 async def cb_whitelist_revoke(callback: CallbackQuery):
     try:
         target_uid = int(callback.data.replace("adm_wl_rm_", ""))
@@ -222,13 +208,8 @@ async def cb_whitelist_revoke(callback: CallbackQuery):
     users = await db_manager.get_whitelisted_users()
     text = render_whitelist_text(users, page=1, page_size=5, source_filter="")
     kb = get_whitelist_pagination_keyboard(users, page=1, page_size=5, source="")
-    try:
-        await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=kb)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e).lower():
-            raise
+    await _edit_screen(callback, text, kb)
 
-@router.callback_query(F.data == "admin_whitelist_add")
 async def cb_whitelist_add(callback: CallbackQuery, state: FSMContext):
     await safe_answer(callback)
     await state.set_state(AccessControlStates.waiting_for_whitelist_user)
@@ -239,11 +220,10 @@ Foydalanuvchining <b>Telegram ID</b> raqamini yoki <b>@username</b>ini yuboring:
 
 <i>Masalan: <code>123456789</code> yoki <code>@foydalanuvchi</code></i>
 """
-    await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=get_cancel_whitelist_keyboard())
+    await _edit_screen(callback, text, get_cancel_whitelist_keyboard())
 
-@router.message(AccessControlStates.waiting_for_whitelist_user)
 async def process_whitelist_user_input(message: Message, state: FSMContext):
-    if not message.text or message.text.strip().lower() in ("/cancel", "bekor qilish"):
+    if not message.text or is_cancel_text(message):
         await state.clear()
         text, kb = await render_bot_mode_view()
         await message.answer(f"{INFO} Amaliyot bekor qilindi.\n\n{text}", parse_mode="HTML", reply_markup=kb)
@@ -251,15 +231,25 @@ async def process_whitelist_user_input(message: Message, state: FSMContext):
 
     raw = message.text.strip()
     for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
-        if raw.startswith(prefix):
+        if raw.lower().startswith(prefix):
             raw = raw[len(prefix):]
+            break
     raw = raw.strip()
 
     admin_id = message.from_user.id if message.from_user else 0
 
-    if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
+    if raw.lstrip("-").isdigit():
         target_uid = int(raw)
-        await db_manager.get_or_create_user(user_id=target_uid, full_name=f"Foydalanuvchi {target_uid}")
+        if not 0 < target_uid < MAX_TELEGRAM_USER_ID:
+            await message.answer(
+                f"{ERROR} <b>Noto'g'ri foydalanuvchi ID!</b>\nFoydalanuvchi ID musbat son bo'lishi kerak (kanal yoki guruh ID emas).",
+                parse_mode="HTML",
+                reply_markup=get_cancel_whitelist_keyboard()
+            )
+            return
+        # Only create a placeholder row for unknown users; never overwrite a known user's real name.
+        if not await db_manager.get_user_by_id(target_uid):
+            await db_manager.get_or_create_user(user_id=target_uid, full_name=f"Foydalanuvchi {target_uid}")
         await db_manager.add_user_to_whitelist(
             user_id=target_uid,
             added_by=admin_id,
@@ -277,6 +267,13 @@ async def process_whitelist_user_input(message: Message, state: FSMContext):
 
     # Process username
     clean_uname = raw.lstrip("@").lower()
+    if not _USERNAME_RE.fullmatch(clean_uname):
+        await message.answer(
+            f"{ERROR} <b>Noto'g'ri username yoki ID formati!</b>\nTelegram ID raqamini yoki @username ni yuboring:",
+            parse_mode="HTML",
+            reply_markup=get_cancel_whitelist_keyboard()
+        )
+        return
     user_found = await db_manager.get_user_by_username(clean_uname)
     if user_found:
         await db_manager.add_user_to_whitelist(
@@ -295,7 +292,7 @@ async def process_whitelist_user_input(message: Message, state: FSMContext):
         return
 
     await message.answer(
-        f"{WARN} <b>@{clean_uname} bazada topilmadi.</b>\n\n"
+        f"{WARN} <b>@{html_escape(clean_uname)} bazada topilmadi.</b>\n\n"
         f"Foydalanuvchi hali botni ishga tushirmagan bo'lishi mumkin.\n"
         f"Iltimos, uning <b>Telegram ID</b> raqamini yuboring:",
         parse_mode="HTML",

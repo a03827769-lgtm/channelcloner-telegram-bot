@@ -3,7 +3,7 @@ import base64
 import hashlib
 import logging
 from cryptography.fernet import Fernet
-from config.settings import settings
+from config.settings import settings, PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,10 @@ class SecurityVault:
         self._disk_cipher = None
 
         enc_key = (getattr(settings, "ENCRYPTION_KEY", "") or "").strip()
-        vault_key_path = getattr(settings, "VAULT_KEY_PATH", "database/.vault_key")
+        vault_key_path = settings.VAULT_KEY_PATH or "database/.vault_key"
+        if not os.path.isabs(vault_key_path):
+            # Resolve against the project root so the same key is used regardless of the working directory
+            vault_key_path = str(PROJECT_ROOT / vault_key_path)
 
         # Load disk key if available for fallback or primary use
         disk_key = ""
@@ -59,9 +62,9 @@ class SecurityVault:
                             try:
                                 os.chmod(vault_key_path, 0o600)
                             except Exception:
-                                logger.debug("Ignored exception", exc_info=True)
+                                logger.debug("Could not restrict vault key file permissions", exc_info=True)
                 except Exception:
-                    logger.debug("Ignored exception", exc_info=True)
+                    logger.error(f"Could not create the machine vault key at {vault_key_path}", exc_info=True)
 
             if disk_key:
                 master_key_bytes = hashlib.sha256(disk_key.encode("utf-8")).digest()
@@ -88,6 +91,10 @@ class SecurityVault:
                         "Set ENCRYPTION_KEY in .env for explicit master key control."
                     )
             else:
+                logger.error(
+                    "No ENCRYPTION_KEY and no vault key file available — falling back to a key derived from the "
+                    "bot credentials. Set ENCRYPTION_KEY in .env to protect stored sessions and backups properly."
+                )
                 self._fernet_key = base64.urlsafe_b64encode(legacy_key_bytes)
                 self._cipher = self._legacy_cipher
 
@@ -108,13 +115,13 @@ class SecurityVault:
             return b""
         try:
             return self._cipher.decrypt(encrypted_data)
-        except Exception as e:
+        except Exception as primary_err:
             for fallback in self._fallback_ciphers:
                 try:
                     return fallback.decrypt(encrypted_data)
                 except Exception:
                     continue
-            logger.error(f"Byte decryption failed with all available ciphers: {e}")
+            logger.error(f"Byte decryption failed with all available ciphers: {primary_err!r}")
             raise ValueError("Decryption failed: invalid key or corrupted ciphertext")
 
     def encrypt_secret(self, raw_secret: str) -> str:
@@ -155,7 +162,7 @@ class SecurityVault:
             if res.startswith("enc:"):
                 return self.decrypt_secret(res)
             return res
-        except Exception as e:
+        except Exception as primary_err:
             for fallback in self._fallback_ciphers:
                 try:
                     decrypted = fallback.decrypt(cipher_text)
@@ -165,7 +172,7 @@ class SecurityVault:
                     return res
                 except Exception:
                     continue
-            logger.error(f"Decryption failed with all available ciphers: {e}")
+            logger.error(f"Decryption failed with all available ciphers: {primary_err!r}")
             return ""
 
 security_vault = SecurityVault()

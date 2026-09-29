@@ -1,16 +1,23 @@
+# Template — installed by `sudo bash deploy/oracle_master_setup.sh --with-webhook`, which replaces
+# __APP_USER__ / __APP_DIR__ and creates /etc/channelcloner/webhook.env (WEBHOOK_SECRET=..., root only).
+# The listener binds to 127.0.0.1 only; nginx publishes it over HTTPS as /deploy-webhook.
 [Unit]
-Description=GitHub Webhook Auto-Deployment Service
-After=network.target docker.service
+Description=GitHub webhook deployer for Telegram Channel Cloner (release tags)
+After=network-online.target docker.service
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/app
-Environment=PROJECT_DIR=/home/ubuntu/app
+User=__APP_USER__
+WorkingDirectory=__APP_DIR__
+Environment=PROJECT_DIR=__APP_DIR__
+Environment=WEBHOOK_BIND=127.0.0.1
 Environment=WEBHOOK_PORT=9000
-ExecStart=/usr/bin/python3 /home/ubuntu/app/deploy/webhook/deploy_webhook.py
+EnvironmentFile=/etc/channelcloner/webhook.env
+ExecStart=/usr/bin/python3 __APP_DIR__/deploy/webhook/deploy_webhook.py
 Restart=always
 RestartSec=10
+NoNewPrivileges=true
 StandardOutput=journal
 StandardError=journal
 

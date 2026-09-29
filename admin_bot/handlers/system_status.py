@@ -1,68 +1,83 @@
 import os
 import json
+import html
 import logging
 import platform
 import asyncio
-from aiogram import Router, F
-from aiogram.exceptions import TelegramBadRequest
+import tempfile
+from typing import List
 from aiogram.types import CallbackQuery, Message
-from aiogram.filters import Command
 from admin_bot.keyboards.admin_keyboards import get_back_to_admin_keyboard
+from admin_bot.permissions import ensure_super_admin
 from database.db_manager import db_manager
 from services.telethon_listener import telethon_listener
 from services.custom_emojis import (
     INFO, SERVICE_24_7, TELEGRAM, SUCCESS, WARN, USERS_GROUP, LINK,
-    ROCKET, STARS, BROADCAST, SETTINGS, DOCUMENT, SHIELD, clean_for_alert
+    ROCKET, STARS, SETTINGS, DOCUMENT, SHIELD
 )
 
 from bot.utils import safe_answer
+from admin_bot.ui import show_screen
 
 logger = logging.getLogger(__name__)
-router = Router(name="admin_status_router")
 
-@router.callback_query(F.data == "admin_system_status")
-@router.message(Command("status"))
-@router.message(F.text.contains("Tizim Holati"))
+ANTI_RECLAIM_STATUS_FILE = "oracle_anti_reclaim_status.json"
+
+
+def _read_anti_reclaim_status() -> str | None:
+    """Reads the telemetry written by deploy/anti_reclaim.py. Returns None when the helper is not running
+    (e.g. on Windows or PaaS hosts), so the status screen never claims a protection that is not active."""
+    candidates = [os.path.join(tempfile.gettempdir(), ANTI_RECLAIM_STATUS_FILE)]
+    if os.name != "nt":
+        candidates.append(os.path.join("/tmp", ANTI_RECLAIM_STATUS_FILE))
+    for status_file in candidates:
+        if not os.path.isfile(status_file):
+            continue
+        try:
+            with open(status_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            ram_pct = float(data.get("ram_percent", 0))
+            cpu_pct = float(data.get("target_cpu_percent", 0))
+            heartbeats = int(data.get("network_heartbeats", 0))
+            return f"{SUCCESS} Faol (RAM: {ram_pct:.0f}%, CPU: {cpu_pct:.0f}%, Heartbeat: {heartbeats})"
+        except Exception:
+            logger.debug("Anti-reclaim status file unreadable", exc_info=True)
+    return None
+
+
+async def _edit_or_answer(event: CallbackQuery | Message, text: str) -> None:
+    await show_screen(event, text, get_back_to_admin_keyboard())
+
+
 async def cb_admin_system_status(event: CallbackQuery | Message):
     if isinstance(event, CallbackQuery):
         await safe_answer(event)
 
     me = await telethon_listener.get_me()
     stats = await db_manager.get_stats()
-    
-    if me:
-        mtproto_status = f"{SUCCESS} Faol ({me.first_name})"
-    else:
-        mtproto_status = f"{WARN} Ulanmagan"
 
-    # Oracle Anti-Reclamation telemetry
-    anti_reclaim_text = f"{SUCCESS} 100% Himoyalangan (24/7 Faol)"
-    import tempfile
-    status_file = os.path.join(tempfile.gettempdir(), "oracle_anti_reclaim_status.json")
-    if not os.path.exists(status_file) and os.path.exists("/tmp/oracle_anti_reclaim_status.json"):
-        status_file = "/tmp/oracle_anti_reclaim_status.json"
-    if os.path.exists(status_file):
-        try:
-            with open(status_file, "r") as f:
-                ar_data = json.load(f)
-                ram_pct = ar_data.get("ram_percent", 24.0)
-                cpu_pct = ar_data.get("target_cpu_percent", 23.0)
-                hb = ar_data.get("network_heartbeats", 0)
-                anti_reclaim_text = f"{SUCCESS} 100% Xavfsiz (RAM: {ram_pct}%, CPU: {cpu_pct}%, Heartbeats: {hb})"
-        except Exception:
-            logger.debug("Ignored exception", exc_info=True)
+    mtproto_status = f"{SUCCESS} Faol ({html.escape(me.first_name or '')})" if me else f"{WARN} Ulanmagan"
 
-    # System metrics
-    os_name = f"{platform.system()} {platform.release()}"
+    anti_reclaim_text = await asyncio.to_thread(_read_anti_reclaim_status)
+    anti_reclaim_line = f"├ {SHIELD} <b>Oracle Anti-Reclaim:</b> {anti_reclaim_text}\n" if anti_reclaim_text else ""
+
+    os_name = html.escape(f"{platform.system()} {platform.release()}")
     python_ver = platform.python_version()
+
+    supplier_cfg = await db_manager.get_supplier_config()
+    supplier_bal_text = f"${supplier_cfg.balance:.2f} {html.escape(supplier_cfg.currency or '')}" if supplier_cfg else "—"
+    store_prods = await db_manager.get_store_products()
+    in_stock_count = sum(1 for p in store_prods if p.stock_status == "in_stock")
+    out_of_stock_count = len(store_prods) - in_stock_count
 
     text = f"""
 {INFO} <b>TIZIM HOLATI VA SERVER MONITORINGI:</b>
 ───────────────────────────
-├ {SERVICE_24_7} <b>Bot API:</b> {SUCCESS} 24/7 Faol
+├ {SERVICE_24_7} <b>Bot API:</b> {SUCCESS} Faol
 ├ {TELEGRAM} <b>MTProto Tinglovchi:</b> {mtproto_status}
-├ {SHIELD} <b>Oracle 7-Kunlik Himoya:</b> {anti_reclaim_text}
-├ {SETTINGS} <b>Operatsion Tizim:</b> <code>{os_name}</code>
+├ 🛒 <b>Ta'minotchi Balansi:</b> <code>{supplier_bal_text}</code>
+├ 📦 <b>Do'kon Mahsulotlari:</b> <code>{len(store_prods)}</code> ta ({in_stock_count} faol, {out_of_stock_count} tugagan)
+{anti_reclaim_line}├ {SETTINGS} <b>Operatsion Tizim:</b> <code>{os_name}</code>
 ├ {DOCUMENT} <b>Python Versiyasi:</b> <code>{python_ver}</code>
 ├ {USERS_GROUP} <b>Jami Foydalanuvchilar:</b> <code>{stats['total_users']}</code> nafar
 ├ {LINK} <b>Jami Ulangan Kanallar:</b> <code>{stats['total_pairs']}</code> ta
@@ -70,75 +85,42 @@ async def cb_admin_system_status(event: CallbackQuery | Message):
 ├ {ROCKET} <b>Ko'chirilgan Postlar:</b> <code>{stats['total_cloned_messages']}</code> ta
 └ {STARS} <b>Jami Stars Tushumi:</b> <code>{stats['total_stars_earned']}</code> Stars
 ───────────────────────────
-<i>Barcha jarayonlar 100k yuqori yuklamaga moslashtirilgan WAL rejimida ishlamoqda.</i>
 """
-    if isinstance(event, CallbackQuery):
-        try:
-            await event.message.edit_text(
-                text=text,
-                parse_mode="HTML",
-                reply_markup=get_back_to_admin_keyboard()
-            )
-        except Exception as e_edit:
-            if "message is not modified" not in str(e_edit).lower():
-                raise
-    else:
-        await event.answer(
-            text=text,
-            parse_mode="HTML",
-            reply_markup=get_back_to_admin_keyboard()
-        )
+    await _edit_or_answer(event, text)
 
-@router.callback_query(F.data == "admin_view_logs")
-@router.message(Command("logs"))
-@router.message(F.text.startswith("/logs"))
+
+# Visible characters of the log tail shown in one message (Telegram allows 4096 after entity parsing)
+LOG_TAIL_MAX_CHARS = 3000
+
+
+def format_log_tail(lines: List[str], max_chars: int = LOG_TAIL_MAX_CHARS) -> str:
+    """HTML-escaped tail of the log lines: at most `max_chars` characters, starting at a line boundary,
+    escaped after cutting (so an entity such as &amp; is never cut in half)."""
+    raw_text = "\n".join(lines)
+    if len(raw_text) > max_chars:
+        raw_text = raw_text[-max_chars:]
+        if "\n" in raw_text:
+            raw_text = raw_text.split("\n", 1)[1]
+    return html.escape(raw_text)
+
+
 async def cb_admin_view_logs(event: CallbackQuery | Message):
+    # Logs can contain user identifiers and operational details — super admins only.
+    if not await ensure_super_admin(event):
+        return
     from services.log_viewer import log_viewer
-    import html
 
     if isinstance(event, CallbackQuery):
         await safe_answer(event)
 
     logs = log_viewer.get_recent_logs(count=30)
-    if not logs:
-        log_text = "Hozircha xotirada loglar mavjud emas."
-    else:
-        raw_text = "\n".join(logs)
-        # Trim to fit Telegram 4096 character limit
-        if len(raw_text) > 3500:
-            raw_text = raw_text[-3500:]
-            if "\n" in raw_text:
-                raw_text = raw_text.split("\n", 1)[1]
-        log_text = html.escape(raw_text)
+    log_text = format_log_tail(logs) if logs else "Hozircha xotirada loglar mavjud emas."
 
-    msg_text = f"""
-{DOCUMENT} <b>Jonli Tizim Loglari (So'nggi 30 ta qator):</b>
-
-<pre><code>{log_text}</code></pre>
-"""
-    if isinstance(event, CallbackQuery):
-        try:
-            await event.message.edit_text(
-                text=msg_text,
-                parse_mode="HTML",
-                reply_markup=get_back_to_admin_keyboard()
-            )
-        except TelegramBadRequest as e:
-            if "message is not modified" not in str(e).lower():
-                raise
-    else:
-        await event.answer(
-            text=msg_text,
-            parse_mode="HTML",
-            reply_markup=get_back_to_admin_keyboard()
-        )
+    await _edit_or_answer(event, f"{DOCUMENT} <b>Jonli Tizim Loglari (So'nggi 30 ta qator):</b>\n\n<pre>{log_text}</pre>")
 
 
-@router.message(Command("check_origin"))
 async def cmd_check_origin(message: Message):
     """Admin command to inspect and extract invisible steganography watermark from a photo"""
-    import html
-    import tempfile
     from services.steganography_service import steganography_service
 
     target_msg = message.reply_to_message if message.reply_to_message else message
@@ -151,32 +133,30 @@ async def cmd_check_origin(message: Message):
         return
 
     photo = target_msg.photo[-1]
-    bot = message.bot
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         tmp_path = tmp.name
 
     try:
-        await bot.download(photo, destination=tmp_path)
+        await message.bot.download(photo, destination=tmp_path)
         payload = await asyncio.to_thread(steganography_service.extract_watermark, tmp_path)
         if payload:
             await message.answer(
-                f"{SHIELD} <b>RASM ASLLIGI VA MUALLIFLIK ISBOTLANDI!</b>\n\n"
+                f"{SHIELD} <b>Rasmda ko'rinmas mualliflik belgisi topildi!</b>\n\n"
                 f"├ <b>Ko'rinmas belgi:</b> <code>{html.escape(payload)}</code>\n"
-                f"└ <i>Ushbu rasm bot tizimi orqali himoyalangan va klonlangan.</i>",
+                f"└ <i>Ushbu rasm bot tizimi orqali belgilangan.</i>",
                 parse_mode="HTML"
             )
         else:
             await message.answer(
                 f"{WARN} <b>Ko'rinmas suv belgisi topilmadi.</b>\n"
-                f"Rasm tizim orqali himoyalanmagan yoki tashqi uchinchi tomon manbasidan.",
+                f"Rasm tizim orqali belgilanmagan yoki qayta siqilgan bo'lishi mumkin.",
                 parse_mode="HTML"
             )
     except Exception as e:
-        await message.answer(f"Tekshirishda xatolik: {e}")
+        logger.warning(f"check_origin failed: {e}")
+        await message.answer(f"{WARN} Tekshirishda xatolik: <code>{html.escape(str(e)[:300])}</code>", parse_mode="HTML")
     finally:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                logger.debug("Ignored exception", exc_info=True)
-
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            logger.debug("Temp file cleanup failed", exc_info=True)

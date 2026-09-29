@@ -1,14 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { Layers, Radio, RefreshCw, Crown, ShieldCheck, CheckCircle2, PlayCircle, Plus, Clapperboard, BarChart3, TrendingUp } from 'lucide-react';
 import { telegram } from '../../services/telegram';
-import { User, Subscription, SummaryStats } from '../../types';
+import { ActiveTab, FeedItem, User, Subscription, SummaryStats } from '../../types';
 import { api } from '../../services/api';
 
 interface OverviewTabProps {
   user: User | null;
   subscription: Subscription | null;
   stats: SummaryStats | null;
-  onNavigate: (tab: any) => void;
+  onNavigate: (tab: ActiveTab) => void;
   onOpenAddModal: () => void;
   onTriggerTestPost?: () => Promise<void>;
 }
@@ -21,10 +21,8 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
   onOpenAddModal,
   onTriggerTestPost
 }) => {
-  const [feed, setFeed] = useState<any[]>([]);
+  const [feed, setFeed] = useState<FeedItem[]>([]);
   const [isTesting, setIsTesting] = useState(false);
-  const [chartPeriod, setChartPeriod] = useState<'24h' | '7d'>('7d');
-  const isVip = subscription?.is_vip;
 
   useEffect(() => {
     let mounted = true;
@@ -62,16 +60,17 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
     }
   };
 
-  // 7-day activity simulation (from Image 1 visionOS chart)
-  const chartDays = [
-    { day: 'Dush', count: 42, height: '55%' },
-    { day: 'Sesh', count: 68, height: '75%' },
-    { day: 'Chor', count: 95, height: '95%', isPeak: true },
-    { day: 'Pay',  count: 55, height: '65%' },
-    { day: 'Jum',  count: 82, height: '85%' },
-    { day: 'Shan', count: 40, height: '50%' },
-    { day: 'Yak',  count: 60, height: '70%' },
-  ];
+  // Real 7-day activity from the API (zero-filled per day, oldest first)
+  const weekdayNames = ['Yak', 'Dush', 'Sesh', 'Chor', 'Pay', 'Jum', 'Shan'];
+  const daily = stats?.daily ?? [];
+  const maxCount = Math.max(1, ...daily.map((d) => d.count));
+  const peakCount = Math.max(0, ...daily.map((d) => d.count));
+  const chartDays = daily.map((d) => ({
+    day: weekdayNames[new Date(`${d.date}T00:00:00Z`).getUTCDay()],
+    count: d.count,
+    height: `${Math.max(6, Math.round((d.count / maxCount) * 100))}%`,
+    isPeak: peakCount > 0 && d.count === peakCount,
+  }));
 
   return (
     <div className="flex flex-col gap-4">
@@ -194,7 +193,7 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
         <div className="vision-card p-4 flex flex-col justify-between min-h-[110px] relative overflow-hidden animate-fade-up stagger-4">
           <div className="flex items-center justify-between">
             <span className="text-white/60 text-[11px] font-semibold tracking-wide uppercase">
-              Ishonchlilik
+              Bugun
             </span>
             <div className="apple-squircle-badge bg-[#64D2FF] w-7 h-7 rounded-[8px]">
               <ShieldCheck size={13} className="text-white" />
@@ -202,10 +201,10 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
           </div>
           <div className="mt-2">
             <div className="text-[28px] font-bold text-white tracking-tight leading-none tabular-nums font-mono">
-              {stats?.success_rate ?? 99.8}%
+              {stats?.today_cloned_messages ?? 0}
             </div>
             <div className="text-[11px] text-white/50 font-medium mt-1">
-              Zero-Loss Kafolati
+              Bugun ko'chirilgan postlar
             </div>
           </div>
         </div>
@@ -219,30 +218,9 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
             <span className="text-[13px] font-semibold text-white">Haftalik Faollik Grafigi</span>
           </div>
 
-          <div className="flex items-center p-0.5 rounded-full bg-white/[0.08] border border-white/10 text-[10px]">
-            <button
-              onClick={() => {
-                telegram.selection();
-                setChartPeriod('24h');
-              }}
-              className={`px-2.5 py-0.5 rounded-full transition-all ${
-                chartPeriod === '24h' ? 'bg-white/25 text-white font-bold' : 'text-white/50'
-              }`}
-            >
-              24h
-            </button>
-            <button
-              onClick={() => {
-                telegram.selection();
-                setChartPeriod('7d');
-              }}
-              className={`px-2.5 py-0.5 rounded-full transition-all ${
-                chartPeriod === '7d' ? 'bg-white/25 text-white font-bold' : 'text-white/50'
-              }`}
-            >
-              7 kun
-            </button>
-          </div>
+          <span className="px-2.5 py-0.5 rounded-full bg-white/[0.08] border border-white/10 text-[10px] text-white/70">
+            7 kun
+          </span>
         </div>
 
         {/* Blue Pill Bars (Exactly like Image 1 center graph) */}
@@ -271,6 +249,7 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
                 <span className={`text-[10px] font-mono ${item.isPeak ? 'text-[#64D2FF] font-bold' : 'text-white/45'}`}>
                   {item.day}
                 </span>
+                <span className="text-[9px] font-mono text-white/35 tabular-nums">{item.count}</span>
               </div>
             ))}
           </div>

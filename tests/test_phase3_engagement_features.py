@@ -1,4 +1,3 @@
-import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -7,6 +6,18 @@ from bot.handlers.comment_moderator import CommentModerator
 from services.market_analytics import market_analytics_service
 from database.db_manager import db_manager
 from database.models import ChannelPair
+
+
+@pytest.fixture
+async def restore_db_manager_path():
+    """The tests below point the shared db_manager at their own temporary database. Close the current
+    connection first (otherwise it keeps serving the old file) and restore the original path afterwards,
+    so later tests never run against this module's temporary database."""
+    original_path = db_manager.db_path
+    await db_manager.close()
+    yield
+    await db_manager.close()
+    db_manager.db_path = original_path
 
 
 def test_ai_paraphraser_new_tones_and_html_preservation():
@@ -81,7 +92,7 @@ def test_comment_moderator_detection():
 
 
 @pytest.mark.asyncio
-async def test_inline_search_query_execution(tmp_path):
+async def test_inline_search_query_execution(tmp_path, restore_db_manager_path):
     test_db = str(tmp_path / "test_inline.db")
     db_manager.db_path = test_db
     await db_manager.init_db()
@@ -112,63 +123,82 @@ async def test_inline_search_query_execution(tmp_path):
     )
 
     from bot.handlers.inline_search import inline_real_estate_search
-    mock_iq = MagicMock()
-    mock_iq.query = "Chilonzor"
-    mock_iq.from_user.username = "testuser"
-    mock_iq.answer = AsyncMock()
 
+    def _inline_query(user_id):
+        iq = MagicMock()
+        iq.query = "Chilonzor"
+        iq.from_user.id = user_id
+        iq.from_user.username = "testuser"
+        iq.bot.me = AsyncMock(return_value=MagicMock(username="test_cloner_bot"))
+        iq.answer = AsyncMock()
+        return iq
+
+    # The owner finds the listing of their own pair
+    mock_iq = _inline_query(1)
     await inline_real_estate_search(mock_iq)
-
     mock_iq.answer.assert_called_once()
     results = mock_iq.answer.call_args[1]["results"]
-    assert len(results) >= 1
+    assert len(results) == 1
     assert "55000" in results[0].title or "55 000" in results[0].description
+
+    # Another user never sees listings of someone else's pairs
+    await db_manager.get_or_create_user(user_id=2, full_name="Other", username="other")
+    other_iq = _inline_query(2)
+    await inline_real_estate_search(other_iq)
+    other_iq.answer.assert_called_once()
+    assert not [r for r in other_iq.answer.call_args[1]["results"] if "55" in (r.title or "")]
 
     await db_manager.close()
 
 
 @pytest.mark.asyncio
-async def test_market_analytics_daily_briefing(tmp_path):
+async def test_market_analytics_daily_briefing(tmp_path, restore_db_manager_path):
     test_db = str(tmp_path / "test_analytics.db")
     db_manager.db_path = test_db
     await db_manager.init_db()
 
     await db_manager.get_or_create_user(user_id=1, full_name="Tester", username="tester")
+    await db_manager.get_or_create_user(user_id=2, full_name="Other", username="other")
     pair_id = await db_manager.add_channel_pair(user_id=1, source_channel="@tashkent_src", target_channel="@tashkent_dst")
+    other_pair = await db_manager.add_channel_pair(user_id=2, source_channel="@other_src", target_channel="@other_dst")
 
-    # Seed listings
+    # Seed listings (the other customer's listing must never appear in user 1's digest)
     await db_manager.record_cloned_message(
         pair_id=pair_id, source_msg_id=1, target_msg_id=1, price=60000.0,
         last_caption="Chilonzor 2 xona shinam uy"
     )
     await db_manager.record_cloned_message(
         pair_id=pair_id, source_msg_id=2, target_msg_id=2, price=90000.0,
-        last_caption="Chilonzor 3 xona evroremont"
+        last_caption="<b>Mirzo Ulugʻbek</b> 3 xona evroremont, Chilonzor yaqinida"
+    )
+    await db_manager.record_cloned_message(
+        pair_id=other_pair, source_msg_id=3, target_msg_id=3, price=1000000.0,
+        last_caption="Yunusobod penthouse"
     )
 
-    stats = await market_analytics_service.get_daily_market_stats(days=1)
+    stats = await market_analytics_service.get_daily_market_stats(1, days=1)
     assert stats["total_listings"] == 2
     assert stats["avg_price"] == 75000.0
     assert stats["min_price"] == 60000.0
     assert stats["max_price"] == 90000.0
     assert stats["top_district"] == "Chilonzor"
+    assert stats["dist_counts"] == {"Chilonzor": 2, "Mirzo Ulug'bek": 1}
 
-    # Text digest formatting
+    # Text digest formatting (thousands separators, never exponent notation)
     digest = market_analytics_service.format_digest_text(stats)
     assert "KUNLIK KO'CHMAS MULK BOZORI TAHLILI" in digest
-    assert "$75000" in digest
+    assert "$75,000" in digest
     assert "Chilonzor" in digest
+    assert "Yunusobod" not in digest
 
-    # Voice script generation
-    script = market_analytics_service.generate_briefing_voice_script(stats)
-    assert "Bugun jami 2 ta" in script
-    assert "75 ming dollar" in script
+    empty = market_analytics_service.format_digest_text(await market_analytics_service.get_daily_market_stats(999, days=1))
+    assert "yangi e'lon ko'chirilmadi" in empty
 
-    # Test send_daily_briefing with mocked bot and tts
+    # Only the text digest is sent (speech synthesis is disabled, no audio is promised)
     mock_bot = AsyncMock()
-    with patch.object(market_analytics_service, "generate_audio_podcast", new=AsyncMock(return_value=None)):
-        await market_analytics_service.send_daily_briefing(mock_bot, 999)
-        mock_bot.send_message.assert_called_once()
-        assert "KUNLIK KO'CHMAS MULK BOZORI TAHLILI" in mock_bot.send_message.call_args[1]["text"]
+    await market_analytics_service.send_daily_briefing(mock_bot, 999, user_id=1)
+    mock_bot.send_message.assert_called_once()
+    mock_bot.send_voice.assert_not_called()
+    assert "KUNLIK KO'CHMAS MULK BOZORI TAHLILI" in mock_bot.send_message.call_args[1]["text"]
 
     await db_manager.close()

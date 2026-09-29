@@ -3,10 +3,9 @@ import os
 import time
 import logging
 from collections import OrderedDict
-from typing import Dict, List, Optional, Set, Any, Tuple, Iterable
+from typing import Dict, Optional, Any, Tuple, Iterable
 
 logger = logging.getLogger(__name__)
-# Live Auto-Reload verified: hot-reload engine active
 
 class LRUSet:
     """Fixed-size in-memory set that evicts oldest items to prevent memory unbounded growth"""
@@ -51,6 +50,10 @@ class LRUSet:
                 self._data.move_to_end(key)
                 return True
             return False
+
+    async def discard(self, key: Tuple[int, int]):
+        async with self._get_lock():
+            self._data.pop(key, None)
 
 class TTLCache:
     """In-memory key-value cache with TTL expiration"""

@@ -1,0 +1,9 @@
+# Development / CI dependencies: pip install -r requirements-dev.txt
+-r requirements.txt
+
+pytest>=8.0,<8.1
+pytest-asyncio>=0.23.5,<0.24
+pytest-timeout>=2.3,<3
+ruff>=0.8,<0.9
+# Deployment-config tests parse docker-compose.yml / render.yaml
+PyYAML>=6.0,<7

@@ -1,7 +1,6 @@
 import os
 import glob
 import pytest
-import asyncio
 import threading
 from unittest.mock import patch, MagicMock, AsyncMock
 

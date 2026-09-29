@@ -1,12 +1,8 @@
-import os
-import re
 import asyncio
-import threading
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from database.db_manager import DatabaseManager, ReentrantAsyncLock
-from database.models import ChannelPair, Subscription
 from services.cloner_engine import ClonerEngine
 from services.text_processor import TextProcessor
 from services.story_cloner_service import StoryClonerService
@@ -83,14 +79,19 @@ async def test_subscription_expiry_deactivates_pairs(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_queued_payload_splits_long_caption():
-    """Verify dispatch_queued_payload safely fits photo caption to 1024 and dispatches overflow as text"""
+async def test_dispatch_queued_payload_splits_long_caption(tmp_path):
+    """dispatch_queued_payload fits the photo caption to 1024 and publishes the overflow as a text message"""
     engine = ClonerEngine()
     mock_bot = AsyncMock()
     mock_pair = MagicMock()
+    mock_pair.id = 5
+    mock_pair.user_id = 42
     mock_pair.target_channel = "@test_tgt"
     mock_pair.target_id = -1001234567890
     mock_pair.source_channel = "@test_src"
+
+    photo = tmp_path / "queued_photo.jpg"
+    photo.write_bytes(b"\xff\xd8\xff\xe0" + b"0" * 2048)
 
     long_text = "Headline: Luxury Villa in Tashkent.\n" + ("Description details about this amazing property.\n" * 40)
     assert len(long_text) > 1024
@@ -98,44 +99,48 @@ async def test_dispatch_queued_payload_splits_long_caption():
     payload = {
         "text": long_text,
         "media_type": "photo",
-        "media_file_id": "temp_media/nonexistent_mock.jpg"
+        "media_path": str(photo)
     }
 
     with patch("services.cloner_engine.rate_limiter.wait_for_slot", new=AsyncMock()):
         with patch.object(engine, "_send_with_retry", new=AsyncMock()) as mock_retry:
             await engine.dispatch_queued_payload(mock_bot, mock_pair, payload)
-            
-            # Must have sent send_photo for the media and send_message for the overflow text
+
+            # send_photo for the media, send_message for the overflow text
             assert mock_retry.call_count >= 2
-            
-            # First call should be send_photo with caption <= 1024
+
             photo_call = mock_retry.call_args_list[0]
             assert photo_call[0][0] == mock_bot.send_photo
             caption_arg = photo_call[1].get("caption")
             assert caption_arg is not None
-            assert len(caption_arg) <= 1024
-            
-            # Second call should be send_message with overflow
+            assert TextProcessor.get_visible_text_length(caption_arg) <= 1024
+
             msg_call = mock_retry.call_args_list[1]
             assert msg_call[0][0] == mock_bot.send_message
             overflow_arg = msg_call[1].get("text")
-            assert len(overflow_arg) > 0
+            assert overflow_arg
+            # Caption and overflow together carry the whole post
+            joined = TextProcessor.html_to_plain(caption_arg) + TextProcessor.html_to_plain(overflow_arg)
+            assert joined.count("Description details") == 40
+            assert payload["progress"]["media_done"] is True
 
 
 def test_attach_signature_with_custom_max_limit():
-    """Verify attach_signature obeys custom max_limit (e.g. 1024 for photo captions)"""
+    """max_limit no longer truncates: the signature is appended to the whole post and the caption split
+    (1024 for media) moves the rest, signature included, into the overflow message"""
     base_text = "Important post update. " * 50
     signature = "📢 Join @my_channel for more"
-    
-    # 1. Standard 4096 limit
-    res_4096 = TextProcessor.attach_signature(base_text, signature, max_limit=4096)
-    assert signature in res_4096
-    assert len(res_4096) <= 4096
 
-    # 2. Strict 1024 media caption limit
+    res_4096 = TextProcessor.attach_signature(base_text, signature, max_limit=4096)
+    assert res_4096.endswith(signature)
+    assert base_text.strip() in res_4096
+
     res_1024 = TextProcessor.attach_signature(base_text, signature, max_limit=1024)
-    assert signature in res_1024
-    assert len(res_1024) <= 1024
+    assert res_1024 == res_4096
+
+    caption, overflow = TextProcessor.fit_caption_limit(res_1024, max_limit=1024)
+    assert TextProcessor.get_visible_text_length(caption) <= 1024
+    assert overflow and overflow.rstrip().endswith(signature)
 
 
 @pytest.mark.asyncio

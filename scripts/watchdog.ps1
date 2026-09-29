@@ -1,20 +1,13 @@
-$containerName = "telegram_channel_cloner"
-$healthUrl = "http://127.0.0.1:8080/health"
-
-try {
-    $res = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 3 -ErrorAction Stop
-    if ($res.status -eq "healthy" -or $res.status -eq "ok") {
-        Write-Host "✅ [WATCHDOG] Container is healthy: Telethon=$($res.telethon_connected), Uptime=$($res.uptime)"
-    } else {
-        Write-Host "⚠️ [WATCHDOG] Container degraded, restarting..."
-        docker restart $containerName
-    }
-} catch {
-    Write-Host "⚠️ [WATCHDOG] Health endpoint unresponsive. Recovering..."
-    $running = (docker ps -q -f "name=$containerName")
-    if ($running) {
-        docker restart $containerName
-    } else {
-        docker start $containerName
-    }
-}
+# ==============================================================================
+# Telegram Channel Cloner - health probe (read-only)
+#
+# Superseded by scripts\windows_keepalive_watchdog.py, which supervises the bot.
+# This script only REPORTS state. It never starts or restarts the Docker container:
+# the bot must run as exactly one instance (host runtime OR docker-bot profile), and
+# starting the container next to the host bot causes TelegramConflictError and
+# duplicate posts.
+# ==============================================================================
+$ErrorActionPreference = "Stop"
+$python = (Get-Command python -ErrorAction Stop).Source
+& $python (Join-Path $PSScriptRoot "windows_keepalive_watchdog.py") --status
+exit $LASTEXITCODE

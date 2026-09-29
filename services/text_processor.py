@@ -2,53 +2,194 @@ import re
 import html
 import unicodedata
 import logging
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Optional, List, Dict, Tuple, Any, Callable, Set
 from database.models import ChannelPair
 
 logger = logging.getLogger(__name__)
 
-# Common telegram link and username regex patterns
+# Common telegram link and username regex patterns.
+# Every link pattern has a left boundary so that lookalike domains (about.me/john, site.com/t.me/x) are never cut.
+_TG_HOSTS = r'(?:t\.me|telegram\.me|telegram\.dog)'
 TG_USERNAME_PATTERN = re.compile(r'(?<![\w.-])@([a-zA-Z0-9_]{4,32})(?![\w.-]*\.[a-zA-Z]{2,})', re.IGNORECASE)
 TG_LINK_PATTERN = re.compile(
-    r'(https?:\/\/)?(www\.)?(t\.me|telegram\.me|telegram\.dog)\/([a-zA-Z0-9_+\/]{3,})',
+    r'(?<![\w.@/-])(?:https?://)?(?:www\.)?'
+    r'(?:[a-z0-9_]{3,32}\.' + _TG_HOSTS + r'(?:/[^\s<>"\'«»]*)?'   # username.t.me[/path]
+    r'|' + _TG_HOSTS + r'/[^\s<>"\'«»]+)',                          # t.me/<anything incl. ?start=ref, +invite>
     re.IGNORECASE
 )
-TG_JOINCHAT_PATTERN = re.compile(
-    r'(https?:\/\/)?(www\.)?(t\.me|telegram\.me)\/(joinchat\/|\+)[a-zA-Z0-9_-]+',
+TG_DEEP_LINK_PATTERN = re.compile(r'(?<![\w.-])tg://[^\s<>"\'«»]+', re.IGNORECASE)
+_TRAILING_PUNCT_RE = re.compile(r'[.,!?:;)\]»]+$')
+_TG_URL_RE = re.compile(
+    r'^(?:https?://)?(?:www\.)?(?:[a-z0-9_-]{1,64}\.)?' + _TG_HOSTS + r'(?:[/?#]|$)|^tg:',
     re.IGNORECASE
 )
-TG_DEEP_LINK_PATTERN = re.compile(
-    r'tg:\/\/(?:resolve\?domain=|join\?invite=)[a-zA-Z0-9_+%-]+',
-    re.IGNORECASE
-)
-
-PROMO_CTA_PATTERNS = [
-    re.compile(r'^\s*(?:Bizning\s+kanal|Kanalimiz|Kanalga\s+obuna\s+bo[\'ʼ`]?ling|A[\'ʼ`]?zo\s+bo[\'ʼ`]?ling|Kanalga\s+qo[\'ʼ`]?shiling)\s*[:\-–—]?\s*(?:@\w+|https?:\/\/t\.me\/\S+)\s*$', re.IGNORECASE | re.MULTILINE),
-    re.compile(r'^\s*(?:Подписывайтесь|Наш\s+канал|Канал|Ссылка\s+на\s+канал|Присоединяйтесь)\s*[:\-–—]?\s*(?:@\w+|https?:\/\/t\.me\/\S+)\s*$', re.IGNORECASE | re.MULTILINE),
-    re.compile(r'^\s*(?:Subscribe|Join\s+channel|Our\s+channel)\s*[:\-–—]?\s*(?:@\w+|https?:\/\/t\.me\/\S+)\s*$', re.IGNORECASE | re.MULTILINE),
-    re.compile(r'^\s*(?:👉|➡️|🔗|📱)?\s*(?:Переходите\s+по\s+ссылке|Перейти\s+по\s+ссылке|Подробнее\s+по\s+ссылке|Связь|Контакты|Связаться|Aloqa|Murojaat\s+uchun|Bog[\'ʼ`]?lanish)\s*[:\-–—]?\s*(?:@\w+|https?:\/\/t\.me\/\S+)\s*$', re.IGNORECASE | re.MULTILINE),
-    re.compile(r'^\s*(?:👉|➡️|🔗|📱)?\s*@\w+\s*$', re.MULTILINE),
-    re.compile(r'^\s*(?:👉|➡️|🔗|📱)?\s*https?:\/\/t\.me\/\S+\s*$', re.MULTILINE),
-]
 
 WEB_URL_PATTERN = re.compile(
-    r'https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{2,10}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)',
+    r'https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{2,10}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=;]*)',
     re.IGNORECASE
 )
 
-COMMERCIAL_AD_PATTERNS = [
-    # Explicit ad tags & disclosures
-    re.compile(r'(?:#reklama|#реклама|#ad\b|#advertisement|#sponsor|#hamkorlik|#promoted)', re.IGNORECASE),
-    re.compile(r'^\s*(?:Реклама|На\s+правах\s+рекламы|Спонсорский\s+пост|Спонсор\s+показа|Hamkorlik\s+asosida|Tijoriy\s+reklama)\s*[:\-–—]?', re.IGNORECASE | re.MULTILINE),
-    # Casino, betting, gambling brands & mechanics
-    re.compile(r'\b(?:1xbet|1win|melbet|mostbet|pin-?up|linebet|aviator|vulkan|parimatch|betandyou|fonbet|olimpbet)\b', re.IGNORECASE),
-    re.compile(r'\b(?:stavka\s+qiling|katta\s+yutuq|promokod|depozit|bonus\s*\d*%?|kazino|slotlar|frispin)\b', re.IGNORECASE),
-    re.compile(r'\b(?:ставка\s+на\s+спорт|бонус\s+к\s+депозиту|выигрыш\s+в\s+казино|слоты|фриспины)\b', re.IGNORECASE),
-    # Crypto / spam airdrop / bot schemes
-    re.compile(r'\b(?:airdrop\s+token|bepul\s+ton|bepul\s+usdt|pul\s+ishlash\s+boti|kunlik\s+daromad\s+\d+%)\b', re.IGNORECASE),
-    # Bulletin board passenger/freight spam
-    re.compile(r'\b(?:moshina\s+bor|damas\s+bor|pochta\s+bor\s+odam\s+bor|yulovchi\s+kerak)\b', re.IGNORECASE),
+# Promo / call-to-action lines. Evaluated with fullmatch() against ONE stripped, tag-free line at a time, so no
+# pattern can span several lines (the previous MULTILINE ^\s*...\s*$ forms were cubic on runs of blank lines).
+_CTA_LEAD = r'(?:(?:👉|➡️|➡|🔗|📱|👇|⬇️|⬇)\s*)?'
+_CTA_SEP = r'\s*[:\-–—]?\s*'
+_CTA_REF = r'(?:@\w+|(?:https?://)?(?:www\.)?(?:[\w-]{1,64}\.)?' + _TG_HOSTS + r'(?:/\S*)?|tg://\S+)'
+PROMO_CTA_PATTERNS = [
+    re.compile(_CTA_LEAD + r'(?:Bizning\s+kanal|Kanalimiz|Kanalga\s+obuna\s+bo\'?ling|A\'?zo\s+bo\'?ling|Kanalga\s+qo\'?shiling)' + _CTA_SEP + _CTA_REF, re.IGNORECASE),
+    re.compile(_CTA_LEAD + r'(?:Подписывайтесь|Наш\s+канал|Канал|Ссылка\s+на\s+канал|Присоединяйтесь)' + _CTA_SEP + _CTA_REF, re.IGNORECASE),
+    re.compile(_CTA_LEAD + r'(?:Subscribe|Join\s+(?:our\s+)?channel|Our\s+channel)' + _CTA_SEP + _CTA_REF, re.IGNORECASE),
+    re.compile(_CTA_LEAD + r'(?:Переходите\s+по\s+ссылке|Перейти\s+по\s+ссылке|Подробнее\s+по\s+ссылке|Связь|Контакты|Связаться|Aloqa|Murojaat\s+uchun|Bog\'?lanish)' + _CTA_SEP + _CTA_REF, re.IGNORECASE),
+    re.compile(_CTA_LEAD + r'@\w+'),
+    re.compile(_CTA_LEAD + r'(?:https?://)?(?:www\.)?(?:[\w-]{1,64}\.)?' + _TG_HOSTS + r'/\S*', re.IGNORECASE),
 ]
+# CTA labels left without their link/username once links were removed ("🔗 Переходите по ссылке:")
+_DANGLING_LABEL_RE = re.compile(
+    _CTA_LEAD + r'(?:Переходите\s+по\s+ссылке|Перейти\s+по\s+ссылке|Подробнее\s+по\s+ссылке|Ссылка\s+на\s+канал|Ссылка|Канал|Наш\s+канал|Подписывайтесь|Bizning\s+kanal|Kanalimiz|Kanal|Havola)\s*[:\-–—]?',
+    re.IGNORECASE
+)
+# Lines longer than this are content, never a bare CTA line (also bounds the regex work per line)
+_CTA_LINE_MAX_CHARS = 300
+
+# --- Advertising / gambling lexicon (matched on normalized plain text, see normalize_for_matching) ---
+# Explicit disclosures: the whole post is an advertisement
+_AD_HASHTAG_RE = re.compile(r'(?<!\w)#(?:reklama|реклама|ad|ads|advertisement|sponsor|sponsored|hamkorlik|promoted|спонсор)(?!\w)', re.IGNORECASE)
+_AD_HEADER_RE = re.compile(
+    r'^[ \t]*(?:реклама|на[ \t]+правах[ \t]+рекламы|спонсорский[ \t]+пост|спонсор[ \t]+показа|hamkorlik[ \t]+asosida|tijoriy[ \t]+reklama|reklama)(?!\w)[ \t]*(?:[:\-–—][ \t]*(?P<value>[^\n]*)|$)',
+    re.IGNORECASE | re.MULTILINE
+)
+# "Reklama va hamkorlik uchun: @admin" — the source channel's ad-contact footer (only that line is an ad).
+# Contact items must be separated explicitly, so a run of digits can never be split ambiguously (no backtracking blow-up).
+_CONTACT_ITEM = r'(?:@\w{1,32}|(?:https?://)?(?:www\.)?(?:[\w-]{1,64}\.)?' + _TG_HOSTS + r'/[^\s,;]+|\+?\d[\d \t()-]{5,20}\d)'
+_CONTACT_LIST = _CONTACT_ITEM + r'(?:[ \t]*(?:,|;|/|\byoki\b|\bили\b)[ \t]*' + _CONTACT_ITEM + r')*'
+_AD_CONTACT_LINE_RE = re.compile(
+    r'(?:(?:reklama|реклама)(?:\s+(?:va|и)\s+(?:hamkorlik|сотрудничеств\w*))?(?:\s+(?:uchun|joyi|bo\'yicha|masalasida))?'
+    r'|hamkorlik\s+uchun|по\s+вопросам\s+(?:рекламы|сотрудничества)|по\s+рекламе)'
+    r'[ \t]*[:\-–—]?[ \t]*(?:' + _CONTACT_LIST + r')?',
+    re.IGNORECASE
+)
+_CONTACT_VALUE_RE = re.compile(_CONTACT_LIST, re.IGNORECASE)
+# Gambling operators (strong signal, still needs a second signal unless two brands appear)
+_GAMBLING_BRAND_RE = re.compile(
+    r'(?<!\w)(?:1\s?x\s?bet\w*|1win\w*|melbet\w*|mostbet\w*|pin-?up\w*|linebet\w*|pari-?match\w*|betandyou\w*|fonbet\w*'
+    r'|olimpbet\w*|betwinner\w*|winline\w*|vavada\w*|22bet\w*|888starz\w*|megapari\w*|leonbet\w*|1xslots\w*|joycasino\w*)(?!\w)',
+    re.IGNORECASE
+)
+# Casino game names — generic words on their own ("aviator", "mines")
+_GAMBLING_GAME_RE = re.compile(
+    r'(?<!\w)(?:aviator\w*|lucky\s?jet\w*|jetx|mines|plinko|sweet\s+bonanza|gates\s+of\s+olympus|crash\s+(?:o\'yin\w*|game\w*))(?!\w)',
+    re.IGNORECASE
+)
+# Unambiguous gambling mechanics
+_GAMBLING_TERM_RE = re.compile(
+    r'(?<!\w)(?:kazino\w*|casino\w*|казино\w*|bukmeker\w*|букмекер\w*|frispin\w*|free\s?spin\w*|фриспин\w*|slotlar\w*|слоты|слотов'
+    r'|игровые\s+автоматы|stavka\s+qiling|stavka\s+qo\'y\w*|pul\s+tik\w*|ставки\s+на\s+спорт|ставка\s+на\s+спорт|yutuqni\s+yechi\w*'
+    r'|бонус\s+к\s+депозиту|выигрыш\s+в\s+казино)(?!\w)',
+    re.IGNORECASE
+)
+# Generic commercial words: only ever counted in combination with other signals
+_WEAK_PROMO_PATTERNS: Dict[str, re.Pattern] = {
+    name: re.compile(r'(?<!\w)(?:' + pattern + r')(?!\w)', re.IGNORECASE) for name, pattern in {
+        "bonus": r'bonus\w*|бонус\w*',
+        "deposit": r'depozit\w*|депозит\w*',
+        "promo_code": r'promo\s?kod\w*|promo\s?code\w*|промо\s?код\w*',
+        "stake": r'stavka\w*|ставк\w*',
+        "earn": r'pul\s+ishla\w*|заработ\w*|daromad\w*|доход\w*',
+        "win": r'yutuq\w*|yutib\s+ol\w*|выигр\w*|jackpot\w*|джекпот\w*',
+        "guarantee": r'kafolat\w*|гарант\w*',
+        "signal": r'signal\w*|сигнал\w*',
+        "insider": r'insayd\w*|инсайд\w*',
+        "percent_bonus": r'\d+\s?%\s?bonus\w*|bonus[^\W\d_]*\s?\d+\s?%|\+\d+\s?%',
+    }.items()
+}
+_SCAM_PHRASE_RE = re.compile(
+    r'(?<!\w)(?:airdrop\w*|bepul\s+(?:ton|usdt|kripto\w*)|pul\s+ishlash\s+bot\w*|kunlik\s+daromad\s+\d+\s?%|ежедневн\w+\s+доход\s+\d+\s?%)(?!\w)',
+    re.IGNORECASE
+)
+# Passenger / freight bulletin-board spam
+_BULLETIN_SPAM_RE = re.compile(r'(?<!\w)(?:moshina\s+bor|damas\s+bor|pochta\s+bor\s+odam\s+bor|(?:yo\'?|yu)lovchi\s+kerak)(?!\w)', re.IGNORECASE)
+_AD_LINK_RE = re.compile(r'(?:https?://|www\.)\S+|(?<![\w.@/-])' + _TG_HOSTS + r'/\S+|(?<![\w.-])@\w{4,32}', re.IGNORECASE)
+_REFERRAL_RE = re.compile(r'(?<!\w)(?:referal\w*|referral\w*|реферал\w*)(?!\w)|[?&](?:start|ref|aff|partner)=\w', re.IGNORECASE)
+# Applied to each link found by _AD_LINK_RE (plain substring search, linear)
+_GAMBLING_URL_KEYWORD_RE = re.compile(r'bet|casino|kazino|stavk|1win|1xbet', re.IGNORECASE)
+
+# Invisible characters used to obfuscate links/words. ZWJ is kept when it joins two emoji (👨‍💻, ❤️‍🔥).
+_INVISIBLE_RE = re.compile(
+    r'[​‌⁠﻿]'
+    r'|(?<![\U0001F000-\U0001FAFF☀-➿️])‍'
+    r'|‍(?![\U0001F000-\U0001FAFF☀-➿])'
+)
+_ALL_INVISIBLE_RE = re.compile(r'[­​-‍⁠﻿]')
+_APOSTROPHES_RE = re.compile(r"[’‘ʻʼ`´]")
+_TAG_SPLIT_RE = re.compile(r'(<[^>]*>)')
+_TAG_NAME_RE = re.compile(r'<\s*(/)?\s*([a-zA-Z][a-zA-Z0-9_\-]*)')
+_ANCHOR_RE = re.compile(r'<a\b([^>]*)>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+_HREF_RE = re.compile(r'\bhref\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', re.IGNORECASE)
+# Anchors whose href is missing or truly empty (never anchors carrying a URL or an ___AFF_PROT_n___ placeholder)
+_EMPTY_ANCHOR_RE = re.compile(r'<a\b(?![^>]*\bhref\s*=\s*["\']?[^"\'\s>])[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+_MD_TG_LINK_RE = re.compile(
+    r'\[([^\]\n]{1,200})\]\((?:(?:https?://)?(?:www\.)?(?:[\w-]{1,64}\.)?' + _TG_HOSTS + r'/[^)\s]*|tg://[^)\s]*)\)',
+    re.IGNORECASE
+)
+_EMPTY_TAG_PAIR_RE = re.compile(
+    r'<(b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|tg-emoji|code|pre|blockquote)\b[^>]*></\1\s*>',
+    re.IGNORECASE
+)
+# URLs, e-mails, @mentions and protected affiliate placeholders must never be touched by word replacements
+_REPLACEMENT_MASK_RE = re.compile(
+    r'(?:https?://|www\.|tg://)[^\s<>"\'«»]+'
+    r'|(?<![\w.@/-])(?:[\w-]{1,64}\.)?' + _TG_HOSTS + r'/[^\s<>"\'«»]*'
+    r'|___AFF_PROT_\d+___'
+    r'|(?<![\w.+-])[\w.+-]{1,64}@[\w-]{1,63}\.[\w.-]{2,63}'
+    r'|(?<![\w.-])@\w+',
+    re.IGNORECASE
+)
+_SIG_KEYWORDS = r'(?:Manba|Kanal|Kanalimiz|Havola|Source|Channel|Подписаться|Подписывайтесь|Канал|Источник|Bizning\s+kanal|Admin|Админ)'
+_SOURCE_SIGNATURE_RE = re.compile(
+    r'(?:@\w{4,32}'
+    r'|(?:https?://)?(?:www\.)?(?:[\w-]{1,64}\.)?' + _TG_HOSTS + r'/\S*'
+    r'|' + _SIG_KEYWORDS + r'(?!\w)\s*[:\-–—]\s*\S.*'
+    r'|' + _SIG_KEYWORDS + r'(?!\w)\s*(?:@\w+|(?:https?://)?' + _TG_HOSTS + r'/\S*))',
+    re.IGNORECASE
+)
+_SIG_PREFIX_RE = re.compile(r'^(?:[\U00010000-\U0010ffff☀-➿⭐⌚-⏳▪-◾‍️•\-\*]\s*)+')
+_SEPARATOR_LINE_RE = re.compile(r'[—–\-_=*•#\s]{3,}')
+
+
+def utf16_len(text: Optional[str]) -> int:
+    """Length in UTF-16 code units — the unit Telegram uses for every text limit."""
+    if not text:
+        return 0
+    return len(text.encode('utf-16-le')) // 2
+
+
+def truncate_utf16(text: Optional[str], limit: int, suffix: str = "") -> str:
+    """Truncates plain text to at most `limit` UTF-16 code units (suffix included) without splitting a surrogate pair."""
+    if not text:
+        return ""
+    if utf16_len(text) <= limit:
+        return text
+    budget = max(0, limit - utf16_len(suffix))
+    out = []
+    used = 0
+    for ch in text:
+        width = 2 if ord(ch) > 0xFFFF else 1
+        if used + width > budget:
+            break
+        out.append(ch)
+        used += width
+    return "".join(out).rstrip() + suffix
+
+
+def _is_tag(token: str) -> bool:
+    return token.startswith("<") and token.endswith(">")
+
+
+def _tag_name(token: str) -> Tuple[bool, str]:
+    m = _TAG_NAME_RE.match(token)
+    if not m:
+        return False, ""
+    return m.group(1) == "/", m.group(2).lower()
+
 
 class TextProcessor:
     @staticmethod
@@ -96,9 +237,9 @@ class TextProcessor:
         """
         if not raw_input:
             return ""
-        
+
         s = raw_input.strip()
-        
+
         # Numeric ID
         if s.startswith("-100") or (s.startswith("-") and s[1:].isdigit()) or s.isdigit():
             return s
@@ -140,28 +281,232 @@ class TextProcessor:
             return s
         return s
 
+    # ------------------------------------------------------------------
+    # Plain-text helpers (filters work on what the reader actually sees)
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def contains_blacklisted_words(text: str, blacklist: List[str]) -> bool:
+    def html_to_plain(text: Optional[str]) -> str:
+        """Visible text of a Telegram-HTML string: tags removed, entities unescaped."""
+        if not text:
+            return ""
+        return html.unescape(re.sub(r'<[^>]*>', '', text))
+
+    @staticmethod
+    def normalize_for_matching(text: Optional[str], collapse_newlines: bool = False) -> str:
+        """Canonical form for keyword matching: invisible characters removed, apostrophe variants unified,
+        NFKC-normalized (NFKD would split letters such as 'й' and break Cyrillic keywords) and case-folded."""
+        if not text:
+            return ""
+        s = _ALL_INVISIBLE_RE.sub('', text)
+        s = _APOSTROPHES_RE.sub("'", s)
+        s = unicodedata.normalize('NFKC', s).casefold()
+        if collapse_newlines:
+            return re.sub(r'\s+', ' ', s).strip()
+        return re.sub(r'[ \t ]+', ' ', s)
+
+    @staticmethod
+    def utf16_len(text: Optional[str]) -> int:
+        return utf16_len(text)
+
+    @staticmethod
+    def truncate_utf16(text: Optional[str], limit: int, suffix: str = "") -> str:
+        return truncate_utf16(text, limit, suffix)
+
+    @staticmethod
+    def is_telegram_url(url: Optional[str]) -> bool:
+        """True for t.me / telegram.me / telegram.dog links (incl. username.t.me) and tg:// deep links."""
+        if not url:
+            return False
+        return bool(_TG_URL_RE.match(html.unescape(url).strip()))
+
+    @staticmethod
+    def _anchor_href(attrs: str) -> Optional[str]:
+        m = _HREF_RE.search(attrs or "")
+        if not m:
+            return None
+        return next((g for g in m.groups() if g is not None), "")
+
+    @staticmethod
+    def _split_html_lines(html_text: str) -> List[Tuple[List[str], bool]]:
+        """Splits Telegram-HTML into lines of tokens (tags and text pieces). The flag tells whether the line lies
+        (partly) inside a <pre> block. Tags never span lines in Telegram HTML, so every token belongs to one line."""
+        lines: List[Tuple[List[str], bool]] = []
+        current: List[str] = []
+        pre_depth = 0
+        current_in_pre = False
+        for token in _TAG_SPLIT_RE.split(html_text):
+            if not token:
+                continue
+            if _is_tag(token):
+                current.append(token)
+                closing, name = _tag_name(token)
+                if name == "pre":
+                    pre_depth = max(0, pre_depth - 1) if closing else pre_depth + 1
+                    current_in_pre = True
+                continue
+            parts = token.split("\n")
+            for idx, part in enumerate(parts):
+                if idx:
+                    lines.append((current, current_in_pre))
+                    current = []
+                    current_in_pre = pre_depth > 0
+                if part:
+                    current.append(part)
+        lines.append((current, current_in_pre))
+        return lines
+
+    @classmethod
+    def drop_empty_tags(cls, html_text: str) -> str:
+        """Removes formatting pairs left without any content (e.g. <b></b>, <a href="x"></a>, <tg-emoji ...></tg-emoji>)."""
+        if not html_text or "</" not in html_text:
+            return html_text
+        previous = None
+        while previous != html_text:
+            previous = html_text
+            html_text = _EMPTY_TAG_PAIR_RE.sub('', html_text)
+        return html_text
+
+    @classmethod
+    def remove_lines(cls, html_text: str, predicate: Callable[[str], bool], skip_pre: bool = True) -> str:
+        """Removes every line whose visible text satisfies `predicate` while keeping the line's tags (attached to a
+        neighbouring line), so removing a line can never leave an unbalanced tag behind. Lines inside <pre> are
+        skipped by default (code, not promo)."""
+        if not html_text:
+            return html_text
+        lines = cls._split_html_lines(html_text)
+        out: List[str] = []
+        carry = ""
+        changed = False
+        for tokens, in_pre in lines:
+            visible = "".join(t for t in tokens if not _is_tag(t))
+            plain = html.unescape(visible).strip()
+            if plain and not (skip_pre and in_pre) and predicate(plain):
+                tags = "".join(t for t in tokens if _is_tag(t))
+                changed = True
+                if out:
+                    out[-1] += tags
+                else:
+                    carry += tags
+                continue
+            line_html = "".join(tokens)
+            if carry:
+                line_html = carry + line_html
+                carry = ""
+            out.append(line_html)
+        if not changed:
+            return html_text
+        result = "\n".join(out) + carry
+        return cls.drop_empty_tags(result)
+
+    @staticmethod
+    def _sub_outside_tags(html_text: str, func: Callable[[str], str], skip_pre: bool = True) -> str:
+        """Applies func to text chunks only (never to tags or attributes) and, by default, not inside <pre>."""
+        tokens = _TAG_SPLIT_RE.split(html_text)
+        pre_depth = 0
+        for i, token in enumerate(tokens):
+            if not token:
+                continue
+            if _is_tag(token):
+                closing, name = _tag_name(token)
+                if name == "pre":
+                    pre_depth = max(0, pre_depth - 1) if closing else pre_depth + 1
+                continue
+            if skip_pre and pre_depth:
+                continue
+            tokens[i] = func(token)
+        return "".join(tokens)
+
+    # ------------------------------------------------------------------
+    # Filters
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def contains_blacklisted_words(cls, text: str, blacklist: List[str]) -> bool:
+        """Whole-word match on the visible text (tags stripped, entities unescaped, NFKC + casefold), with
+        Unicode word boundaries: '<b>casino</b>', '🎰casino' and "o&#x27;yin" can no longer slip through."""
         if not text or not blacklist:
             return False
-        
-        clean_text = re.sub(r'[\u200b\u200c\u200d\ufeff\u2060]', '', text)
-        clean_text = re.sub(r"[’‘ʻʼ`]", "'", clean_text)
-        normalized_text = unicodedata.normalize('NFKD', clean_text).casefold()
+        haystack = cls.normalize_for_matching(cls.html_to_plain(text), collapse_newlines=True)
+        if not haystack:
+            return False
         for word in blacklist:
             if not word:
                 continue
-            w_clean = re.sub(r'[\u200b\u200c\u200d\ufeff\u2060]', '', word.strip())
-            w_clean = re.sub(r"[’‘ʻʼ`]", "'", w_clean)
-            w_clean = unicodedata.normalize('NFKD', w_clean).casefold()
-            if not w_clean:
+            needle = cls.normalize_for_matching(str(word), collapse_newlines=True)
+            if not needle:
                 continue
-            # Match whole words respecting apostrophes, hyphens, and punctuation boundaries
-            pattern = r'(?:(?<=[\s\.,!?;:()\[\]{}"\'`ʻʼ«»—–\-_/\\|])|^)' + re.escape(w_clean) + r'(?:(?=[\s\.,!?;:()\[\]{}"\'`ʻʼ«»—–\-_/\\|])|$)'
-            if re.search(pattern, normalized_text):
+            if re.search(r'(?<!\w)' + re.escape(needle) + r'(?!\w)', haystack):
                 logger.info(f"Message blocked due to blacklisted word: '{word}'")
                 return True
         return False
+
+    @staticmethod
+    def collect_ad_signals(norm_text: str) -> Dict[str, Set[str]]:
+        """Ad/gambling signals found in text already passed through normalize_for_matching()."""
+        signals: Dict[str, Set[str]] = {
+            "disclosure": set(), "contact": set(), "brands": set(), "games": set(), "strong": set(),
+            "weak": set(), "scam": set(), "bulletin": set(), "links": set(), "referral": set(), "gambling_links": set(),
+        }
+        if not norm_text:
+            return signals
+        signals["disclosure"].update(m.group(0) for m in _AD_HASHTAG_RE.finditer(norm_text))
+        for m in _AD_HEADER_RE.finditer(norm_text):
+            value = (m.group("value") or "").strip()
+            # "Реклама: @admin" is a contact footer, "Реклама: <offer text>" discloses an advertisement
+            if value and len(value) <= _CTA_LINE_MAX_CHARS and _CONTACT_VALUE_RE.fullmatch(value):
+                signals["contact"].add(m.group(0).strip())
+            else:
+                signals["disclosure"].add(m.group(0).strip())
+        signals["brands"].update(m.group(0).replace(" ", "") for m in _GAMBLING_BRAND_RE.finditer(norm_text))
+        signals["games"].update(m.group(0) for m in _GAMBLING_GAME_RE.finditer(norm_text))
+        signals["strong"].update(m.group(0) for m in _GAMBLING_TERM_RE.finditer(norm_text))
+        for name, pattern in _WEAK_PROMO_PATTERNS.items():
+            if pattern.search(norm_text):
+                signals["weak"].add(name)
+        signals["scam"].update(m.group(0) for m in _SCAM_PHRASE_RE.finditer(norm_text))
+        signals["bulletin"].update(m.group(0) for m in _BULLETIN_SPAM_RE.finditer(norm_text))
+        signals["links"].update(m.group(0) for m in _AD_LINK_RE.finditer(norm_text))
+        signals["referral"].update(m.group(0) for m in _REFERRAL_RE.finditer(norm_text))
+        signals["gambling_links"].update(link for link in signals["links"] if _GAMBLING_URL_KEYWORD_RE.search(link))
+        return signals
+
+    @classmethod
+    def classify_ad(cls, norm_text: str, signals: Optional[Dict[str, Set[str]]] = None) -> Optional[str]:
+        """Returns the ad category of a normalized text ("sponsor", "bulletin", "casino", "crypto_spam",
+        "referral") or None. Generic commercial words (bonus, depozit, promokod, stavka, aviator, ...) never
+        decide alone: an ad needs an explicit disclosure or several independent signals."""
+        s = signals if signals is not None else cls.collect_ad_signals(norm_text)
+        if s["disclosure"]:
+            return "sponsor"
+        if s["bulletin"]:
+            return "bulletin"
+        has_cta = bool(s["links"] or s["referral"])
+        if len(s["brands"]) >= 2:
+            return "casino"
+        if s["brands"] and (s["games"] or s["strong"] or s["weak"] or has_cta or s["gambling_links"]):
+            return "casino"
+        if s["gambling_links"] and (s["games"] or s["strong"] or s["weak"]):
+            return "casino"
+        if s["games"] and (s["strong"] or s["weak"]):
+            return "casino"
+        if s["strong"] and (len(s["strong"]) >= 2 or s["weak"] or has_cta):
+            return "casino"
+        if s["scam"] and (has_cta or s["weak"]):
+            return "crypto_spam"
+        if len(s["weak"]) >= 3:
+            return "casino"
+        if s["weak"] and s["referral"]:
+            return "referral"
+        return None
+
+    @staticmethod
+    def is_ad_contact_line(norm_line: str) -> bool:
+        """True for a single normalized line that is only the source's ad-contact footer."""
+        line = (norm_line or "").strip()
+        if not line or len(line) > _CTA_LINE_MAX_CHARS:
+            return False
+        return bool(_AD_CONTACT_LINE_RE.fullmatch(line))
 
     @classmethod
     def is_commercial_ad(cls, text: str) -> bool:
@@ -171,74 +516,103 @@ class TextProcessor:
         """
         if not text:
             return False
-        clean_text = re.sub(r'[\u200b\u200c\u200d\ufeff\u2060]', '', text)
-        clean_text = re.sub(r"[’‘ʻʼ`]", "'", clean_text)
-        normalized_text = unicodedata.normalize('NFKD', clean_text)
-        for pat in COMMERCIAL_AD_PATTERNS:
-            if pat.search(normalized_text):
-                return True
-        return False
+        normalized_text = cls.normalize_for_matching(cls.html_to_plain(text))
+        return cls.classify_ad(normalized_text) is not None
+
+    # ------------------------------------------------------------------
+    # Link cleaning
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def clean_links_and_usernames(text: str, remove_web_urls: bool = False) -> str:
+    def _strip_invisible(text: str) -> str:
+        return _INVISIBLE_RE.sub('', text)
+
+    @staticmethod
+    def _cta_candidate(plain_line: str) -> Optional[str]:
+        if len(plain_line) > _CTA_LINE_MAX_CHARS:
+            return None
+        s = _APOSTROPHES_RE.sub("'", _ALL_INVISIBLE_RE.sub('', plain_line))
+        return unicodedata.normalize('NFKC', s).strip()
+
+    @classmethod
+    def _is_promo_cta_line(cls, plain_line: str) -> bool:
+        line = cls._cta_candidate(plain_line)
+        return bool(line) and any(p.fullmatch(line) for p in PROMO_CTA_PATTERNS)
+
+    @classmethod
+    def _is_dangling_label_line(cls, plain_line: str) -> bool:
+        line = cls._cta_candidate(plain_line)
+        return bool(line) and bool(_DANGLING_LABEL_RE.fullmatch(line))
+
+    @staticmethod
+    def _cut_link_keep_punct(match: re.Match) -> str:
+        tail = _TRAILING_PUNCT_RE.search(match.group(0))
+        return tail.group(0) if tail else ""
+
+    @classmethod
+    def _unwrap_telegram_anchor(cls, match: re.Match) -> str:
+        href = cls._anchor_href(match.group(1))
+        if href is not None and cls.is_telegram_url(href):
+            return match.group(2)
+        return match.group(0)
+
+    @classmethod
+    def clean_links_and_usernames(cls, text: str, remove_web_urls: bool = False) -> str:
         if not text:
             return ""
 
-        cleaned = re.sub(r'[\u200b\u200c\u200d\ufeff\u2060]', '', text)
+        cleaned = cls._strip_invisible(text)
+        # Runs of blank lines never carry content; collapsing first keeps every later step linear
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
 
-        # 1. Clean HTML anchor tags pointing to Telegram links (preserve inner text if not purely CTA)
-        cleaned = re.sub(
-            r'<a\s+[^>]*href=["\']?(?:(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)\/[^"\'>\s]+|tg:\/\/[^"\'>\s]+)["\']?[^>]*>(.*?)<\/a>',
-            r'\1',
-            cleaned,
-            flags=re.IGNORECASE | re.DOTALL
-        )
+        # 1. Unwrap HTML anchors pointing to Telegram (t.me, telegram.me/.dog, username.t.me, tg://); keep inner text
+        cleaned = _ANCHOR_RE.sub(cls._unwrap_telegram_anchor, cleaned)
 
         # 2. Clean Markdown formatted telegram links [text](https://t.me/...) or [text](tg://...)
-        cleaned = re.sub(
-            r'\[([^\]]+)\]\((?:(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)\/[^\)]+|tg:\/\/[^\)]+)\)',
-            r'\1',
-            cleaned,
-            flags=re.IGNORECASE
-        )
+        cleaned = _MD_TG_LINK_RE.sub(r'\1', cleaned)
 
-        # 3. Clean CTA promo lines
-        for promo_pattern in PROMO_CTA_PATTERNS:
-            cleaned = promo_pattern.sub('', cleaned)
+        # 3. Clean CTA promo lines (one line at a time on its visible text; tags of removed lines are kept)
+        cleaned = cls.remove_lines(cleaned, cls._is_promo_cta_line)
 
-        # 4. Clean raw Telegram links, invite links, usernames, and deep links (only outside HTML tags)
-        tokens = re.split(r'(<[^>]+>)', cleaned)
-        for i in range(0, len(tokens), 2):
-            chunk = tokens[i]
-            if chunk:
-                chunk = TG_JOINCHAT_PATTERN.sub('', chunk)
-                chunk = TG_LINK_PATTERN.sub('', chunk)
-                chunk = TG_DEEP_LINK_PATTERN.sub('', chunk)
-                chunk = TG_USERNAME_PATTERN.sub('', chunk)
-                if remove_web_urls:
-                    chunk = WEB_URL_PATTERN.sub('', chunk)
-                tokens[i] = chunk
-        cleaned = "".join(tokens)
+        # 4. Clean raw Telegram links, invite links, usernames, and deep links (only outside HTML tags and <pre>)
+        def _clean_chunk(chunk: str) -> str:
+            new_chunk = TG_LINK_PATTERN.sub(cls._cut_link_keep_punct, chunk)
+            new_chunk = TG_DEEP_LINK_PATTERN.sub(cls._cut_link_keep_punct, new_chunk)
+            new_chunk = TG_USERNAME_PATTERN.sub('', new_chunk)
+            if remove_web_urls:
+                new_chunk = WEB_URL_PATTERN.sub('', new_chunk)
+            if new_chunk != chunk:
+                new_chunk = re.sub(r'[ \t]{2,}', ' ', new_chunk)
+            return new_chunk
 
-        # 5. Clean residual empty or broken anchor tags
-        cleaned = re.sub(r'<a\s+[^>]*href=["\']?\s*["\']?[^>]*>(.*?)<\/a>', r'\1', cleaned, flags=re.IGNORECASE | re.DOTALL)
-        cleaned = re.sub(r'<a>(.*?)<\/a>', r'\1', cleaned, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = cls._sub_outside_tags(cleaned, _clean_chunk)
+
+        # 5. Unwrap anchors whose href is missing or truly empty (real links and affiliate placeholders stay)
+        cleaned = _EMPTY_ANCHOR_RE.sub(r'\1', cleaned)
 
         # 6. Clean dangling promo CTA labels that now have no link/username
-        cleaned = re.sub(
-            r'^\s*(?:👉|➡️|🔗|📱)?\s*(?:Переходите\s+по\s+ссылке|Перейти\s+по\s+ссылке|Подробнее\s+по\s+ссылке|Ссылка\s+на\s+канал|Ссылка|Канал|Наш\s+канал|Подписывайтесь|Bizning\s+kanal|Kanalimiz|Kanal|Havola)\s*[:\-–—]?\s*$',
-            '',
-            cleaned,
-            flags=re.IGNORECASE | re.MULTILINE
-        )
+        cleaned = cls.remove_lines(cleaned, cls._is_dangling_label_line)
 
         # Clean ad hashtags when web URLs cleaning requested
         if remove_web_urls:
-            cleaned = re.sub(r'(?:#reklama|#реклама|#ad\b|#advertisement|#sponsor|#hamkorlik|#promoted)', '', cleaned, flags=re.IGNORECASE)
+            cleaned = cls._sub_outside_tags(cleaned, lambda chunk: _AD_HASHTAG_RE.sub('', chunk))
 
-        # 7. Clean up dangling multiple line breaks
+        # 7. Clean up dangling multiple line breaks and emptied formatting pairs
+        cleaned = cls.drop_empty_tags(cleaned)
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
         return cleaned.strip()
+
+    @classmethod
+    def clean_for_clone(cls, text: str) -> Tuple[bool, str]:
+        """Link-cleaning stage of the clone pipeline: (is_commercial_ad, cleaned_text). CPU-bound and synchronous,
+        meant to run in a worker thread."""
+        if cls.is_commercial_ad(text):
+            return True, text
+        return False, cls.clean_links_and_usernames(text)
+
+    # ------------------------------------------------------------------
+    # Word replacements & signatures
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _match_case(original: str, replacement: str) -> str:
@@ -257,88 +631,120 @@ class TextProcessor:
 
     @classmethod
     def apply_word_replacements(cls, text: str, replace_dict: Dict[str, str]) -> str:
+        """Replaces whole words in the visible text only: never inside HTML tags/attributes, URLs, e-mails,
+        @mentions or protected affiliate placeholders. Matching happens on unescaped text and the result is
+        re-escaped, so 'AT&amp;T' matches 'AT&T' and a replacement containing '<' or '&' cannot break the HTML."""
         if not text or not replace_dict:
             return text
 
-        # Tokenize by HTML tags so replacements are never applied inside HTML tags or attributes
-        tokens = re.split(r'(<[^>]+>)', text)
-        for i in range(0, len(tokens), 2):
-            chunk = tokens[i]
-            if not chunk:
-                continue
-            sorted_replacements = sorted(
-                [(k, v) for k, v in replace_dict.items() if k],
-                key=lambda x: len(x[0]),
-                reverse=True
+        sorted_replacements = sorted(
+            [(k, v) for k, v in replace_dict.items() if k],
+            key=lambda x: len(x[0]),
+            reverse=True
+        )
+        if not sorted_replacements:
+            return text
+        compiled = [
+            (
+                re.compile(
+                    r'(?:(?<=[\s\.,!?;:()\[\]{}"\'`ʻʼ«»—–\-_/\\|])|^)' + re.escape(old_val) + r'(?:(?=[\s\.,!?;:()\[\]{}"\'`ʻʼ«»—–\-_/\\|])|$)',
+                    re.IGNORECASE
+                ),
+                new_val
             )
-            for old_val, new_val in sorted_replacements:
-                pattern = r'(?:(?<=[\s\.,!?;:()\[\]{}"\'`ʻʼ«»—–\-_/\\|])|^)' + re.escape(old_val) + r'(?:(?=[\s\.,!?;:()\[\]{}"\'`ʻʼ«»—–\-_/\\|])|$)'
-                chunk = re.sub(
-                    pattern,
-                    lambda m, v=new_val: cls._match_case(m.group(0), v),
-                    chunk,
-                    flags=re.IGNORECASE
-                )
-            tokens[i] = chunk
+            for old_val, new_val in sorted_replacements
+        ]
+
+        def _replace_chunk(chunk: str) -> str:
+            plain = html.unescape(chunk)
+            masked: List[str] = []
+
+            def _mask(m: re.Match) -> str:
+                masked.append(m.group(0))
+                return f"{chr(0xE000 + len(masked) - 1)}"
+
+            work = _REPLACEMENT_MASK_RE.sub(_mask, plain)
+            for pattern, new_val in compiled:
+                work = pattern.sub(lambda m, v=new_val: cls._match_case(m.group(0), v), work)
+            if masked:
+                work = re.sub(r'(.)', lambda m: masked[ord(m.group(1)) - 0xE000], work)
+            if work == plain:
+                return chunk
+            return html.escape(work, quote=False)
+
+        # Tokenize by HTML tags so replacements are never applied inside HTML tags or attributes
+        tokens = _TAG_SPLIT_RE.split(text)
+        for i, token in enumerate(tokens):
+            if token and not _is_tag(token):
+                tokens[i] = _replace_chunk(token)
         return "".join(tokens)
 
     @classmethod
     def attach_signature(cls, text: str, signature: str, max_limit: int = 4096) -> str:
+        """Appends the channel signature. The post body is never truncated: splitting into caption + overflow or
+        several messages is done later by fit_caption_limit / fit_text_limit on the visible UTF-16 length.
+        (`max_limit` is accepted for backward compatibility and no longer truncates anything.)"""
         if not signature:
             return text
-        
+
         signature = signature.strip()
-        if not text:
-            return signature[:max_limit]
-        
+        if not signature:
+            return text
+        if not text or not text.strip():
+            return signature
+
         if text.strip().endswith(signature):
             return text
-        
-        combined = f"{text}\n\n{signature}"
-        sig_vis_len = cls.get_visible_text_length(signature)
-        if len(combined) > max_limit or cls.get_visible_text_length(combined) > max_limit:
-            max_text_len = max_limit - max(len(signature), sig_vis_len) - 2
-            if max_text_len > 50:
-                target_limit = max_text_len
-                safe_cut, _ = cls.fit_caption_limit(text, max_limit=target_limit)
-                while (len(safe_cut) + len(signature) + 2 > max_limit or cls.get_visible_text_length(safe_cut) + sig_vis_len + 2 > max_limit) and target_limit > 50:
-                    overshoot = max((len(safe_cut) + len(signature) + 2) - max_limit, (cls.get_visible_text_length(safe_cut) + sig_vis_len + 2) - max_limit)
-                    target_limit -= max(overshoot, 1)
-                    safe_cut, _ = cls.fit_caption_limit(text, max_limit=target_limit)
-                return f"{safe_cut}\n\n{signature}"
-            safe_cut, _ = cls.fit_caption_limit(combined, max_limit=max_limit)
-            return safe_cut
-        return combined
 
-    @staticmethod
-    def strip_source_signature(text: str) -> str:
-        """Removes source channel signatures, author handles, and footer links from post text"""
+        return f"{text.rstrip()}\n\n{signature}"
+
+    @classmethod
+    def strip_source_signature(cls, text: str) -> str:
+        """Removes source channel signatures, author handles, and footer links from the end of the post text.
+        A keyword line ("Kanal", "Admin", ...) only counts as a signature when it is followed by a separator or a
+        handle/link, so ordinary last lines such as "Kanalizatsiya ta'mirlandi" or "Admin panel yangilandi" stay."""
         if not text:
             return ""
-        lines = text.rstrip().split("\n")
-        if not lines:
-            return text
-        
+        lines = cls._split_html_lines(text.rstrip())
+        removed_tags = ""
         while lines:
-            last_line = lines[-1].strip()
-            if not last_line:
+            tokens, in_pre = lines[-1]
+            line_html = "".join(tokens)
+            visible = "".join(t for t in tokens if not _is_tag(t))
+            plain_line = html.unescape(visible).strip()
+            if not plain_line:
+                removed_tags = "".join(t for t in tokens if _is_tag(t)) + removed_tags
                 lines.pop()
                 continue
-            line_body = re.sub(r'^(?:[\U00010000-\U0010ffff\u2600-\u27bf\u2b50\u231a-\u23f3\u25aa-\u25fe\u200d\ufe0f👉🔹📌✅📍▶️➡️🔗⚡️⭐️✨•\-\*]\s*)+', '', last_line).strip()
-            check_target = line_body if line_body else last_line
-            is_sig = bool(
-                re.match(r'^(?:@[\w_]+|https?://t\.me/[\w_+/]+|(?:Manba|Kanal|Havola|Source|Channel|Подписаться|Канал|Bizning\s+kanal|Admin)\s*[:\-–—]?.*)$', check_target, flags=re.IGNORECASE) or
-                re.match(r'^<a\s+[^>]*>.*?</a>$', check_target, flags=re.IGNORECASE) or
-                re.match(r'^[—–\-_=*•#\s]{3,}$', last_line)
-            )
-            if is_sig:
-                lines.pop()
-            else:
+            if in_pre:
                 break
-        return "\n".join(lines).rstrip()
+            body = _SIG_PREFIX_RE.sub('', plain_line).strip()
+            check_target = body or plain_line
+            without_anchors = _ANCHOR_RE.sub('', line_html)
+            anchor_only = (
+                bool(_ANCHOR_RE.search(line_html))
+                and not _SIG_PREFIX_RE.sub('', html.unescape(re.sub(r'<[^>]*>', '', without_anchors)).strip()).strip()
+            )
+            is_sig = (
+                bool(_SOURCE_SIGNATURE_RE.fullmatch(check_target))
+                or anchor_only
+                or bool(_SEPARATOR_LINE_RE.fullmatch(plain_line))
+            )
+            if not is_sig:
+                break
+            removed_tags = "".join(t for t in tokens if _is_tag(t)) + removed_tags
+            lines.pop()
+        result = "\n".join("".join(tokens) for tokens, _ in lines).rstrip()
+        if removed_tags:
+            # Tags of removed lines are re-attached so formatting opened earlier is still closed properly
+            result = cls.drop_empty_tags(result + removed_tags)
+        return result
 
     @classmethod
     def process_text(cls, raw_text: Optional[str], pair: ChannelPair) -> Optional[str]:
+        """Synchronous subset of ClonerEngine.process_post_text with the same order and the same gates:
+        blacklist -> link/ad cleaning (only when the pair's "Link Tozalash" toggle is on) -> source signature
+        removal -> word replacements -> own signature."""
         if raw_text is None:
             raw_text = ""
 
@@ -347,17 +753,17 @@ class TextProcessor:
 
         result = raw_text
 
-        if (pair.clean_links or getattr(pair, "clone_mode", "clean") == "clean") and result:
-            if cls.is_commercial_ad(result):
+        if pair.clean_links and result.strip():
+            is_ad, result = cls.clean_for_clone(result)
+            if is_ad:
                 logger.info("Message blocked: detected commercial advertisement/gambling post.")
                 return None
-            result = cls.clean_links_and_usernames(result)
-
-        if pair.replace_dict and result:
-            result = cls.apply_word_replacements(result, pair.replace_dict)
 
         if pair.remove_signature and result:
             result = cls.strip_source_signature(result)
+
+        if pair.replace_dict and result:
+            result = cls.apply_word_replacements(result, pair.replace_dict)
 
         if pair.custom_signature and result:
             result = cls.attach_signature(result, pair.custom_signature)
@@ -419,12 +825,104 @@ class TextProcessor:
         closing_suffix = "".join(f"</{tname}>" for tname, _ in reversed(tag_stack))
         return html_text + closing_suffix
 
+    # Paragraph, line and sentence boundaries are preferred as the split point only while the part before
+    # them keeps at least this share of the limit; otherwise the last space is used (a boundary near the
+    # start would waste most of the caption)
+    _MIN_SOFT_SPLIT_SHARE = 0.5
+    # Split point kinds in order of preference
+    _SPLIT_PATTERNS = (
+        ("para", re.compile(r'\n[ \t]*\n')),
+        ("line", re.compile(r'\n')),
+        ("sentence", re.compile(r'(?<=[.!?…])[ \t]')),
+        ("space", re.compile(r'[ \t]')),
+    )
+    _SENTENCE_END_RE = re.compile(r'[.!?…]\s*$')
+    _LEADING_CLOSING_TAGS_RE = re.compile(r'(?:\s*</[a-zA-Z][^>]*>)+')
+
+    @staticmethod
+    def _visible_units(fragment: str) -> int:
+        """Visible UTF-16 length of an HTML text fragment without tags."""
+        return len(html.unescape(fragment).encode('utf-16-le')) // 2
+
+    @classmethod
+    def _hard_cut_in_token(cls, token: str, remaining_visible: int) -> int:
+        """Longest prefix of a text token (in characters) whose visible length fits `remaining_visible`.
+        HTML entities such as &quot; are never cut in half."""
+        accum_vis = 0
+        cut = 0
+        for part in re.split(r'(&[a-zA-Z0-9#]+;)', token):
+            if not part:
+                continue
+            part_vis = cls._visible_units(part)
+            if accum_vis + part_vis <= remaining_visible:
+                accum_vis += part_vis
+                cut += len(part)
+                continue
+            if not (part.startswith('&') and part.endswith(';')):
+                for ch in part:
+                    ch_vis = len(ch.encode('utf-16-le')) // 2
+                    if accum_vis + ch_vis > remaining_visible:
+                        break
+                    accum_vis += ch_vis
+                    cut += len(ch)
+            break
+        return cut
+
+    @classmethod
+    def _find_split_index(cls, processed_text: str, max_limit: int) -> int:
+        """Character index at which `processed_text` (visible length > max_limit) is split.
+
+        Preference: the last paragraph break, line break or sentence end (each only while the first part
+        keeps at least _MIN_SOFT_SPLIT_SHARE of the limit), then the last space, then an exact cut at the
+        limit. Split points are only searched in the text tokens up to the limit, so a cut never falls
+        inside a tag or an HTML entity."""
+        tokens = re.split(r'(<[^>]+>)', processed_text)
+        min_soft_visible = int(max_limit * cls._MIN_SOFT_SPLIT_SHARE)
+        visible = 0
+        char_pos = 0
+        # kind -> (char index, visible length before it) of the last boundary of that kind seen so far
+        best: Dict[str, Tuple[int, int]] = {}
+        hard_cut = len(processed_text)
+
+        for token in tokens:
+            if not token:
+                continue
+            if token.startswith("<") and token.endswith(">"):
+                char_pos += len(token)
+                continue
+            token_vis = cls._visible_units(token)
+            fits = visible + token_vis <= max_limit
+            usable = token if fits else token[:cls._hard_cut_in_token(token, max_limit - visible)]
+            for kind, pattern in cls._SPLIT_PATTERNS:
+                last = None
+                for last in pattern.finditer(usable):
+                    pass
+                if last is not None:
+                    best[kind] = (char_pos + last.start(), visible + cls._visible_units(usable[:last.start()]))
+            if fits and cls._SENTENCE_END_RE.search(token):
+                # A sentence that ends right before a tag ("...tugadi.</b>") is a sentence boundary too
+                best["sentence"] = (char_pos + len(token), visible + token_vis)
+            if not fits:
+                hard_cut = char_pos + len(usable)
+                break
+            visible += token_vis
+            char_pos += len(token)
+
+        for kind in ("para", "line", "sentence"):
+            if kind in best and best[kind][1] >= min_soft_visible:
+                return best[kind][0]
+        if "space" in best and best["space"][1] > 0:
+            return best["space"][0]
+        return hard_cut
+
     @classmethod
     def fit_caption_limit(cls, processed_text: str, max_limit: int = 1024, limit: Optional[int] = None) -> Tuple[str, Optional[str]]:
         """
         Fits caption text within Telegram's caption limit (1024 for standard Bot API, 2048 for Telegram Premium/Telethon).
-        Only splits if the VISIBLE plain text length exceeds max_limit.
-        Never splits when formatting tags (<b>, <a>, <tg-emoji>) inflate HTML size.
+        Only splits if the VISIBLE plain text length (UTF-16 units, tags excluded) exceeds max_limit, so
+        formatting tags (<b>, <a>, <tg-emoji>) never cause a split. The split point is chosen by
+        _find_split_index (paragraph > line > word > exact cut); formatting open at the split point is closed
+        in the caption and reopened in the overflow.
         """
         if limit is not None:
             max_limit = limit
@@ -435,55 +933,17 @@ class TextProcessor:
         if cls.get_visible_text_length(processed_text) <= max_limit:
             return cls.ensure_closed_tags(processed_text), None
 
-        # Visible text exceeds limit: tokenize to locate split point within visible text
-        tokens = re.split(r'(<[^>]+>)', processed_text)
-        current_visible_len = 0
-        cut_idx = len(processed_text)
-        char_pos = 0
-
-        for token in tokens:
-            if not token:
-                continue
-            if token.startswith("<") and token.endswith(">"):
-                char_pos += len(token)
-            else:
-                token_vis_len = len(html.unescape(token).encode('utf-16-le')) // 2
-                if current_visible_len + token_vis_len > max_limit:
-                    remaining_visible = max_limit - current_visible_len
-                    # Slice entity-aware so entities like &quot; aren't sliced in half or dropped
-                    accum_vis = 0
-                    cut_in_token = 0
-                    for part in re.split(r'(&[a-zA-Z0-9#]+;)', token):
-                        if not part:
-                            continue
-                        part_vis = len(html.unescape(part).encode('utf-16-le')) // 2
-                        if accum_vis + part_vis <= remaining_visible:
-                            accum_vis += part_vis
-                            cut_in_token += len(part)
-                        else:
-                            if part.startswith('&') and part.endswith(';'):
-                                break
-                            for ch in part:
-                                ch_vis = len(ch.encode('utf-16-le')) // 2
-                                if accum_vis + ch_vis <= remaining_visible:
-                                    accum_vis += ch_vis
-                                    cut_in_token += len(ch)
-                                else:
-                                    break
-                            break
-                    candidate = token[:cut_in_token]
-                    nl_pos = candidate.rfind("\n")
-                    sp_pos = candidate.rfind(" ")
-                    # Pick whichever boundary is furthest to maximize caption usage
-                    best_cut = max(nl_pos, sp_pos)
-                    if best_cut > 0:
-                        cut_idx = char_pos + best_cut
-                    else:
-                        cut_idx = char_pos + len(candidate)
-                    break
-                else:
-                    current_visible_len += token_vis_len
-                    char_pos += len(token)
+        cut_idx = cls._find_split_index(processed_text, max_limit)
+        # Closing tags right after the cut end formatting of the caption's text: they stay in the caption
+        # (otherwise the overflow would start with an empty re-opened element such as <b></b>)
+        closing = cls._LEADING_CLOSING_TAGS_RE.match(processed_text, cut_idx)
+        if closing:
+            cut_idx = closing.end()
+        # Opening tags right before the cut carry no text of the caption: they move to the overflow
+        # (an empty <tg-emoji></tg-emoji> or <a></a> in the caption would be rejected by Telegram)
+        dangling = re.search(r'(?:<[a-zA-Z][^>]*>\s*)+$', processed_text[:cut_idx])
+        if dangling and dangling.start() > 0:
+            cut_idx = dangling.start()
 
         caption_part = processed_text[:cut_idx].strip()
         overflow_part = processed_text[cut_idx:].strip()
@@ -526,8 +986,8 @@ class TextProcessor:
     def fit_text_limit(cls, processed_text: str, max_limit: int = 4096) -> List[str]:
         """
         Fits text message within Telegram's 4096-character limit.
-        Splits into multiple chunks only if visible plain text length exceeds 4096.
-        Ensures all chunks have properly closed HTML formatting tags.
+        Splits into multiple chunks only if visible plain text length exceeds 4096 (same split rules as
+        fit_caption_limit). Ensures all chunks have properly closed HTML formatting tags.
         """
         if not processed_text:
             return [""]
@@ -541,10 +1001,10 @@ class TextProcessor:
                 chunks.append(cls.ensure_closed_tags(remaining))
                 break
             caption_part, overflow_part = cls.fit_caption_limit(remaining, max_limit=max_limit)
-            if not caption_part:
-                chunks.append(cls.ensure_closed_tags(remaining[:max_limit]))
-                remaining = remaining[max_limit:]
-            else:
-                chunks.append(cls.ensure_closed_tags(caption_part))
-                remaining = overflow_part or ""
+            if not caption_part or overflow_part == remaining:
+                # No progress possible (should not happen): keep the rest as one last chunk
+                chunks.append(cls.ensure_closed_tags(remaining))
+                break
+            chunks.append(cls.ensure_closed_tags(caption_part))
+            remaining = overflow_part or ""
         return [c for c in chunks if c.strip()] or [cls.ensure_closed_tags(processed_text)]

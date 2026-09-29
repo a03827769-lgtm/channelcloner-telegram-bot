@@ -1,11 +1,16 @@
 import re
+import html
 import urllib.parse
 import logging
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from services.custom_emojis import ID_LINK, ID_CART, ID_BOX, ID_DOCUMENT, ID_COIN, ID_GIFT
 
 logger = logging.getLogger(__name__)
+
+_TAG_SPLIT_RE = re.compile(r'(<[^>]*>)')
+_HREF_RE = re.compile(r'(\bhref\s*=\s*)(?:"([^"]*)"|\'([^\']*)\')', re.IGNORECASE)
+
 
 class DynamicAffiliateEngine:
     """
@@ -14,8 +19,9 @@ class DynamicAffiliateEngine:
     and constructs high-converting Inline Keyboard CTA buttons.
     """
 
+    # Applied to UNESCAPED text, so a query string is never cut at the ';' of an '&amp;' entity
     URL_REGEX = re.compile(
-        r'https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)'
+        r'https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=;]*)'
     )
 
     MERCHANT_CTA_MAP = {
@@ -28,20 +34,78 @@ class DynamicAffiliateEngine:
         "bybit.com": ("Bybit bonusini olish", "bybit", ID_GIFT)
     }
 
+    @staticmethod
+    def _strip_trailing_punct(url: str) -> str:
+        return re.sub(r'[.,!?:;\'")]+$', '', url)
+
+    def _find_links(self, text: str) -> List[str]:
+        """Plain (unescaped) URLs found in anchor hrefs and in the visible text, in order of appearance."""
+        links: List[str] = []
+        for token in _TAG_SPLIT_RE.split(text):
+            if not token:
+                continue
+            if token.startswith("<") and token.endswith(">"):
+                m = _HREF_RE.search(token)
+                if m:
+                    href = html.unescape(m.group(2) if m.group(2) is not None else m.group(3))
+                    if href.startswith(("http://", "https://")):
+                        links.append(href)
+                continue
+            for url in self.URL_REGEX.findall(html.unescape(token)):
+                links.append(self._strip_trailing_punct(url))
+        return links
+
+    def _apply_rules(self, link: str, domain: str, affiliate_rules: str) -> str:
+        final_link = link
+        for rule in re.split(r'[\r\n,]+', affiliate_rules):
+            rule = rule.strip()
+            if "=>" in rule:
+                k, v = rule.split("=>", 1)
+            elif "->" in rule:
+                k, v = rule.split("->", 1)
+            elif "=" in rule:
+                k, v = rule.split("=", 1)
+            else:
+                continue
+            k, v = k.strip(), v.strip()
+            if k and k in domain:
+                if v.startswith("http://") or v.startswith("https://"):
+                    final_link = v
+                else:
+                    try:
+                        p_url = urllib.parse.urlparse(final_link)
+                        q_dict = urllib.parse.parse_qs(p_url.query)
+                        param_key = "ref"
+                        if "amazon." in domain:
+                            param_key = "tag"
+                        elif "aliexpress." in domain:
+                            param_key = "aff_id"
+                        elif "uzum." in domain:
+                            param_key = "p"
+                        q_dict[param_key] = [v]
+                        q_dict['utm_source'] = ['telegram_cloner']
+                        new_query = urllib.parse.urlencode(q_dict, doseq=True)
+                        final_link = urllib.parse.urlunparse(p_url._replace(query=new_query))
+                    except Exception as e:
+                        logger.debug(f"Error parsing affiliate url: {e}")
+        return final_link
+
     def extract_and_convert_links(self, text: str, affiliate_rules: str = "") -> Tuple[str, List[Tuple]]:
         """
-        Parses all URLs from the text, applies affiliate tag replacements,
+        Parses all URLs from the (Telegram-HTML) text, applies affiliate tag replacements,
         and returns the modified text along with a list of (button_label, target_url, icon_id).
+        URLs are unescaped before parsing; rewritten URLs are HTML-escaped when written back into the text,
+        while the button URLs stay plain.
         """
         if not text:
             return text, []
 
-        found_links = self.URL_REGEX.findall(text)
+        found_links = self._find_links(text)
         if not found_links:
             return text, []
 
         cta_buttons: List[Tuple] = []
-        modified_text = text
+        rewrites: Dict[str, str] = {}
 
         for link in found_links:
             parsed = urllib.parse.urlparse(link)
@@ -57,48 +121,15 @@ class DynamicAffiliateEngine:
                     break
 
             # Process affiliate rules if provided
-            final_link = link
-            if affiliate_rules:
-                for rule in re.split(r'[\r\n,]+', affiliate_rules):
-                    rule = rule.strip()
-                    if "=>" in rule:
-                        k, v = rule.split("=>", 1)
-                    elif "->" in rule:
-                        k, v = rule.split("->", 1)
-                    elif "=" in rule:
-                        k, v = rule.split("=", 1)
-                    else:
-                        continue
-                    k, v = k.strip(), v.strip()
-                    if k and k in domain:
-                        if v.startswith("http://") or v.startswith("https://"):
-                            final_link = v
-                        else:
-                            try:
-                                p_url = urllib.parse.urlparse(final_link)
-                                q_dict = urllib.parse.parse_qs(p_url.query)
-                                param_key = "ref"
-                                if "amazon." in domain:
-                                    param_key = "tag"
-                                elif "aliexpress." in domain:
-                                    param_key = "aff_id"
-                                elif "uzum." in domain:
-                                    param_key = "p"
-                                q_dict[param_key] = [v]
-                                q_dict['utm_source'] = ['telegram_cloner']
-                                new_query = urllib.parse.urlencode(q_dict, doseq=True)
-                                final_link = urllib.parse.urlunparse(p_url._replace(query=new_query))
-                            except Exception as e:
-                                logger.debug(f"Error parsing affiliate url: {e}")
-
+            final_link = self._apply_rules(link, domain, affiliate_rules) if affiliate_rules else link
             if final_link != link:
-                pattern = re.compile(r'(^|[\s"\'\(])' + re.escape(link) + r'($|[\s"\'\)])')
-                if pattern.search(modified_text):
-                    modified_text = pattern.sub(lambda m, fl=final_link: f"{m.group(1)}{fl}{m.group(2)}", modified_text)
-                else:
-                    modified_text = modified_text.replace(link, final_link)
+                rewrites[link] = final_link
 
             cta_buttons.append((button_label, final_link, button_icon))
+
+        modified_text = text
+        if rewrites:
+            modified_text = self._rewrite_text(text, rewrites)
 
         # Deduplicate buttons by target URL while preserving order
         unique_buttons = []
@@ -111,8 +142,34 @@ class DynamicAffiliateEngine:
 
         return modified_text, unique_buttons
 
-    def build_cta_keyboard(self, cta_buttons: List[Tuple]) -> Optional[InlineKeyboardMarkup]:
-        """Constructs an Aiogram InlineKeyboardMarkup from extracted CTA links with Bot API 9.4 styles"""
+    @staticmethod
+    def _rewrite_text(text: str, rewrites: Dict[str, str]) -> str:
+        """Writes rewritten URLs back into hrefs and visible text (escaped form in both)."""
+        escaped_rewrites = {html.escape(old, quote=True): html.escape(new, quote=True) for old, new in rewrites.items()}
+        escaped_rewrites.update({html.escape(old, quote=False): html.escape(new, quote=False) for old, new in rewrites.items()})
+        tokens = _TAG_SPLIT_RE.split(text)
+        for i, token in enumerate(tokens):
+            if not token:
+                continue
+            if token.startswith("<") and token.endswith(">"):
+                def _swap_href(m: re.Match) -> str:
+                    raw = m.group(2) if m.group(2) is not None else m.group(3)
+                    new = rewrites.get(html.unescape(raw))
+                    if new is None:
+                        return m.group(0)
+                    return f'{m.group(1)}"{html.escape(new, quote=True)}"'
+                tokens[i] = _HREF_RE.sub(_swap_href, token)
+                continue
+            for old, new in sorted(escaped_rewrites.items(), key=lambda kv: len(kv[0]), reverse=True):
+                pattern = re.compile(r'(^|[\s"\'\(])' + re.escape(old) + r'(?=$|[\s"\'\).,!?:;])')
+                token = pattern.sub(lambda m, fl=new: f"{m.group(1)}{fl}", token)
+            tokens[i] = token
+        return "".join(tokens)
+
+    def build_cta_keyboard(self, cta_buttons: List[Tuple], with_icons: bool = True) -> Optional[InlineKeyboardMarkup]:
+        """Constructs an Aiogram InlineKeyboardMarkup from extracted CTA links with Bot API 9.4 styles.
+
+        with_icons=False omits icon_custom_emoji_id: bots may not use custom emoji button icons in channel posts."""
         if not cta_buttons:
             return None
 
@@ -123,12 +180,10 @@ class DynamicAffiliateEngine:
             url = item[1]
             icon_id = item[2] if len(item) > 2 else ID_LINK
             if url and (url.startswith("http://") or url.startswith("https://") or url.startswith("tg://")):
-                keyboard.append([InlineKeyboardButton(
-                    text=label,
-                    url=url,
-                    style="primary",
-                    icon_custom_emoji_id=icon_id
-                )])
+                button_kwargs: Dict[str, Any] = {"text": label, "url": url, "style": "primary"}
+                if with_icons and icon_id:
+                    button_kwargs["icon_custom_emoji_id"] = icon_id
+                keyboard.append([InlineKeyboardButton(**button_kwargs)])
 
         return InlineKeyboardMarkup(inline_keyboard=keyboard) if keyboard else None
 

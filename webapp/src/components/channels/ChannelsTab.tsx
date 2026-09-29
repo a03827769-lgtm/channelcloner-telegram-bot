@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Plus, Search, Radio, Sliders, ArrowRight, X, ShieldCheck, Globe, Send, Image as ImageIcon, Check, Mic } from 'lucide-react';
+import { Plus, Search, Radio, Sliders, ArrowRight, X, ShieldCheck, Globe, Image as ImageIcon, Check, Mic } from 'lucide-react';
 import { ChannelPair } from '../../types';
 import { Switch } from '../ui/Switch';
 import { telegram } from '../../services/telegram';
@@ -91,16 +91,16 @@ export const ChannelsTab: React.FC<ChannelsTabProps> = ({
 
       {/* visionOS Segmented Control Container (From Images 1, 2, 4) */}
       <div className="vision-segmented-container animate-fade-up stagger-2">
-        {[
+        {([
           { id: 'all', label: `Barchasi (${pairs.length})` },
           { id: 'active', label: `Faol (${pairs.filter((p) => p.is_active).length})` },
           { id: 'paused', label: `To'xtatilgan (${pairs.filter((p) => !p.is_active).length})` },
-        ].map((f) => (
+        ] as const).map((f) => (
           <button
             key={f.id}
             onClick={() => {
               telegram.selection();
-              setStatusFilter(f.id as any);
+              setStatusFilter(f.id);
             }}
             className={`vision-segment-pill ${statusFilter === f.id ? 'active' : ''}`}
           >

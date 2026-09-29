@@ -1,5 +1,4 @@
 import unittest
-import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 from database.models import ChannelPair
 from services.text_processor import TextProcessor
@@ -46,11 +45,12 @@ class TestFixedIssuesE2E(unittest.IsolatedAsyncioTestCase):
 
         tl.resolve_entity = AsyncMock(return_value=MagicMock(id=999))
 
-        m3 = MagicMock(id=300, grouped_id=None)
-        m2_c = MagicMock(id=203, grouped_id=555)
-        m2_b = MagicMock(id=202, grouped_id=555)
-        m2_a = MagicMock(id=201, grouped_id=555)
-        m1 = MagicMock(id=100, grouped_id=None)
+        # Content messages (no service action)
+        m3 = MagicMock(id=300, grouped_id=None, action=None)
+        m2_c = MagicMock(id=203, grouped_id=555, action=None)
+        m2_b = MagicMock(id=202, grouped_id=555, action=None)
+        m2_a = MagicMock(id=201, grouped_id=555, action=None)
+        m1 = MagicMock(id=100, grouped_id=None, action=None)
 
         async def mock_iter_messages(*args, **kwargs):
             for msg in [m3, m2_c, m2_b, m2_a, m1]:
@@ -69,8 +69,10 @@ class TestFixedIssuesE2E(unittest.IsolatedAsyncioTestCase):
         async def mock_progress(cur, total, status):
             progress_records.append((cur, total, status))
 
+        # The run re-reads the pair before every post (a paused or deleted pair stops it): it stays active here
         with patch("services.cloner_engine.cloner_engine.clone_single_message", AsyncMock(return_value=True)), \
-             patch("services.cloner_engine.cloner_engine.clone_media_group", AsyncMock(return_value=True)):
+             patch("services.cloner_engine.cloner_engine.clone_media_group", AsyncMock(return_value=True)), \
+             patch.object(tl, "_current_pair", AsyncMock(return_value=pair)):
             
             result = await tl.clone_history(pair, limit=2, progress_callback=mock_progress)
 

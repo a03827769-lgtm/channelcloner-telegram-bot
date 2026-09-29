@@ -9,9 +9,7 @@ Validates:
 """
 
 import sys
-import os
 import json
-import asyncio
 import pytest
 import requests
 from pathlib import Path
@@ -25,7 +23,6 @@ from bot.keyboards.inline_buttons import (
     get_main_reply_keyboard,
     get_main_menu_keyboard
 )
-from services.tunnel_sync_service import tunnel_sync_service
 
 @pytest.mark.asyncio
 async def test_active_webapp_url_valid():

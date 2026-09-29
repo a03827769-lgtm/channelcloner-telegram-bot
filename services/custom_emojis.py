@@ -10,15 +10,32 @@ def tg_e(emoji_id: str, fallback: str) -> str:
     """Returns Telegram HTML Custom Emoji string: <tg-emoji emoji-id="...">...</tg-emoji>"""
     return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
 
+_ALERT_MAX_UTF16 = 195  # callback answers allow 200 characters, counted by Telegram in UTF-16 code units
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
 def clean_for_alert(text: str) -> str:
-    """Strips HTML tags like <tg-emoji> and truncates to 195 characters for safe callback.answer popups."""
+    """Strips HTML tags like <tg-emoji> and truncates to 195 UTF-16 code units (emoji count double) for safe
+    callback.answer popups."""
     if not text:
         return ""
     cleaned = re.sub(r'<tg-emoji\b[^>]*>(.*?)</tg-emoji>', r'\1', text, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r'<[^>]+>', '', cleaned)
     cleaned = html.unescape(cleaned).strip()
-    if len(cleaned) > 195:
-        cleaned = cleaned[:192] + "..."
+    if _utf16_len(cleaned) > _ALERT_MAX_UTF16:
+        budget = _ALERT_MAX_UTF16 - 3
+        out = []
+        used = 0
+        for ch in cleaned:
+            width = 2 if ord(ch) > 0xFFFF else 1
+            if used + width > budget:
+                break
+            out.append(ch)
+            used += width
+        cleaned = "".join(out) + "..."
     return cleaned
 
 # ==============================================================================

@@ -1,21 +1,11 @@
 # ==============================================================================
-# Telegram Channel Cloner - Install 24/7 Watchdog to Windows Startup
+# Telegram Channel Cloner - register the 24/7 watchdog autostart (Windows logon)
+# Thin wrapper: the single implementation is scripts\setup_autostart.py
+# (Startup-folder shortcut, non-elevated; removes legacy Run-key / scheduled-task entries).
+#   .\scripts\install_startup_watchdog.ps1           register
+#   .\scripts\install_startup_watchdog.ps1 --start   register and start the watchdog now
 # ==============================================================================
-
-$baseDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).ProviderPath
-$vbsPath = Join-Path $baseDir "scripts\start_watchdog_silently.vbs"
-$startupFolder = [System.Environment]::GetFolderPath('Startup')
-$shortcutPath = Join-Path $startupFolder "ChannelCloner_24_7_Watchdog.lnk"
-
-Write-Host "Installing 24/7 Keep-Awake Watchdog to Windows Startup..." -ForegroundColor Cyan
-
-$wshShell = New-Object -ComObject WScript.Shell
-$shortcut = $wshShell.CreateShortcut($shortcutPath)
-$shortcut.TargetPath = "wscript.exe"
-$shortcut.Arguments = "`"$vbsPath`""
-$shortcut.WorkingDirectory = $baseDir
-$shortcut.Description = "Telegram Channel Cloner 24/7 Background Keep-Awake & Auto-Recovery Watchdog"
-$shortcut.Save()
-
-Write-Host "[SUCCESS] Shortcut installed to: $shortcutPath" -ForegroundColor Green
-Write-Host "The Watchdog will now start automatically in background whenever you log into Windows." -ForegroundColor Yellow
+$ErrorActionPreference = "Stop"
+$python = (Get-Command python -ErrorAction Stop).Source
+& $python (Join-Path $PSScriptRoot "setup_autostart.py") install @args
+exit $LASTEXITCODE

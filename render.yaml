@@ -1,16 +1,43 @@
+# ==============================================================================
+# Render Blueprint — Telegram Channel Cloner
+#
+# SINGLE INSTANCE ONLY. A bot token and a Telethon session may be used by exactly
+# one process. Two overlapping instances (zero-downtime / rolling deploy, a second
+# instance, the same bot also running on another host) cause TelegramConflictError,
+# AUTH_KEY_DUPLICATED (the Telethon session gets revoked) and duplicate posts.
+#
+# Why this configuration is safe:
+#   * A persistent disk is attached: Render then stops the old instance before it
+#     starts the new one (no zero-downtime overlap) and never scales it out.
+#     Persistent disks require a paid plan — the free plan has no disk, so the
+#     SQLite database, payments and the vault key would be lost on every deploy.
+#   * autoDeploy is off: deploy deliberately from the dashboard (Manual Deploy)
+#     after the previous instance is confirmed stopped.
+#   * /ready (not /health) gates the deploy: it answers 503 until the bot is ready.
+#
+# Never run this service while the bot also runs anywhere else (Windows host,
+# Docker `docker-bot` profile, VPS).
+# ==============================================================================
 services:
   - type: web
     name: channelcloner-telegram-bot
     runtime: docker
-    plan: free
-    region: frankfurt # Frankfurt region for optimized Telegram MTProto connections
+    plan: starter            # paid plan: required for the persistent disk below
+    region: frankfurt
+    numInstances: 1
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    autoDeploy: true
-    healthCheckPath: /health
+    autoDeploy: false
+    healthCheckPath: /ready
+    disk:
+      name: cloner-data
+      mountPath: /app/data   # SQLite DB, vault key, logs and backups
+      sizeGB: 1
     envVars:
       - key: DB_PATH
-        value: database/cloner.db
+        value: /app/data/cloner.db
+      - key: VAULT_KEY_PATH
+        value: /app/data/.vault_key
       - key: TEMP_DOWNLOAD_DIR
         value: temp_media
       - key: BOT_TOKEN
@@ -23,5 +50,15 @@ services:
         sync: false
       - key: TELETHON_SESSION
         sync: false
+      - key: PRIMARY_SUPER_ADMIN_ID
+        sync: false
       - key: ADMIN_IDS
         sync: false
+      # Master key for sessions and backups. Set it explicitly and keep a copy outside Render:
+      # data encrypted with it cannot be recovered without it.
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: WEBAPP_URL
+        sync: false
+      - key: ENABLE_PLAYWRIGHT
+        value: "false"

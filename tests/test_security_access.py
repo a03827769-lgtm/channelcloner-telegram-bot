@@ -1,27 +1,43 @@
 import unittest
 import os
+import tempfile
 import uuid
+from unittest.mock import patch
 from config.settings import settings
 from database.db_manager import DatabaseManager
 from bot.filters.admin_filter import is_admin_user
 from bot.keyboards.inline_buttons import get_main_reply_keyboard, get_main_menu_keyboard, get_quickstart_keyboard
 
+# Fake Telegram IDs (never real accounts)
+ADMIN_A = 7100000001
+ADMIN_B = 7100000002
+REGULAR_USER = 7100000003
+
 class TestSecurityAndAccessControl(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        settings.ADMIN_IDS_RAW = "8881989487,1686689830"
-        self.test_db_path = f"temp_media/test_sec_access_{uuid.uuid4().hex[:8]}.db"
-        os.makedirs("temp_media", exist_ok=True)
+        # Patched with automatic restore, so the admin list never leaks into other tests
+        self._settings_patches = [
+            patch.object(settings, "ADMIN_IDS_RAW", f"{ADMIN_A},{ADMIN_B}"),
+            patch.object(settings, "PRIMARY_SUPER_ADMIN_ID", 0),
+        ]
+        for p in self._settings_patches:
+            p.start()
+        self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.test_db_path = os.path.join(self._tmp_dir.name, f"test_sec_access_{uuid.uuid4().hex[:8]}.db")
         self.db = DatabaseManager(self.test_db_path)
         await self.db.init_db()
 
     async def asyncTearDown(self):
         from tests.test_utils import safe_cleanup_db
         await safe_cleanup_db(self.test_db_path, self.db)
+        self._tmp_dir.cleanup()
+        for p in reversed(self._settings_patches):
+            p.stop()
 
     async def test_is_admin_user(self):
-        self.assertTrue(is_admin_user(8881989487))
-        self.assertTrue(is_admin_user(1686689830))
-        self.assertFalse(is_admin_user(8414426548))
+        self.assertTrue(is_admin_user(ADMIN_A))
+        self.assertTrue(is_admin_user(ADMIN_B))
+        self.assertFalse(is_admin_user(REGULAR_USER))
         self.assertFalse(is_admin_user(9999999999))
         self.assertFalse(is_admin_user(0))
         self.assertFalse(is_admin_user(None))
@@ -60,14 +76,14 @@ class TestSecurityAndAccessControl(unittest.IsolatedAsyncioTestCase):
 
     async def test_user_db_admin_sync(self):
         # Register regular user
-        user = await self.db.get_or_create_user(8414426548, "Regular User", "reg_user")
+        user = await self.db.get_or_create_user(REGULAR_USER, "Regular User", "reg_user")
         self.assertFalse(user.is_admin)
-        self.assertFalse(await self.db.is_user_admin(8414426548))
+        self.assertFalse(await self.db.is_user_admin(REGULAR_USER))
 
         # Register admin user
-        admin = await self.db.get_or_create_user(8881989487, "Admin User", "admin_user")
+        admin = await self.db.get_or_create_user(ADMIN_A, "Admin User", "admin_user")
         self.assertTrue(admin.is_admin)
-        self.assertTrue(await self.db.is_user_admin(8881989487))
+        self.assertTrue(await self.db.is_user_admin(ADMIN_A))
 
     async def test_user_stats_isolation(self):
         user_a = 111000

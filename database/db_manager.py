@@ -4,17 +4,20 @@ import os
 import shutil
 import logging
 import json
+import re
+import sqlite3
 import threading
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any, Tuple, Set
 from database.models import (
-    User, ChannelPair, ClonedMessage, Subscription, Payment,
-    StorySettings, PostedStory, StorySourceChannel, StoryQueueItem
+    User, ChannelPair, Subscription, StorySettings, StorySourceChannel, StoryQueueItem,
+    SupplierConfig, StoreProduct, StoreOrder
 )
 from services.security_vault import security_vault
 from services.cache_manager import cache_manager
-from config.settings import settings
+from config.settings import settings, PROJECT_ROOT
+from config.plans import TIER_RANK, TRIAL_DAYS, daily_price
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +61,16 @@ class ReentrantAsyncLock:
         self.release()
 
 class DatabaseManager:
+    # Bumped whenever init_db gains a migration; stored in PRAGMA user_version.
+    SCHEMA_VERSION = 3
+
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path or getattr(settings, "DB_PATH", "database/cloner.db")
         self._conn: Optional[aiosqlite.Connection] = None
         self._init_lock = asyncio.Lock()
         self._write_lock = ReentrantAsyncLock()
         self._admin_cache: Set[int] = set()
+        self._closed_final = False
 
     def _notify_pair_cache_invalidated(self):
         try:
@@ -74,6 +81,8 @@ class DatabaseManager:
 
     async def _ensure_connected(self) -> aiosqlite.Connection:
         """Ensures a single persistent connection exists. Lock only guards initialization."""
+        if self._closed_final:
+            raise RuntimeError("Database manager has been shut down")
         if self._conn is None:
             async with self._init_lock:
                 # Double-check after acquiring lock
@@ -109,22 +118,35 @@ class DatabaseManager:
 
     @asynccontextmanager
     async def write_transaction(self):
-        """Yields the connection guarded by ReentrantAsyncLock to guarantee serialized SQLite writes."""
+        """Serialized write transaction on the shared connection.
+
+        Commits when the block exits normally and rolls back on any exception, so no statement is ever
+        left pending on the shared connection (where a later rollback by another writer would discard it).
+        Nested use inside the same task joins the outer transaction; only the outermost block commits."""
         async with self._write_lock:
             conn = await self._ensure_connected()
+            outermost = self._write_lock._depth == 1
             try:
                 yield conn
-            except Exception:
-                try:
-                    await conn.rollback()
-                except Exception:
-                    logger.debug("Ignored exception", exc_info=True)
+            except BaseException:
+                if outermost:
+                    try:
+                        await conn.rollback()
+                    except Exception:
+                        logger.debug("Rollback on write_transaction exception failed or not needed", exc_info=True)
                 raise
+            else:
+                if outermost and conn.in_transaction:
+                    await conn.commit()
 
-    async def close(self):
-        """Closes the underlying persistent SQLite connection safely waiting for write lock"""
+    async def close(self, final: bool = False):
+        """Closes the shared SQLite connection. With final=True (application shutdown) any later database
+        call raises instead of silently reopening a connection whose worker thread would keep the
+        process alive."""
         async with self._write_lock:
             async with self._init_lock:
+                if final:
+                    self._closed_final = True
                 if self._conn is not None:
                     try:
                         await self._conn.close()
@@ -146,6 +168,32 @@ class DatabaseManager:
                 await db.execute("PRAGMA wal_checkpoint(PASSIVE);")
         except Exception as e:
             logger.warning(f"WAL checkpoint non-fatal notice: {e}")
+
+    @staticmethod
+    async def _ensure_columns(db: aiosqlite.Connection, table: str, columns: List[Tuple[str, str]]) -> None:
+        """Adds the missing columns of `table` (checked through PRAGMA table_info, so nothing fails on reruns)."""
+        cursor = await db.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in await cursor.fetchall()}
+        for col, col_type in columns:
+            if col not in existing:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                existing.add(col)
+
+    @staticmethod
+    async def _create_unique_index(db: aiosqlite.Connection, name: str, table: str, columns: str, dedupe_sql: str) -> None:
+        """Creates a UNIQUE index required by ON CONFLICT upserts, removing legacy duplicates first.
+        Failure is fatal: without the index every upsert on that table would raise at runtime."""
+        cur = await db.execute("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?", (name,))
+        if await cur.fetchone():
+            return
+        await db.execute(dedupe_sql)
+        await db.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {table}({columns})")
+
+    @staticmethod
+    async def _get_schema_version(db: aiosqlite.Connection) -> int:
+        cursor = await db.execute("PRAGMA user_version")
+        row = await cursor.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
 
     async def init_db(self):
         """Initialize database tables, subscriptions, payments, indexes and vault"""
@@ -245,10 +293,6 @@ class DatabaseManager:
                     FOREIGN KEY (pair_id) REFERENCES channel_pairs (id) ON DELETE CASCADE
                 )
             """)
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_cloned_messages_pair_src ON cloned_messages (pair_id, source_msg_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_cloned_messages_src_chan_msg ON cloned_messages (source_channel, source_msg_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_cloned_messages_cloned_at ON cloned_messages (cloned_at)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_channel_pairs_user ON channel_pairs (user_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_channel_pairs_source ON channel_pairs (source_channel)")
 
             await db.execute("""
@@ -360,16 +404,8 @@ class DatabaseManager:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_posted_stories_chan_msg ON posted_stories (source_channel, source_msg_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_posted_stories_user_status ON posted_stories (user_id, status, id)")
 
-            # Dynamic column migrations for posted_stories grouped_id
-            try:
-                await db.execute("ALTER TABLE posted_stories ADD COLUMN grouped_id INTEGER DEFAULT NULL")
-            except Exception:
-                logger.debug("Ignored exception", exc_info=True)
-
-            try:
-                await db.execute("CREATE INDEX IF NOT EXISTS idx_posted_stories_group ON posted_stories (user_id, grouped_id)")
-            except Exception:
-                logger.debug("Ignored exception", exc_info=True)
+            await self._ensure_columns(db, "posted_stories", [("grouped_id", "INTEGER DEFAULT NULL")])
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_posted_stories_group ON posted_stories (user_id, grouped_id)")
 
             # Multi-channel source subscriptions
             await db.execute("""
@@ -451,19 +487,11 @@ class DatabaseManager:
                 ("video_duration", "INTEGER DEFAULT 25"),
                 ("enable_ai_voice", "INTEGER DEFAULT 1")
             ]
-            for col, col_type in story_settings_cols:
-                try:
-                    await db.execute(f"ALTER TABLE story_settings ADD COLUMN {col} {col_type}")
-                except Exception as e_col:
-                    if "duplicate column" not in str(e_col).lower():
-                        pass
+            await self._ensure_columns(db, "story_settings", story_settings_cols)
 
-            # Dynamic column migrations for users
-            try:
-                await db.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0")
-            except Exception as e_bl:
-                if "duplicate column" not in str(e_bl).lower():
-                    logger.debug(f"Column is_blocked migration note: {e_bl}")
+            # users: is_blocked + admin_source ('granted' for admins promoted from the admin bot;
+            # environment super admins are recognised dynamically and never persisted)
+            await self._ensure_columns(db, "users", [("is_blocked", "INTEGER DEFAULT 0"), ("admin_source", "TEXT DEFAULT NULL")])
 
             # Migrations for dynamic columns
             sub_columns = [
@@ -471,12 +499,7 @@ class DatabaseManager:
                 ("trial_notified", "INTEGER DEFAULT 0"),
                 ("paid_notified", "INTEGER DEFAULT 0")
             ]
-            for col, col_type in sub_columns:
-                try:
-                    await db.execute(f"ALTER TABLE subscriptions ADD COLUMN {col} {col_type}")
-                except Exception as e:
-                    if "duplicate column" not in str(e).lower():
-                        logger.debug(f"Column {col} migration note: {e}")
+            await self._ensure_columns(db, "subscriptions", sub_columns)
 
             pair_columns = [
                 ("source_id", "INTEGER"),
@@ -505,14 +528,12 @@ class DatabaseManager:
                 ("source_topic_id", "INTEGER DEFAULT NULL"),
                 ("target_topic_id", "INTEGER DEFAULT NULL"),
                 ("ad_action", "TEXT DEFAULT 'clean'"),
-                ("show_caption_above", "INTEGER DEFAULT 0")
+                ("show_caption_above", "INTEGER DEFAULT 0"),
+                # 1 = the owner paused the pair; 0 = active or suspended only for billing reasons.
+                # Renewals re-activate billing-suspended pairs but never ones the owner paused.
+                ("paused_by_user", "INTEGER DEFAULT 0"),
             ]
-            for col, col_type in pair_columns:
-                try:
-                    await db.execute(f"ALTER TABLE channel_pairs ADD COLUMN {col} {col_type}")
-                except Exception as e:
-                    if "duplicate column" not in str(e).lower():
-                        logger.debug(f"Column {col} migration note: {e}")
+            await self._ensure_columns(db, "channel_pairs", pair_columns)
 
             # Backfill 14-day trial_expires_at for existing users if null
             try:
@@ -524,103 +545,85 @@ class DatabaseManager:
             except Exception:
                 logger.debug("Ignored exception", exc_info=True)
 
-            try:
-                await db.execute("ALTER TABLE cloned_messages ADD COLUMN media_type TEXT DEFAULT 'text'")
-            except Exception:
-                logger.debug("Ignored exception", exc_info=True)
-
-            cloned_msg_cols = [
+            await self._ensure_columns(db, "cloned_messages", [
+                ("media_type", "TEXT DEFAULT 'text'"),
                 ("source_channel", "TEXT"),
                 ("target_channel", "TEXT"),
                 ("story_id", "INTEGER"),
                 ("status", "TEXT DEFAULT 'active'"),
                 ("price", "REAL DEFAULT 0.0"),
-                ("last_caption", "TEXT")
-            ]
-            for col, col_type in cloned_msg_cols:
-                try:
-                    await db.execute(f"ALTER TABLE cloned_messages ADD COLUMN {col} {col_type}")
-                except Exception:
-                    logger.debug("Ignored exception", exc_info=True)
-
-            try:
-                await db.execute("ALTER TABLE drip_queue ADD COLUMN error_message TEXT")
-            except Exception:
-                logger.debug("Ignored exception", exc_info=True)
-
-            try:
-                await db.execute("ALTER TABLE channel_backups ADD COLUMN media_group_id TEXT")
-            except Exception:
-                logger.debug("Ignored exception", exc_info=True)
-
-            try:
-                await db.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0")
-            except Exception:
-                logger.debug("Ignored exception", exc_info=True)
+                ("last_caption", "TEXT"),
+            ])
+            await self._ensure_columns(db, "drip_queue", [("error_message", "TEXT")])
+            await self._ensure_columns(db, "channel_backups", [("media_group_id", "TEXT")])
 
             await db.execute("CREATE INDEX IF NOT EXISTS idx_pairs_user ON channel_pairs(user_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_pairs_active ON channel_pairs(is_active)")
-            cur_cloned_idx = await db.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_cloned_unique_pair_msg'")
-            if not await cur_cloned_idx.fetchone():
-                try:
-                    await db.execute("""
-                        DELETE FROM cloned_messages
-                        WHERE id NOT IN (
-                            SELECT MAX(id)
-                            FROM cloned_messages
-                            GROUP BY pair_id, source_msg_id
-                        )
-                    """)
-                    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cloned_unique_pair_msg ON cloned_messages(pair_id, source_msg_id)")
-                except Exception as e:
-                    logger.warning(f"Failed to create idx_cloned_unique_pair_msg: {e}")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_pairs_source_id ON channel_pairs(source_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_pairs_target_id ON channel_pairs(target_id)")
+
+            # UNIQUE indexes backing the ON CONFLICT upserts — required, so failures abort init.
+            await self._create_unique_index(
+                db, "idx_cloned_unique_pair_msg", "cloned_messages", "pair_id, source_msg_id",
+                "DELETE FROM cloned_messages WHERE id NOT IN (SELECT MAX(id) FROM cloned_messages GROUP BY pair_id, source_msg_id)"
+            )
+            await self._create_unique_index(
+                db, "idx_backups_pair_msg", "channel_backups", "pair_id, message_id",
+                "DELETE FROM channel_backups WHERE id NOT IN (SELECT MAX(id) FROM channel_backups GROUP BY pair_id, message_id)"
+            )
             await db.execute("CREATE INDEX IF NOT EXISTS idx_cloned_media_group ON cloned_messages(pair_id, media_group_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_cloned_time ON cloned_messages(cloned_at)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_cloned_source_chan_msg ON cloned_messages(source_channel, source_msg_id)")
-            cur_bkp_idx = await db.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_backups_pair_msg'")
-            if not await cur_bkp_idx.fetchone():
-                try:
-                    await db.execute("""
-                        DELETE FROM channel_backups
-                        WHERE id NOT IN (
-                            SELECT MAX(id)
-                            FROM channel_backups
-                            GROUP BY pair_id, message_id
-                        )
-                    """)
-                    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_backups_pair_msg ON channel_backups(pair_id, message_id)")
-                except Exception as e:
-                    logger.warning(f"Failed to create idx_backups_pair_msg: {e}")
-            try:
-                await db.execute("""
-                    CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_charge_id 
-                    ON payments(telegram_payment_charge_id) 
-                    WHERE telegram_payment_charge_id IS NOT NULL 
-                      AND telegram_payment_charge_id != ''
-                      AND telegram_payment_charge_id NOT LIKE 'admin_manual_grant_%'
-                """)
-            except Exception as e_pay_idx:
-                logger.warning(f"Failed to create idx_payments_charge_id: {e_pay_idx}")
-            # Ensure all configured admins have permanent VIP tier and is_admin=1
-            for admin_id in settings.admin_ids:
-                try:
-                    await db.execute(
-                        "INSERT INTO users (user_id, full_name, username, is_admin) VALUES (?, 'Super Admin', 'admin', 1) "
-                        "ON CONFLICT(user_id) DO UPDATE SET is_admin = 1",
-                        (admin_id,)
-                    )
-                    await db.execute(
-                        "INSERT INTO subscriptions (user_id, tier, expires_at) VALUES (?, 'vip', '2099-12-31T23:59:59') "
-                        "ON CONFLICT(user_id) DO UPDATE SET tier = 'vip', expires_at = '2099-12-31T23:59:59'",
-                        (admin_id,)
-                    )
-                except Exception:
-                    logger.debug("Ignored exception", exc_info=True)
+            # Edit/delete sync and own-post (loop) detection look messages up by the target post id
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_cloned_target_msg ON cloned_messages(target_msg_id)")
+            # Legacy duplicates of the indexes above (same columns under another name) only slowed down inserts
+            for legacy_index in ("idx_cloned_messages_pair_src", "idx_cloned_lookup", "idx_cloned_messages_src_chan_msg",
+                                 "idx_cloned_messages_cloned_at", "idx_channel_pairs_user"):
+                await db.execute(f"DROP INDEX IF EXISTS {legacy_index}")
+
+            await db.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_charge_id
+                ON payments(telegram_payment_charge_id)
+                WHERE telegram_payment_charge_id IS NOT NULL
+                  AND telegram_payment_charge_id != ''
+                  AND telegram_payment_charge_id NOT LIKE 'admin_manual_grant_%'
+            """)
+
+            # Environment super admins are recognised dynamically (settings.admin_ids) and get a synthetic
+            # VIP plan from get_user_subscription(); nothing about them is persisted any more. Rows written by
+            # the old seeding (is_admin = 1 and a 2099 VIP plan) must not outlive a removal from ADMIN_IDS.
+            env_admin_ids = sorted(settings.admin_ids)
+            # An empty IN () list is invalid SQL; an empty sub-select keeps NOT IN / IN semantics correct.
+            env_placeholders = ",".join("?" * len(env_admin_ids)) if env_admin_ids else "SELECT NULL WHERE 0"
+            if await self._get_schema_version(db) < 3:
+                # One-time: admins that exist in the DB but not in the environment were promoted in the admin bot.
+                await db.execute(
+                    f"UPDATE users SET admin_source = 'granted' WHERE is_admin = 1 AND admin_source IS NULL "
+                    f"AND user_id NOT IN ({env_placeholders})",
+                    env_admin_ids
+                )
+                await db.execute(
+                    f"UPDATE users SET admin_source = 'env' WHERE is_admin = 1 AND admin_source IS NULL "
+                    f"AND user_id IN ({env_placeholders})",
+                    env_admin_ids
+                )
+            # Former environment admins (seeded, not granted) lose the admin flag and the seeded lifetime VIP plan.
+            await db.execute(
+                f"UPDATE users SET is_admin = 0, admin_source = NULL WHERE admin_source = 'env' "
+                f"AND user_id NOT IN ({env_placeholders})",
+                env_admin_ids
+            )
+            await db.execute(
+                f"UPDATE subscriptions SET tier = 'free', expires_at = NULL "
+                f"WHERE expires_at = '2099-12-31T23:59:59' AND user_id NOT IN ({env_placeholders})",
+                env_admin_ids
+            )
 
             await db.commit()
 
-            # Populate admin cache
-            self._admin_cache = set(settings.admin_ids)
+            # Admin cache: delegated (database-granted) admins only; environment super admins are checked
+            # against settings.admin_ids directly, so removing one from the configuration takes effect
+            self._admin_cache = set()
             try:
                 cur_admins = await db.execute("SELECT user_id FROM users WHERE is_admin = 1")
                 admin_rows = await cur_admins.fetchall()
@@ -628,6 +631,70 @@ class DatabaseManager:
                     self._admin_cache.add(ar[0])
             except Exception:
                 logger.debug("Ignored exception", exc_info=True)
+
+            # --- SUPPLIER & STORE TABLES ---
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS supplier_configs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider_name TEXT NOT NULL DEFAULT 'Standard SMM/Reseller API',
+                    api_url TEXT NOT NULL DEFAULT 'https://justanotherpanel.com/api/v2',
+                    api_key TEXT NOT NULL DEFAULT '',
+                    margin_percent REAL DEFAULT 25.0,
+                    balance REAL DEFAULT 0.0,
+                    currency TEXT DEFAULT 'USD',
+                    last_synced_at TIMESTAMP,
+                    is_active INTEGER DEFAULT 1
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS store_products (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    supplier_id INTEGER NOT NULL DEFAULT 1,
+                    supplier_service_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    category TEXT DEFAULT 'Telegram',
+                    type TEXT DEFAULT 'Default',
+                    supplier_rate REAL DEFAULT 0.0,
+                    selling_price_stars INTEGER DEFAULT 50,
+                    min_quantity INTEGER DEFAULT 10,
+                    max_quantity INTEGER DEFAULT 10000,
+                    is_available INTEGER DEFAULT 1,
+                    stock_status TEXT DEFAULT 'in_stock',
+                    description TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_store_products_supplier ON store_products(supplier_id, supplier_service_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_store_products_avail ON store_products(is_available, stock_status)")
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS store_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    product_id INTEGER NOT NULL,
+                    product_name TEXT DEFAULT '',
+                    quantity INTEGER DEFAULT 1,
+                    price_stars INTEGER DEFAULT 0,
+                    target_link TEXT DEFAULT '',
+                    supplier_order_id INTEGER DEFAULT NULL,
+                    status TEXT DEFAULT 'completed',
+                    admin_notified INTEGER DEFAULT 0,
+                    note TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_store_orders_user ON store_orders(user_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_store_orders_status ON store_orders(status)")
+
+            # Seed default supplier config if empty
+            cur_sup = await db.execute("SELECT id FROM supplier_configs LIMIT 1")
+            if not await cur_sup.fetchone():
+                await db.execute("""
+                    INSERT INTO supplier_configs (provider_name, api_url, api_key, margin_percent, balance, is_active)
+                    VALUES ('Standard Reseller API', 'https://justanotherpanel.com/api/v2', '', 25.0, 0.0, 1)
+                """)
 
             # Automatically deduplicate redundant channel pairs and clean invalid loop pairs
             await self._deduplicate_existing_pairs(db)
@@ -638,7 +705,8 @@ class DatabaseManager:
             if rows:
                 await cache_manager.dedup_cache.add_batch((r[0], r[1]) for r in rows)
 
-            logger.info(f"Database initialized for 100k high-load. Preloaded {len(rows)} message IDs into LRU cache.")
+            await db.execute(f"PRAGMA user_version = {int(self.SCHEMA_VERSION)}")
+            logger.info(f"Database initialized (schema v{self.SCHEMA_VERSION}). Preloaded {len(rows)} message IDs into the dedup cache.")
 
     # --- SUBSCRIPTIONS & TELEGRAM STARS ---
 
@@ -651,6 +719,20 @@ class DatabaseManager:
             return True
         sub = await self.get_user_subscription(user_id)
         return bool(sub and sub.is_vip)
+
+    @staticmethod
+    def _row_to_subscription(row: Any) -> Subscription:
+        keys = row.keys()
+        return Subscription(
+            user_id=row["user_id"],
+            tier=row["tier"] or "free",
+            expires_at=row["expires_at"],
+            trial_expires_at=row["trial_expires_at"] if "trial_expires_at" in keys else None,
+            trial_notified=bool(row["trial_notified"]) if "trial_notified" in keys else False,
+            paid_notified=bool(row["paid_notified"]) if "paid_notified" in keys else False,
+            stars_spent=row["stars_spent"] or 0,
+            created_at=row["created_at"]
+        )
 
     async def get_user_subscription(self, user_id: int) -> Subscription:
         if user_id in settings.admin_ids or self.is_admin_sync(user_id):
@@ -668,69 +750,77 @@ class DatabaseManager:
         if cached:
             return cached
 
+        for _attempt in range(3):
+            async with self.get_connection() as db:
+                cursor = await db.execute("SELECT * FROM subscriptions WHERE user_id = ?", (user_id,))
+                row = await cursor.fetchone()
+
+            if not row:
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                trial_exp = (now + timedelta(days=TRIAL_DAYS)).isoformat()
+                async with self.write_transaction() as wdb:
+                    await wdb.execute(
+                        "INSERT OR IGNORE INTO users (user_id, full_name) VALUES (?, ?)",
+                        (user_id, f"User {user_id}")
+                    )
+                    await wdb.execute(
+                        "INSERT INTO subscriptions (user_id, tier, trial_expires_at) VALUES (?, 'free', ?) "
+                        "ON CONFLICT(user_id) DO NOTHING",
+                        (user_id, trial_exp)
+                    )
+                continue  # re-read what is actually stored (another task may have created it first)
+
+            sub = self._row_to_subscription(row)
+
+            if not sub.trial_expires_at and sub.created_at:
+                c_date = Subscription._parse_iso_to_utc_naive(sub.created_at)
+                if c_date:
+                    trial_exp = (c_date + timedelta(days=TRIAL_DAYS)).isoformat()
+                    async with self.write_transaction() as wdb:
+                        await wdb.execute(
+                            "UPDATE subscriptions SET trial_expires_at = ? WHERE user_id = ? AND trial_expires_at IS NULL",
+                            (trial_exp, user_id)
+                        )
+                    sub.trial_expires_at = trial_exp
+
+            if not sub.is_active:
+                # Lazily suspend an expired plan. Compare-and-set against the row we read: when a renewal
+                # committed in between, nothing is changed and the fresh row is read again.
+                if not await self._suspend_expired_subscription(user_id, row):
+                    continue
+                sub.tier = "free"
+
+            await cache_manager.sub_cache.set(f"sub_{user_id}", sub)
+            return sub
+
+        # Extremely contended: return the current state without caching it
         async with self.get_connection() as db:
-            db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM subscriptions WHERE user_id = ?", (user_id,))
             row = await cursor.fetchone()
+        return self._row_to_subscription(row) if row else Subscription(user_id=user_id)
 
-        if row:
-            keys = row.keys()
-            trial_exp = row["trial_expires_at"] if "trial_expires_at" in keys else None
-            trial_notified = bool(row["trial_notified"]) if "trial_notified" in keys else False
-            paid_notified = bool(row["paid_notified"]) if "paid_notified" in keys else False
-            
-            # If trial_expires_at is null, set to created_at + 14 days
-            if not trial_exp and row["created_at"]:
-                try:
-                    c_date = datetime.fromisoformat(row["created_at"].replace(" ", "T"))
-                    trial_exp = (c_date + timedelta(days=14)).isoformat()
-                    async with self.write_transaction() as wdb:
-                        await wdb.execute("UPDATE subscriptions SET trial_expires_at = ? WHERE user_id = ?", (trial_exp, user_id))
-                        await wdb.commit()
-                except Exception:
-                    logger.debug("Ignored exception", exc_info=True)
-
-            sub = Subscription(
-                user_id=row["user_id"],
-                tier=row["tier"],
-                expires_at=row["expires_at"],
-                trial_expires_at=trial_exp,
-                trial_notified=trial_notified,
-                paid_notified=paid_notified,
-                stars_spent=row["stars_spent"],
-                created_at=row["created_at"]
+    async def _suspend_expired_subscription(self, user_id: int, observed_row: Any) -> bool:
+        """Downgrades an expired paid plan to free and suspends the user's pairs (billing suspension —
+        pairs the owner paused keep paused_by_user = 1). Returns False when the subscription changed
+        after `observed_row` was read, in which case nothing is modified."""
+        async with self.write_transaction() as wdb:
+            cursor = await wdb.execute(
+                "SELECT tier, expires_at, trial_expires_at FROM subscriptions WHERE user_id = ?", (user_id,)
             )
-            if sub.tier != "free" and not sub.is_active:
-                async with self.write_transaction() as wdb:
-                    await wdb.execute("UPDATE subscriptions SET tier = 'free' WHERE user_id = ?", (user_id,))
-                    await wdb.execute("UPDATE channel_pairs SET is_active = 0 WHERE user_id = ?", (user_id,))
-                    await wdb.commit()
-                self._notify_pair_cache_invalidated()
-                sub.tier = "free"
-            elif not sub.is_active:
-                async with self.write_transaction() as wdb:
-                    await wdb.execute("UPDATE channel_pairs SET is_active = 0 WHERE user_id = ?", (user_id,))
-                    await wdb.commit()
-                self._notify_pair_cache_invalidated()
-            await cache_manager.sub_cache.set(f"sub_{user_id}", sub)
-            return sub
-        else:
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            trial_exp = (now + timedelta(days=14)).isoformat()
-            async with self.write_transaction() as wdb:
-                await wdb.execute(
-                    "INSERT OR IGNORE INTO users (user_id, full_name) VALUES (?, ?)",
-                    (user_id, f"User {user_id}")
-                )
-                await wdb.execute(
-                    "INSERT INTO subscriptions (user_id, tier, trial_expires_at) VALUES (?, 'free', ?) "
-                    "ON CONFLICT(user_id) DO NOTHING",
-                    (user_id, trial_exp)
-                )
-                await wdb.commit()
-            sub = Subscription(user_id=user_id, tier="free", trial_expires_at=trial_exp, created_at=now.isoformat())
-            await cache_manager.sub_cache.set(f"sub_{user_id}", sub)
-            return sub
+            current = await cursor.fetchone()
+            if not current or (current[0], current[1], current[2]) != (
+                observed_row["tier"], observed_row["expires_at"], observed_row["trial_expires_at"]
+            ):
+                return False
+            if current[0] != "free":
+                await wdb.execute("UPDATE subscriptions SET tier = 'free' WHERE user_id = ?", (user_id,))
+            cur_pairs = await wdb.execute(
+                "UPDATE channel_pairs SET is_active = 0 WHERE user_id = ? AND is_active = 1", (user_id,)
+            )
+            deactivated = (cur_pairs.rowcount or 0) > 0
+        if deactivated:
+            self._notify_pair_cache_invalidated()
+        return True
 
     async def is_payment_processed(self, charge_id: str) -> bool:
         """Checks whether a Telegram Stars payment charge_id has already been recorded in payments"""
@@ -740,6 +830,63 @@ class DatabaseManager:
             cursor = await db.execute("SELECT 1 FROM payments WHERE telegram_payment_charge_id = ?", (charge_id,))
             return bool(await cursor.fetchone())
 
+    @staticmethod
+    def _plan_period_after_purchase(
+        now: datetime,
+        current_tier: str,
+        current_exp: Optional[datetime],
+        bought_tier: str,
+        days: int
+    ) -> Tuple[str, datetime]:
+        """Tier and expiry after buying `days` of `bought_tier`.
+
+        * nothing active / same tier: time is added on top of what is left;
+        * upgrade (Pro -> VIP): the upgrade starts now and the unused Pro time is converted to VIP time
+          at the price ratio, so nobody gets VIP days for Pro money;
+        * lower tier bought while a higher one is active: the higher tier is kept and the purchased time
+          is converted at the price ratio — a purchase never downgrades an active plan.
+        """
+        active = current_tier in ("pro", "vip") and current_exp is not None and current_exp > now
+        if not active:
+            return bought_tier, now + timedelta(days=days)
+        if current_tier == bought_tier:
+            return bought_tier, current_exp + timedelta(days=days)
+        current_rate, bought_rate = daily_price(current_tier), daily_price(bought_tier)
+        if TIER_RANK.get(bought_tier, 0) > TIER_RANK.get(current_tier, 0):
+            remaining = current_exp - now
+            credit = remaining * (current_rate / bought_rate) if bought_rate else timedelta(0)
+            return bought_tier, now + timedelta(days=days) + credit
+        credit_days = days * (bought_rate / current_rate) if current_rate else 0.0
+        return current_tier, current_exp + timedelta(days=credit_days)
+
+    async def _apply_plan_limits(self, db: aiosqlite.Connection, user_id: int, max_channels: int) -> None:
+        """Inside an open write transaction: re-activates billing-suspended pairs up to the plan limit
+        (oldest first, never pairs the owner paused) and suspends active pairs above the limit."""
+        if max_channels > 0:
+            await db.execute("""
+                UPDATE channel_pairs SET is_active = 1
+                WHERE id IN (
+                    SELECT id FROM channel_pairs
+                    WHERE user_id = ? AND COALESCE(paused_by_user, 0) = 0
+                    ORDER BY id ASC LIMIT ?
+                )
+            """, (user_id, max_channels))
+        await db.execute("""
+            UPDATE channel_pairs SET is_active = 0
+            WHERE user_id = ? AND is_active = 1 AND id NOT IN (
+                SELECT id FROM channel_pairs WHERE user_id = ? AND is_active = 1 ORDER BY id ASC LIMIT ?
+            )
+        """, (user_id, user_id, max(0, max_channels)))
+
+    async def enforce_plan_limits(self, user_id: int) -> None:
+        """Brings the number of active pairs in line with the user's current plan."""
+        if user_id in settings.admin_ids or await self.is_admin(user_id):
+            return
+        sub = await self.get_user_subscription(user_id)
+        async with self.write_transaction() as db:
+            await self._apply_plan_limits(db, user_id, sub.max_channels)
+        self._notify_pair_cache_invalidated()
+
     async def activate_subscription(
         self,
         user_id: int,
@@ -748,161 +895,160 @@ class DatabaseManager:
         charge_id: str,
         days: int = 30
     ) -> Subscription:
-        await cache_manager.sub_cache.delete(f"sub_{user_id}")
-        is_duplicate = False
-        if charge_id and not charge_id.startswith("admin_manual_grant_"):
-            async with self.get_connection() as db_ro:
-                cur_chk = await db_ro.execute("SELECT 1 FROM payments WHERE telegram_payment_charge_id = ?", (charge_id,))
-                if await cur_chk.fetchone():
+        """Records a payment (idempotent on charge_id) and extends the user's plan.
+        tier "free" is the paid private-mode unlock: it extends the trial window only."""
+        if tier not in ("free", "pro", "vip"):
+            raise ValueError(f"Unknown subscription tier: {tier!r}")
+        days = max(1, int(days))
+        is_admin_grant = bool(charge_id) and charge_id.startswith("admin_manual_grant_")
+
+        async with self.write_transaction() as db:
+            await db.execute("INSERT OR IGNORE INTO users (user_id, full_name) VALUES (?, ?)", (user_id, f"User {user_id}"))
+            try:
+                await db.execute(
+                    "INSERT INTO payments (user_id, telegram_payment_charge_id, amount, tier) VALUES (?, ?, ?, ?)",
+                    (user_id, charge_id, stars, tier)
+                )
+            except sqlite3.IntegrityError:
+                cur_dup = await db.execute(
+                    "SELECT 1 FROM payments WHERE telegram_payment_charge_id = ?", (charge_id,)
+                )
+                if not is_admin_grant and await cur_dup.fetchone():
                     logger.warning(f"Payment charge_id {charge_id} already processed. Skipping duplicate activation.")
-                    return await self.get_user_subscription(user_id)
-
-        try:
-            async with self.write_transaction() as db:
-                try:
-                    await db.execute(
-                        "INSERT INTO payments (user_id, telegram_payment_charge_id, amount, tier) VALUES (?, ?, ?, ?)",
-                        (user_id, charge_id, stars, tier)
-                    )
-                except Exception as e_pay_ins:
-                    if "unique" in str(e_pay_ins).lower() or "constraint" in str(e_pay_ins).lower():
-                        logger.warning(f"Payment charge_id {charge_id} duplicate caught by unique index. Returning existing sub.")
-                        is_duplicate = True
-                    else:
-                        raise
-
-                if is_duplicate:
-                    pass
+                    sub = None
                 else:
-                    cursor = await db.execute("SELECT tier, expires_at, stars_spent, trial_expires_at FROM subscriptions WHERE user_id = ?", (user_id,))
-                    row = await cursor.fetchone()
+                    raise
+            else:
+                cursor = await db.execute(
+                    "SELECT tier, expires_at, stars_spent, trial_expires_at FROM subscriptions WHERE user_id = ?", (user_id,)
+                )
+                row = await cursor.fetchone()
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                cur_tier = (row[0] if row else None) or "free"
+                cur_exp = Subscription._parse_iso_to_utc_naive(row[1]) if row and row[1] else None
+                old_spent = (row[2] if row else 0) or 0
+                trial_exp_str = row[3] if row else None
 
-                    now = datetime.now(timezone.utc).replace(tzinfo=None)
-                    new_exp = now + timedelta(days=days)
-                    old_spent = 0
-                    trial_exp = None
-                    final_tier = tier
+                if tier == "free":
+                    current_trial = Subscription._parse_iso_to_utc_naive(trial_exp_str) if trial_exp_str else None
+                    trial_base = current_trial if current_trial and current_trial > now else now
+                    trial_exp_str = (trial_base + timedelta(days=days)).isoformat()
+                    final_tier = cur_tier if cur_tier in ("pro", "vip") and cur_exp and cur_exp > now else "free"
+                    exp_str = row[1] if final_tier != "free" and row else None
+                else:
+                    final_tier, new_exp = self._plan_period_after_purchase(now, cur_tier, cur_exp, tier, days)
+                    exp_str = new_exp.isoformat(timespec="seconds")
 
-                    if row:
-                        curr_tier = row[0]
-                        curr_exp = None
-                        if row[1]:
-                            try:
-                                curr_exp = Subscription._parse_iso_to_utc_naive(row[1])
-                                if curr_exp and curr_exp > now:
-                                    new_exp = curr_exp + timedelta(days=days)
-                            except Exception:
-                                logger.debug("Ignored exception", exc_info=True)
-                        old_spent = row[2] or 0
-                        trial_exp = row[3] if len(row) > 3 else None
+                total_spent = old_spent + max(0, int(stars))
+                await db.execute("""
+                    INSERT INTO subscriptions (user_id, tier, expires_at, trial_expires_at, stars_spent, trial_notified, paid_notified)
+                    VALUES (?, ?, ?, ?, ?, 0, 0)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        tier = excluded.tier,
+                        expires_at = excluded.expires_at,
+                        trial_expires_at = COALESCE(excluded.trial_expires_at, subscriptions.trial_expires_at),
+                        stars_spent = excluded.stars_spent,
+                        paid_notified = 0
+                """, (user_id, final_tier, exp_str, trial_exp_str, total_spent))
 
-                    exp_str = new_exp.isoformat()
-                    if final_tier == "free":
-                        trial_exp = exp_str
-                    total_spent = old_spent + stars
+                sub = Subscription(
+                    user_id=user_id, tier=final_tier, expires_at=exp_str, trial_expires_at=trial_exp_str,
+                    trial_notified=False, paid_notified=False, stars_spent=total_spent
+                )
+                await self._apply_plan_limits(db, user_id, sub.max_channels)
 
-                    await db.execute("""
-                        INSERT INTO subscriptions (user_id, tier, expires_at, trial_expires_at, stars_spent, trial_notified, paid_notified)
-                        VALUES (?, ?, ?, ?, ?, 0, 0)
-                        ON CONFLICT(user_id) DO UPDATE SET
-                            tier = excluded.tier,
-                            expires_at = excluded.expires_at,
-                            stars_spent = excluded.stars_spent,
-                            trial_notified = 0,
-                            paid_notified = 0
-                    """, (user_id, final_tier, exp_str, trial_exp, total_spent))
-
-                    sub = Subscription(user_id=user_id, tier=final_tier, expires_at=exp_str, trial_expires_at=trial_exp, trial_notified=False, paid_notified=False, stars_spent=total_spent)
-                    limit = sub.max_channels
-                    if limit > 0:
-                        await db.execute("""
-                            UPDATE channel_pairs
-                            SET is_active = 1
-                            WHERE id IN (
-                                SELECT id FROM channel_pairs
-                                WHERE user_id = ?
-                                ORDER BY id ASC
-                                LIMIT ?
-                            )
-                        """, (user_id, limit))
-
-                    await db.commit()
-                    await cache_manager.sub_cache.set(f"sub_{user_id}", sub)
-                    self._notify_pair_cache_invalidated()
-                    return sub
-        except Exception as e_act:
-            if not is_duplicate:
-                raise
-
-        if is_duplicate:
+        if sub is None:
+            await cache_manager.sub_cache.delete(f"sub_{user_id}")
             return await self.get_user_subscription(user_id)
+        await cache_manager.sub_cache.set(f"sub_{user_id}", sub)
+        self._notify_pair_cache_invalidated()
+        return sub
 
     async def revoke_subscription(self, user_id: int) -> Subscription:
-        """Revokes paid subscription, resets user tier to free, deactivates active pairs, and invalidates cache"""
-        await cache_manager.sub_cache.delete(f"sub_{user_id}")
+        """Revokes paid subscription, resets user tier to free, suspends pairs and story automation"""
         async with self.write_transaction() as db:
             await db.execute("UPDATE subscriptions SET tier = 'free', expires_at = NULL, paid_notified = 0 WHERE user_id = ?", (user_id,))
             await db.execute("UPDATE channel_pairs SET is_active = 0 WHERE user_id = ?", (user_id,))
-            try:
-                await db.execute("UPDATE story_settings SET is_active = 0 WHERE user_id = ?", (user_id,))
-                await db.execute("UPDATE story_queue SET status = 'skipped', error_message = 'VIP obunasi bekor qilingan' WHERE user_id = ? AND status = 'pending'", (user_id,))
-            except Exception:
-                logger.debug("Ignored exception", exc_info=True)
-            await db.commit()
+            await db.execute("UPDATE story_settings SET is_active = 0 WHERE user_id = ?", (user_id,))
+            await db.execute(
+                "UPDATE story_queue SET status = 'skipped', error_message = 'VIP obunasi bekor qilingan' WHERE user_id = ? AND status = 'pending'",
+                (user_id,)
+            )
+        await cache_manager.sub_cache.delete(f"sub_{user_id}")
         self._notify_pair_cache_invalidated()
         return await self.get_user_subscription(user_id)
 
     async def get_expired_trial_users_to_notify(self) -> List[Tuple[int, str]]:
-        now_str = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        """Free users whose trial just ended and who never bought a paid plan (ex-customers get a different message)."""
         async with self.get_connection() as db:
-            db.row_factory = aiosqlite.Row
             cursor = await db.execute("""
                 SELECT s.user_id, u.full_name
                 FROM subscriptions s
                 JOIN users u ON s.user_id = u.user_id
                 WHERE s.tier = 'free'
                   AND s.trial_expires_at IS NOT NULL
-                  AND s.trial_expires_at <= ?
+                  AND datetime(s.trial_expires_at) <= datetime('now')
                   AND s.trial_notified = 0
-            """, (now_str,))
+                  AND u.is_blocked = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM payments p WHERE p.user_id = s.user_id AND p.tier IN ('pro', 'vip')
+                  )
+            """)
             rows = await cursor.fetchall()
             return [(r["user_id"], r["full_name"]) for r in rows]
 
     async def mark_trial_notified(self, user_id: int):
-        await cache_manager.sub_cache.delete(f"sub_{user_id}")
         async with self.write_transaction() as db:
             await db.execute("""
                 INSERT INTO subscriptions (user_id, tier, trial_notified)
                 VALUES (?, 'free', 1)
                 ON CONFLICT(user_id) DO UPDATE SET trial_notified = 1
             """, (user_id,))
-            await db.commit()
+        await cache_manager.sub_cache.delete(f"sub_{user_id}")
 
     async def get_expiring_paid_users_to_notify(self) -> List[Tuple[int, str, str, str]]:
-        """Returns users whose PRO/VIP subscription expires within 3 days or has expired and needs notification"""
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        three_days_later = (now + timedelta(days=3)).isoformat()
+        """Paid-plan notifications in two stages (subscriptions.paid_notified: 0 none, 1 reminded, 2 expired):
+        * PRO/VIP plans ending within 3 days that were not reminded yet;
+        * plans that ended in the last 7 days and whose "expired" notice was not sent yet — including plans
+          already suspended to 'free' by get_user_subscription (their tier is taken from the last payment).
+        The caller tells the two apart by comparing expires_at with the current UTC time."""
         async with self.get_connection() as db:
-            db.row_factory = aiosqlite.Row
             cursor = await db.execute("""
-                SELECT s.user_id, u.full_name, s.tier, s.expires_at
+                SELECT s.user_id, u.full_name,
+                       CASE WHEN s.tier IN ('pro', 'vip') THEN s.tier
+                            ELSE COALESCE((SELECT p.tier FROM payments p
+                                           WHERE p.user_id = s.user_id AND p.tier IN ('pro', 'vip')
+                                           ORDER BY p.id DESC LIMIT 1), 'pro')
+                       END AS plan_tier,
+                       s.expires_at
                 FROM subscriptions s
                 JOIN users u ON s.user_id = u.user_id
-                WHERE s.tier IN ('pro', 'vip')
-                  AND s.expires_at IS NOT NULL
-                  AND s.expires_at <= ?
-                  AND s.paid_notified = 0
-            """, (three_days_later,))
+                WHERE s.expires_at IS NOT NULL
+                  AND u.is_blocked = 0
+                  AND (
+                        (s.tier IN ('pro', 'vip')
+                         AND datetime(s.expires_at) > datetime('now')
+                         AND datetime(s.expires_at) <= datetime('now', '+3 days')
+                         AND COALESCE(s.paid_notified, 0) = 0)
+                     OR (datetime(s.expires_at) <= datetime('now')
+                         AND datetime(s.expires_at) >= datetime('now', '-7 days')
+                         AND COALESCE(s.paid_notified, 0) < 2)
+                  )
+            """)
             rows = await cursor.fetchall()
-            return [(r["user_id"], r["full_name"], r["tier"], r["expires_at"]) for r in rows]
+            return [(r["user_id"], r["full_name"], r["plan_tier"], r["expires_at"]) for r in rows]
 
-    async def mark_paid_sub_notified(self, user_id: int):
-        await cache_manager.sub_cache.delete(f"sub_{user_id}")
+    async def mark_paid_sub_notified(self, user_id: int, expired: bool = False):
+        """Records the reminder (stage 1) or the "plan expired" notice (stage 2) for the current paid period."""
         async with self.write_transaction() as db:
-            await db.execute("""
-                UPDATE subscriptions SET paid_notified = 1 WHERE user_id = ?
-            """, (user_id,))
-            await db.commit()
+            if expired:
+                await db.execute("UPDATE subscriptions SET paid_notified = 2 WHERE user_id = ?", (user_id,))
+            else:
+                await db.execute(
+                    "UPDATE subscriptions SET paid_notified = MAX(COALESCE(paid_notified, 0), 1) WHERE user_id = ?",
+                    (user_id,)
+                )
+        await cache_manager.sub_cache.delete(f"sub_{user_id}")
 
     async def can_user_add_channel(self, user_id: int, is_admin: bool = False) -> Tuple[bool, int, int]:
         pairs = await self.get_user_channel_pairs(user_id)
@@ -940,7 +1086,6 @@ class DatabaseManager:
             return val
 
     async def set_setting(self, key: str, value: str):
-        await cache_manager.settings_cache.delete(f"set_{key}")
         store_value = value
         if key == "telethon_session":
             store_value = security_vault.encrypt_secret(value)
@@ -951,13 +1096,13 @@ class DatabaseManager:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
                 (key, store_value)
             )
-            await db.commit()
+        # Invalidate after commit so a concurrent reader cannot re-cache the old value
+        await cache_manager.settings_cache.delete(f"set_{key}")
 
     async def delete_setting(self, key: str):
-        await cache_manager.settings_cache.delete(f"set_{key}")
         async with self.write_transaction() as db:
             await db.execute("DELETE FROM app_settings WHERE key = ?", (key,))
-            await db.commit()
+        await cache_manager.settings_cache.delete(f"set_{key}")
 
     # --- BOT ACCESS MODE & WHITELIST ---
 
@@ -1088,70 +1233,65 @@ class DatabaseManager:
     # --- USERS ---
 
     async def get_or_create_user(self, user_id: int, full_name: str, username: Optional[str] = None, is_admin: Optional[bool] = None) -> User:
+        """Registers the user or refreshes their profile (name/username) from a real Telegram update.
+
+        Admin rights are never derived from `is_admin` here: environment super admins are recognised
+        dynamically through settings.admin_ids, and delegated admins only through set_admin_status()."""
         async with self.write_transaction() as db:
-            db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
             row = await cursor.fetchone()
             if row:
                 final_username = username if username else row["username"]
-                admin_flag = 1 if (is_admin is True or user_id in settings.admin_ids or bool(row["is_admin"])) else 0
-
-                if admin_flag:
-                    self._admin_cache.add(user_id)
-                else:
-                    self._admin_cache.discard(user_id)
-
-                await db.execute(
-                    "UPDATE users SET full_name = ?, username = ?, is_admin = ?, is_blocked = 0 WHERE user_id = ?",
-                    (full_name, final_username, admin_flag, user_id)
-                )
-                await db.commit()
-                return User(
-                    user_id=row["user_id"],
-                    full_name=full_name,
-                    username=final_username,
-                    created_at=row["created_at"],
-                    is_admin=bool(admin_flag),
-                    is_blocked=False
-                )
+                if row["full_name"] != full_name or row["username"] != final_username or row["is_blocked"]:
+                    await db.execute(
+                        "UPDATE users SET full_name = ?, username = ?, is_blocked = 0 WHERE user_id = ?",
+                        (full_name, final_username, user_id)
+                    )
+                db_admin = bool(row["is_admin"])
+                created_at = row["created_at"]
             else:
-                admin_flag = 1 if ((is_admin is True) or user_id in settings.admin_ids) else 0
-                if admin_flag:
-                    self._admin_cache.add(user_id)
-                else:
-                    self._admin_cache.discard(user_id)
-
                 await db.execute(
-                    "INSERT INTO users (user_id, full_name, username, is_admin, is_blocked) VALUES (?, ?, ?, ?, 0)",
-                    (user_id, full_name, username, admin_flag)
+                    "INSERT INTO users (user_id, full_name, username, is_admin, is_blocked) VALUES (?, ?, ?, 0, 0)",
+                    (user_id, full_name, username)
                 )
-                await db.commit()
-                return User(
-                    user_id=user_id,
-                    full_name=full_name,
-                    username=username,
-                    created_at=datetime.now(timezone.utc).isoformat(),
-                    is_admin=bool(admin_flag),
-                    is_blocked=False
-                )
+                final_username = username
+                db_admin = False
+                created_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        if db_admin:
+            self._admin_cache.add(user_id)
+        else:
+            self._admin_cache.discard(user_id)
+        is_admin_now = db_admin or user_id in settings.admin_ids
+        return User(
+            user_id=user_id,
+            full_name=full_name,
+            username=final_username,
+            created_at=created_at,
+            is_admin=is_admin_now,
+            is_blocked=False
+        )
 
     add_user = get_or_create_user
 
     async def set_admin_status(self, user_id: int, is_admin: bool) -> bool:
         """Sets or revokes admin privileges for user_id. Super admins in settings.admin_ids cannot be revoked."""
-        if not is_admin and (user_id == settings.PRIMARY_SUPER_ADMIN_ID or user_id in settings.admin_ids):
+        if not is_admin and user_id in settings.admin_ids:
             logger.warning(f"Super admin {user_id} cannot be revoked.")
             return False
 
         flag = 1 if is_admin else 0
+        async with self.write_transaction() as db:
+            await db.execute("INSERT OR IGNORE INTO users (user_id, full_name) VALUES (?, ?)", (user_id, f"User {user_id}"))
+            await db.execute(
+                "UPDATE users SET is_admin = ?, admin_source = ? WHERE user_id = ?",
+                (flag, "granted" if is_admin else None, user_id)
+            )
         if is_admin:
             self._admin_cache.add(user_id)
         else:
             self._admin_cache.discard(user_id)
-
-        async with self.write_transaction() as db:
-            await db.execute("UPDATE users SET is_admin = ? WHERE user_id = ?", (flag, user_id))
-            await db.commit()
+        await cache_manager.sub_cache.delete(f"sub_{user_id}")
         return True
 
     async def mark_user_blocked(self, user_id: int, is_blocked: bool = True):
@@ -1184,7 +1324,6 @@ class DatabaseManager:
                 )
             return None
 
-    get_user = get_user_by_id
 
     async def get_user_by_username(self, username: str) -> Optional[User]:
         clean_user = username.strip().lstrip("@").lower()
@@ -1204,18 +1343,22 @@ class DatabaseManager:
             return None
 
     def is_admin_sync(self, user_id: Any) -> bool:
+        """Admin check without a database query: environment super admins (settings.admin_ids, which
+        includes PRIMARY_SUPER_ADMIN_ID) and the cached delegated admins."""
         try:
             uid = int(user_id)
         except (ValueError, TypeError):
             return False
-        return uid == settings.PRIMARY_SUPER_ADMIN_ID or uid in settings.admin_ids or uid in self._admin_cache
+        return uid > 0 and (uid in settings.admin_ids or uid in self._admin_cache)
 
     async def is_admin(self, user_id: Any) -> bool:
         try:
             uid = int(user_id)
         except (ValueError, TypeError):
             return False
-        if uid == settings.PRIMARY_SUPER_ADMIN_ID or uid in settings.admin_ids:
+        if uid <= 0:
+            return False
+        if uid in settings.admin_ids:
             return True
         user = await self.get_user_by_id(uid)
         if user and user.is_admin:
@@ -1224,9 +1367,10 @@ class DatabaseManager:
         self._admin_cache.discard(uid)
         return False
 
-    async def get_all_user_ids(self) -> List[int]:
+    async def get_broadcast_recipient_ids(self) -> List[int]:
+        """Reachable private-chat users only: not blocked and a positive (user) id, never a group/channel id."""
         async with self.get_connection() as db:
-            cursor = await db.execute("SELECT user_id FROM users")
+            cursor = await db.execute("SELECT user_id FROM users WHERE is_blocked = 0 AND user_id > 0 ORDER BY user_id")
             rows = await cursor.fetchall()
             return [r[0] for r in rows]
 
@@ -1247,6 +1391,27 @@ class DatabaseManager:
                     is_admin=bool(r["is_admin"])
                 ) for r in rows
             ]
+
+    async def get_users_detailed_page(self, offset: int = 0, limit: int = 10) -> Tuple[List[Dict[str, Any]], int]:
+        """One page of users (newest first) with plan and channel count, plus the total user count."""
+        offset = max(0, int(offset))
+        limit = max(1, min(int(limit), 100))
+        async with self.get_connection() as db:
+            cur_total = await db.execute("SELECT COUNT(*) FROM users")
+            total_row = await cur_total.fetchone()
+            total = int(total_row[0]) if total_row else 0
+            cursor = await db.execute("""
+                SELECT u.user_id, u.full_name, u.username, u.created_at,
+                       COALESCE(s.tier, 'free') as tier,
+                       s.expires_at, s.trial_expires_at,
+                       (SELECT COUNT(*) FROM channel_pairs p WHERE p.user_id = u.user_id) as channel_count
+                FROM users u
+                LEFT JOIN subscriptions s ON u.user_id = s.user_id
+                ORDER BY u.created_at DESC, u.user_id DESC
+                LIMIT ? OFFSET ?
+            """, (limit, offset))
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows], total
 
     async def get_users_detailed(self, limit: int = 500) -> List[Dict[str, Any]]:
         async with self.get_connection() as db:
@@ -1331,61 +1496,104 @@ class DatabaseManager:
 
     async def _deduplicate_existing_pairs(self, db):
         """
-        Scans channel_pairs for duplicate configurations for the same user,
-        keeps the earliest (canonical) pair, and cleans up redundant duplicates.
-        Also cleans up any accidental self-cloning loop pairs.
+        Deactivates (never deletes) self-loop pairs and exact duplicates of an earlier pair of the same user.
+        Two pairs are duplicates only when both endpoints match by chat id, or — when an id is unknown on
+        either side — by normalized username. A username alone never overrides differing chat ids.
+        They are also marked paused_by_user, so a later plan purchase (_apply_plan_limits) never switches
+        them back on; the owner can delete them, and resuming one is refused (set_pair_active_by_owner).
         """
         try:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM channel_pairs ORDER BY id ASC")
+            cursor = await db.execute(
+                "SELECT id, user_id, source_channel, target_channel, source_id, target_id, is_active, "
+                "COALESCE(paused_by_user, 0) AS paused FROM channel_pairs ORDER BY id ASC"
+            )
             all_pairs = await cursor.fetchall()
-            if not all_pairs:
-                return
-
-            seen_user_pairs = {}
-            pairs_to_delete = []
-
+            seen: Dict[Tuple[int, str, str], int] = {}
+            to_deactivate: List[int] = []
             for row in all_pairs:
-                user_id = row["user_id"]
-                pair_id = row["id"]
-                s_ch = self._normalize_channel_name(row["source_channel"] or "")
-                t_ch = self._normalize_channel_name(row["target_channel"] or "")
-                s_id = row["source_id"]
-                t_id = row["target_id"]
-
-                # Check if self-loop pair
-                is_self_loop = False
-                if s_id is not None and t_id is not None and s_id == t_id:
-                    is_self_loop = True
-                elif s_ch and t_ch and s_ch == t_ch:
-                    is_self_loop = True
-
-                if is_self_loop:
-                    pairs_to_delete.append(pair_id)
+                src_key = self.pair_endpoint_key(row["source_channel"], row["source_id"])
+                tgt_key = self.pair_endpoint_key(row["target_channel"], row["target_id"])
+                needs_update = bool(row["is_active"]) or not row["paused"]
+                if src_key and tgt_key and src_key == tgt_key:
+                    if needs_update:
+                        to_deactivate.append(row["id"])
                     continue
-
-                src_key = f"id:{s_id}" if s_id else f"ch:{s_ch}"
-                tgt_key = f"id:{t_id}" if t_id else f"ch:{t_ch}"
-                group_key = (user_id, src_key, tgt_key)
-                alt_group_key = (user_id, f"ch:{s_ch}", f"ch:{t_ch}") if (s_ch and t_ch) else None
-
-                if group_key in seen_user_pairs or (alt_group_key and alt_group_key in seen_user_pairs):
-                    pairs_to_delete.append(pair_id)
+                key = (row["user_id"], src_key, tgt_key)
+                if src_key and tgt_key and key in seen:
+                    if needs_update:
+                        to_deactivate.append(row["id"])
                 else:
-                    seen_user_pairs[group_key] = pair_id
-                    if alt_group_key:
-                        seen_user_pairs[alt_group_key] = pair_id
-
-            if pairs_to_delete:
-                logger.info(f"Removing {len(pairs_to_delete)} duplicate/invalid channel pairs from database: {pairs_to_delete}")
-                params = [(p,) for p in pairs_to_delete]
-                await db.executemany("DELETE FROM cloned_messages WHERE pair_id = ?", params)
-                await db.executemany("DELETE FROM channel_backups WHERE pair_id = ?", params)
-                await db.executemany("DELETE FROM drip_queue WHERE pair_id = ?", params)
-                await db.executemany("DELETE FROM channel_pairs WHERE id = ?", params)
-                await db.commit()
+                    seen[key] = row["id"]
+            if to_deactivate:
+                logger.warning(f"Deactivating {len(to_deactivate)} duplicate or self-loop channel pairs: {to_deactivate}")
+                await db.executemany(
+                    "UPDATE channel_pairs SET is_active = 0, paused_by_user = 1 WHERE id = ?",
+                    [(pid,) for pid in to_deactivate]
+                )
         except Exception as e:
             logger.error(f"Error during channel pair deduplication: {e}", exc_info=True)
+
+    @staticmethod
+    def normalize_peer_id(value: Any) -> Optional[int]:
+        """Raw positive chat id from any stored form (-1001234, -1234, 1234, '1234'); None when not numeric."""
+        if value is None:
+            return None
+        text = str(value).strip()
+        if text.startswith("-100") and len(text) > 4:
+            text = text[4:]
+        elif text.startswith("-"):
+            text = text[1:]
+        return int(text) if text.isdigit() else None
+
+    @classmethod
+    def pair_endpoint_key(cls, channel: Optional[str], peer_id: Any) -> str:
+        """Canonical identity of a pair endpoint: 'id:<raw id>' when known, else 'ch:<normalized name>'."""
+        raw_id = cls.normalize_peer_id(peer_id)
+        if raw_id is None:
+            raw_id = cls.normalize_peer_id(channel)
+        if raw_id is not None:
+            return f"id:{raw_id}"
+        name = cls._normalize_channel_name(channel)
+        return f"ch:{name}" if name else ""
+
+    async def would_create_cycle(
+        self,
+        source_channel: str,
+        target_channel: str,
+        source_id: Optional[int] = None,
+        target_id: Optional[int] = None,
+        exclude_pair_id: Optional[int] = None
+    ) -> bool:
+        """True when a pair source -> target would close a loop with existing pairs of any user
+        (A->B with B->A, or A->B->C->A): every cloned post would then be re-cloned forever."""
+        src = self.pair_endpoint_key(source_channel, source_id)
+        tgt = self.pair_endpoint_key(target_channel, target_id)
+        if not src or not tgt:
+            return False
+        if src == tgt:
+            return True
+        async with self.get_connection() as db:
+            cursor = await db.execute("SELECT id, source_channel, source_id, target_channel, target_id FROM channel_pairs")
+            rows = await cursor.fetchall()
+        graph: Dict[str, Set[str]] = {}
+        for r in rows:
+            if exclude_pair_id is not None and r["id"] == exclude_pair_id:
+                continue
+            a = self.pair_endpoint_key(r["source_channel"], r["source_id"])
+            b = self.pair_endpoint_key(r["target_channel"], r["target_id"])
+            if a and b:
+                graph.setdefault(a, set()).add(b)
+        # A cycle appears iff the new target already reaches the new source
+        stack, visited = [tgt], set()
+        while stack:
+            node = stack.pop()
+            if node == src:
+                return True
+            if node in visited:
+                continue
+            visited.add(node)
+            stack.extend(graph.get(node, ()))
+        return False
 
     async def find_duplicate_pair(
         self,
@@ -1511,21 +1719,21 @@ class DatabaseManager:
             ad_action = getattr(pair_obj, 'ad_action', ad_action)
             show_caption_above = getattr(pair_obj, 'show_caption_above', show_caption_above)
 
-        existing = await self.find_duplicate_pair(user_id, source_channel, target_channel, source_id, target_id)
-        if existing:
-            if (source_id and not existing.source_id) or (target_id and not existing.target_id):
-                await self.update_pair_ids(existing.id, source_id or existing.source_id, target_id or existing.target_id)
-            if (source_title and source_title != existing.source_title) or (target_title and target_title != existing.target_title):
-                async with self.write_transaction() as db:
+        # The duplicate check and the insert run under the same write lock, so two concurrent submissions
+        # (double tap, forwarded album) cannot both create the pair.
+        async with self.write_transaction() as db:
+            existing = await self.find_duplicate_pair(user_id, source_channel, target_channel, source_id, target_id)
+            if existing:
+                if (source_id and not existing.source_id) or (target_id and not existing.target_id):
+                    await self.update_pair_ids(existing.id, source_id or existing.source_id, target_id or existing.target_id)
+                if (source_title and source_title != existing.source_title) or (target_title and target_title != existing.target_title):
                     await db.execute(
                         "UPDATE channel_pairs SET source_title = COALESCE(?, source_title), target_title = COALESCE(?, target_title) WHERE id = ?",
                         (source_title or None, target_title or None, existing.id)
                     )
-                    await db.commit()
-            self._notify_pair_cache_invalidated()
-            return existing.id
+                self._notify_pair_cache_invalidated()
+                return existing.id
 
-        async with self.write_transaction() as db:
 
             cursor = await db.execute("""
                 INSERT INTO channel_pairs (
@@ -1570,18 +1778,58 @@ class DatabaseManager:
             rows = await cursor.fetchall()
             return [self._row_to_pair(row) for row in rows]
 
-    async def toggle_pair_active(self, pair_id: int) -> Optional[bool]:
-        async with self.write_transaction() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT is_active FROM channel_pairs WHERE id = ?", (pair_id,))
-            row = await cursor.fetchone()
-            if not row:
-                return None
-            new_status = 0 if row["is_active"] else 1
-            await db.execute("UPDATE channel_pairs SET is_active = ? WHERE id = ?", (new_status, pair_id))
-            await db.commit()
+    async def set_pair_active_by_owner(self, pair_id: int, active: bool, bypass_limits: bool = False) -> Tuple[Optional[bool], Optional[str]]:
+        """Owner pauses or resumes a pair.
+
+        Returns (new_is_active, None) on success, or (current_is_active, error_code) where error_code is
+        "not_found", "self_loop" (source and target are the same chat), "cycle" (resuming would close a
+        loop with other pairs), "duplicate" (another active pair of the owner connects the same chats),
+        "subscription_inactive" (plan/trial expired) or "plan_limit" (active pairs already at the plan
+        maximum). Admin-owned pairs and bypass_limits=True skip only the plan checks, never the loop and
+        duplicate checks: those would make every post be cloned twice or forever."""
+        pair = await self.get_pair_by_id(pair_id)
+        if not pair:
+            return None, "not_found"
+        if not active:
+            async with self.write_transaction() as db:
+                await db.execute("UPDATE channel_pairs SET is_active = 0, paused_by_user = 1 WHERE id = ?", (pair_id,))
             self._notify_pair_cache_invalidated()
-            return bool(new_status)
+            return False, None
+
+        src_key = self.pair_endpoint_key(pair.source_channel, pair.source_id)
+        tgt_key = self.pair_endpoint_key(pair.target_channel, pair.target_id)
+        if src_key and src_key == tgt_key:
+            return pair.is_active, "self_loop"
+        if await self.would_create_cycle(pair.source_channel, pair.target_channel, pair.source_id, pair.target_id,
+                                         exclude_pair_id=pair_id):
+            return pair.is_active, "cycle"
+
+        owner_is_admin = self.is_admin_sync(pair.user_id) or await self.is_admin(pair.user_id)
+        if not (bypass_limits or owner_is_admin):
+            sub = await self.get_user_subscription(pair.user_id)
+            if not sub.is_active:
+                return pair.is_active, "subscription_inactive"
+        async with self.write_transaction() as db:
+            cur = await db.execute(
+                "SELECT source_channel, source_id, target_channel, target_id FROM channel_pairs "
+                "WHERE user_id = ? AND is_active = 1 AND id != ?",
+                (pair.user_id, pair_id)
+            )
+            for other in await cur.fetchall():
+                if (self.pair_endpoint_key(other["source_channel"], other["source_id"]) == src_key
+                        and self.pair_endpoint_key(other["target_channel"], other["target_id"]) == tgt_key):
+                    return pair.is_active, "duplicate"
+            if not (bypass_limits or owner_is_admin):
+                cur = await db.execute(
+                    "SELECT COUNT(*) FROM channel_pairs WHERE user_id = ? AND is_active = 1 AND id != ?",
+                    (pair.user_id, pair_id)
+                )
+                active_count = (await cur.fetchone())[0]
+                if active_count >= sub.max_channels:
+                    return pair.is_active, "plan_limit"
+            await db.execute("UPDATE channel_pairs SET is_active = 1, paused_by_user = 0 WHERE id = ?", (pair_id,))
+        self._notify_pair_cache_invalidated()
+        return True, None
 
     async def toggle_clean_links(self, pair_id: int) -> Optional[bool]:
         async with self.write_transaction() as db:
@@ -1695,10 +1943,23 @@ class DatabaseManager:
             self._notify_pair_cache_invalidated()
 
     async def update_pair_source_id(self, pair_id: int, source_id: int):
+        """Stores the resolved source chat id. When the source chat really changes (e.g. a group was
+        migrated to a supergroup) the old chat's message ids no longer mean anything, so the catch-up
+        watermark is reset."""
         async with self.write_transaction() as db:
-            await db.execute("UPDATE channel_pairs SET source_id = ? WHERE id = ?", (source_id, pair_id))
-            await db.commit()
-            self._notify_pair_cache_invalidated()
+            cursor = await db.execute("SELECT source_id FROM channel_pairs WHERE id = ?", (pair_id,))
+            row = await cursor.fetchone()
+            if not row:
+                return
+            old_raw = self.normalize_peer_id(row[0])
+            new_raw = self.normalize_peer_id(source_id)
+            if old_raw is not None and new_raw is not None and old_raw != new_raw:
+                await db.execute(
+                    "UPDATE channel_pairs SET source_id = ?, last_seen_msg_id = NULL WHERE id = ?", (source_id, pair_id)
+                )
+            else:
+                await db.execute("UPDATE channel_pairs SET source_id = ? WHERE id = ?", (source_id, pair_id))
+        self._notify_pair_cache_invalidated()
 
     async def update_pair_target_id(self, pair_id: int, target_id: int):
         async with self.write_transaction() as db:
@@ -1760,7 +2021,6 @@ class DatabaseManager:
             self._notify_pair_cache_invalidated()
             return cursor.rowcount > 0
 
-    delete_channel_pair = delete_pair
 
     # --- CLONED MESSAGES TRACKING & ANALYTICS ---
 
@@ -1838,14 +2098,22 @@ class DatabaseManager:
                     """, (pair_id, clean_chan, source_msg_id, h, price))
             await db.commit()
 
-    async def get_recent_image_hashes(self, days: int = 30) -> List[Dict[str, Any]]:
-        """Retrieves image hashes for the last N days to compare incoming listings"""
+    async def get_recent_image_hashes(self, days: int = 30, user_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Image hashes of the last N days; restricted to one tenant's pairs when user_id is given."""
         async with self.get_connection() as db:
-            cursor = await db.execute("""
-                SELECT pair_id, source_channel, source_msg_id, phash, price, created_at
-                FROM image_hashes
-                WHERE created_at >= datetime('now', '-' || ? || ' days')
-            """, (int(days),))
+            if user_id is not None:
+                cursor = await db.execute("""
+                    SELECT ih.pair_id, ih.source_channel, ih.source_msg_id, ih.phash, ih.price, ih.created_at
+                    FROM image_hashes ih
+                    JOIN channel_pairs cp ON cp.id = ih.pair_id
+                    WHERE cp.user_id = ? AND ih.created_at >= datetime('now', ?)
+                """, (user_id, f"-{int(days)} days"))
+            else:
+                cursor = await db.execute("""
+                    SELECT pair_id, source_channel, source_msg_id, phash, price, created_at
+                    FROM image_hashes
+                    WHERE created_at >= datetime('now', ?)
+                """, (f"-{int(days)} days",))
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
 
@@ -1864,6 +2132,123 @@ class DatabaseManager:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
 
+    async def get_cloned_messages_for_source(
+        self,
+        source_msg_id: int,
+        peer_id: Optional[int] = None,
+        username: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Destination posts cloned from one source message, across every pair watching that source.
+
+        Pairs are matched by the source chat id in all of its stored forms (raw / -100 prefixed), or by
+        username for pairs whose chat id was never resolved. Uses the (pair_id, source_msg_id) index."""
+        raw_id = self.normalize_peer_id(peer_id)
+        clean_name = (username or "").lstrip("@").lower().strip()
+        clauses, params = [], [source_msg_id]
+        if raw_id is not None:
+            clauses.append("cp.source_id IN (?, ?)")
+            params.extend([raw_id, int(f"-100{raw_id}")])
+        if clean_name:
+            clauses.append("(cp.source_id IS NULL AND LOWER(TRIM(REPLACE(cp.source_channel, '@', ''))) = ?)")
+            params.append(clean_name)
+        if not clauses:
+            return []
+        async with self.get_connection() as db:
+            cursor = await db.execute(f"""
+                SELECT cm.*, cp.target_channel AS pair_target_channel, cp.target_id AS pair_target_id,
+                       cp.user_id AS pair_user_id, cp.is_active AS pair_is_active
+                FROM channel_pairs cp
+                JOIN cloned_messages cm ON cm.pair_id = cp.id AND cm.source_msg_id = ?
+                WHERE {" OR ".join(clauses)}
+            """, params)
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    async def is_own_clone_post(self, chat_peer_id: Any, message_id: int) -> bool:
+        """True when message `message_id` in chat `chat_peer_id` is a post this system published as a clone
+        (used to break A->B->A repost loops)."""
+        raw_id = self.normalize_peer_id(chat_peer_id)
+        if raw_id is None or not message_id:
+            return False
+        async with self.get_connection() as db:
+            cursor = await db.execute("""
+                SELECT 1 FROM cloned_messages cm
+                JOIN channel_pairs cp ON cm.pair_id = cp.id
+                WHERE cm.target_msg_id = ? AND cp.target_id IN (?, ?)
+                LIMIT 1
+            """, (message_id, raw_id, int(f"-100{raw_id}")))
+            return await cursor.fetchone() is not None
+
+    async def search_user_listings(
+        self,
+        user_id: int,
+        text: str = "",
+        price_range: Optional[Tuple[float, float]] = None,
+        limit: int = 15
+    ) -> List[Dict[str, Any]]:
+        """Published clones of the user's own pairs whose caption contains `text` (case-insensitive for
+        ASCII) and, when given, whose detected price lies within `price_range`. Newest first. Each row
+        carries the pair's target (pair_target_channel, pair_target_id) for building post links."""
+        sql = """
+            SELECT cm.id, cm.target_channel, cm.target_msg_id, cm.status, cm.price, cm.last_caption,
+                   cp.target_channel AS pair_target_channel, cp.target_id AS pair_target_id
+            FROM cloned_messages cm
+            JOIN channel_pairs cp ON cp.id = cm.pair_id
+            WHERE cp.user_id = ?
+              AND cm.last_caption IS NOT NULL AND TRIM(cm.last_caption) != ''
+        """
+        params: List[Any] = [user_id]
+        if price_range is not None:
+            sql += " AND cm.price > 0 AND cm.price BETWEEN ? AND ?"
+            params.extend([float(price_range[0]), float(price_range[1])])
+        if text:
+            escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            sql += " AND cm.last_caption LIKE ? ESCAPE '\\'"
+            params.append(f"%{escaped}%")
+        sql += " ORDER BY cm.id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        async with self.get_connection() as db:
+            cursor = await db.execute(sql, params)
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def update_cloned_message_caption(self, cloned_id: int, caption: Optional[str]):
+        """Stores the caption that is currently shown on the destination post."""
+        async with self.write_transaction() as db:
+            await db.execute("UPDATE cloned_messages SET last_caption = ? WHERE id = ?", (caption, cloned_id))
+
+    async def mark_cloned_message_delivered(
+        self,
+        pair_id: int,
+        source_msg_id: int,
+        target_msg_id: Optional[int],
+        target_channel: Optional[str] = None,
+        last_caption: Optional[str] = None
+    ):
+        """Completes the mapping of a drip-queued post once it has actually been published."""
+        async with self.write_transaction() as db:
+            await db.execute("""
+                UPDATE cloned_messages
+                SET target_msg_id = COALESCE(?, target_msg_id),
+                    target_channel = COALESCE(?, target_channel),
+                    last_caption = COALESCE(?, last_caption),
+                    status = 'active'
+                WHERE pair_id = ? AND source_msg_id = ?
+            """, (target_msg_id, target_channel, last_caption, pair_id, source_msg_id))
+
+    async def forget_cloned_messages(self, pair_id: int, source_msg_ids: List[int]):
+        """Removes processing records (e.g. of a drip item that could not be delivered) so catch-up and
+        history cloning can pick those source messages up again."""
+        if not source_msg_ids:
+            return
+        async with self.write_transaction() as db:
+            await db.executemany(
+                "DELETE FROM cloned_messages WHERE pair_id = ? AND source_msg_id = ? AND target_msg_id IS NULL",
+                [(pair_id, mid) for mid in source_msg_ids]
+            )
+        for mid in source_msg_ids:
+            await cache_manager.dedup_cache.discard((pair_id, mid))
+
     async def update_cloned_message_status(self, cloned_id: int, status: str):
         """Updates cloned message status (e.g. 'sold', 'edited')"""
         async with self.write_transaction() as db:
@@ -1877,19 +2262,16 @@ class DatabaseManager:
             await db.commit()
 
     async def get_effective_last_source_msg_id(self, pair_id: int) -> Optional[int]:
-        """Returns the highest known source message ID either from cloned_messages or pair.last_seen_msg_id"""
+        """Highest source message id known for the pair (cloned records or the stored watermark)."""
         async with self.get_connection() as db:
-            cursor = await db.execute(
-                "SELECT MAX(source_msg_id) FROM cloned_messages WHERE pair_id = ?",
-                (pair_id,)
-            )
+            cursor = await db.execute("""
+                SELECT MAX(COALESCE((SELECT MAX(source_msg_id) FROM cloned_messages WHERE pair_id = ?), -1),
+                           COALESCE(last_seen_msg_id, -1))
+                FROM channel_pairs WHERE id = ?
+            """, (pair_id, pair_id))
             row = await cursor.fetchone()
-            if row and row[0] is not None:
+            if row and row[0] is not None and row[0] >= 0:
                 return int(row[0])
-            cur2 = await db.execute("SELECT last_seen_msg_id FROM channel_pairs WHERE id = ?", (pair_id,))
-            row2 = await cur2.fetchone()
-            if row2 and row2[0] is not None:
-                return int(row2[0])
             return None
 
     async def update_pair_last_seen_msg_id(self, pair_id: int, last_seen_msg_id: int):
@@ -1903,17 +2285,46 @@ class DatabaseManager:
             self._notify_pair_cache_invalidated()
 
     async def clean_old_cloned_messages(self, days: int = 180) -> Tuple[int, int]:
-        """Prunes ancient deduplication records from cloned_messages and expired drip queue items to keep DB size compact"""
+        """Retention for clone records. The (pair_id, source_msg_id) rows are the deduplication ledger that
+        history cloning relies on, so they are kept for two years; only the stored caption text is dropped
+        after `days`. Finished drip and story queue items are removed after 14 / 30 days."""
         async with self.write_transaction() as db:
-            cur1 = await db.execute("DELETE FROM cloned_messages WHERE cloned_at < datetime('now', '-' || ? || ' days')", (str(days),))
+            await db.execute(
+                "UPDATE cloned_messages SET last_caption = NULL WHERE last_caption IS NOT NULL AND cloned_at < datetime('now', ?)",
+                (f"-{int(days)} days",)
+            )
+            cur1 = await db.execute("DELETE FROM cloned_messages WHERE cloned_at < datetime('now', '-730 days')")
             deleted_cloned = cur1.rowcount if cur1.rowcount is not None else 0
-            # Clean finished or failed drip queue items older than 14 days
-            cur2 = await db.execute("DELETE FROM drip_queue WHERE status IN ('sent', 'failed', 'skipped') AND (created_at < datetime('now', '-14 days') OR scheduled_at < datetime('now', '-14 days'))")
+            cur2 = await db.execute(
+                "DELETE FROM drip_queue WHERE status IN ('sent', 'failed', 'skipped') "
+                "AND (created_at < datetime('now', '-14 days') OR scheduled_at < datetime('now', '-14 days'))"
+            )
             deleted_drip = cur2.rowcount if cur2.rowcount is not None else 0
-            # Clean finished, failed or skipped story queue items older than 30 days
-            await db.execute("DELETE FROM story_queue WHERE status IN ('sent', 'completed', 'failed', 'skipped') AND (created_at < datetime('now', '-30 days') OR scheduled_at < datetime('now', '-30 days'))")
-            await db.commit()
+            await db.execute(
+                "DELETE FROM story_queue WHERE status IN ('sent', 'completed', 'failed', 'skipped') "
+                "AND (created_at < datetime('now', '-30 days') OR scheduled_at < datetime('now', '-30 days'))"
+            )
             return deleted_cloned, deleted_drip
+
+    async def run_maintenance(self) -> Dict[str, int]:
+        """Daily housekeeping with one consistent retention policy (called by run.py)."""
+        deleted_cloned, deleted_drip = await self.clean_old_cloned_messages(days=180)
+        stats = {"deleted_cloned_messages": deleted_cloned, "deleted_drip_items": deleted_drip}
+        async with self.write_transaction() as db:
+            for name, sql in (
+                # Abandoned wizard conversations
+                ("deleted_fsm_rows", "DELETE FROM fsm_storage WHERE updated_at < datetime('now', '-7 days')"),
+                # Visual duplicate detection only looks back 30 days
+                ("deleted_image_hashes", "DELETE FROM image_hashes WHERE created_at < datetime('now', '-45 days')"),
+                # Listing fingerprints are compared over a 14 day window
+                ("deleted_listing_hashes", "DELETE FROM story_dedup_hashes WHERE posted_at < datetime('now', '-30 days')"),
+                ("deleted_posted_stories", "DELETE FROM posted_stories WHERE posted_at < datetime('now', '-180 days')"),
+                ("deleted_store_orders", "DELETE FROM store_orders WHERE status = 'awaiting_payment' AND created_at < datetime('now', '-2 days')"),
+            ):
+                cur = await db.execute(sql)
+                stats[name] = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        await self.checkpoint()
+        return stats
 
     async def get_pair_analytics(self, pair_id: int) -> Dict[str, Any]:
         async with self.get_connection() as db:
@@ -1937,15 +2348,26 @@ class DatabaseManager:
 
     # --- DATABASE BACKUP EXPORTER ---
 
+    def _backup_dir(self) -> str:
+        """data/backups inside the project for the project database; a sibling 'backups' folder otherwise."""
+        db_dir = os.path.dirname(os.path.abspath(self.db_path))
+        project_root = str(PROJECT_ROOT)
+        try:
+            inside_project = os.path.commonpath([db_dir, project_root]) == project_root
+        except ValueError:
+            inside_project = False
+        return os.path.join(project_root, "data", "backups") if inside_project else os.path.join(db_dir, "backups")
+
     async def create_backup_file(self) -> Optional[str]:
         """Creates a timestamped snapshot backup of the database using SQLite online backup or VACUUM INTO"""
         if not os.path.exists(self.db_path):
             return None
 
-        backup_dir = os.path.join("data", "backups")
+        backup_dir = self._backup_dir()
         os.makedirs(backup_dir, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        backup_path = os.path.join(backup_dir, f"backup_cloner_{timestamp}.db")
+        # A random suffix keeps concurrent backups (double tap, two admins) from sharing one file
+        backup_path = os.path.join(backup_dir, f"backup_cloner_{timestamp}_{os.urandom(3).hex()}.db")
 
         try:
             # Check available disk space (need at least 2x db_size + 50MB)
@@ -2033,6 +2455,42 @@ class DatabaseManager:
                 "subscription": sub
             }
 
+    async def get_user_daily_clone_counts(self, user_id: int, days: int = 7) -> List[Dict[str, Any]]:
+        """Per-day cloned message counts (UTC) for the user's pairs, oldest day first, zero-filled."""
+        days = max(1, min(int(days), 90))
+        async with self.get_connection() as db:
+            cursor = await db.execute("""
+                SELECT date(m.cloned_at) AS day, COUNT(*) AS cnt
+                FROM cloned_messages m
+                JOIN channel_pairs p ON m.pair_id = p.id
+                WHERE p.user_id = ? AND m.target_msg_id IS NOT NULL
+                  AND m.cloned_at >= date('now', ?)
+                GROUP BY date(m.cloned_at)
+            """, (user_id, f"-{days - 1} days"))
+            rows = await cursor.fetchall()
+        counts = {r[0]: r[1] for r in rows}
+        today = datetime.now(timezone.utc).date()
+        result = []
+        for offset in range(days - 1, -1, -1):
+            day = (today - timedelta(days=offset)).isoformat()
+            result.append({"date": day, "count": int(counts.get(day, 0))})
+        return result
+
+    async def get_user_recent_clones(self, user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        """Most recent successfully delivered posts across the user's pairs (activity feed)."""
+        async with self.get_connection() as db:
+            cursor = await db.execute("""
+                SELECT m.id, m.pair_id, m.source_msg_id, m.target_msg_id, m.media_type, m.cloned_at,
+                       p.source_channel AS cp_src, p.target_channel AS cp_tgt
+                FROM cloned_messages m
+                JOIN channel_pairs p ON m.pair_id = p.id
+                WHERE p.user_id = ? AND m.target_msg_id IS NOT NULL
+                ORDER BY m.id DESC
+                LIMIT ?
+            """, (user_id, max(1, min(int(limit), 50))))
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
     async def toggle_premium_emojis(self, pair_id: int) -> Optional[bool]:
         async with self.write_transaction() as db:
             db.row_factory = aiosqlite.Row
@@ -2099,14 +2557,30 @@ class DatabaseManager:
             self._notify_pair_cache_invalidated()
             return bool(new_status)
 
-    async def update_pair_topic_settings(self, pair_id: int, source_topic_id: Optional[int], target_topic_id: Optional[int]):
+    # is_active is not updatable here: pausing/resuming goes through set_pair_active_by_owner (plan limits,
+    # paused_by_user, loop and duplicate checks)
+    UPDATABLE_PAIR_COLUMNS = frozenset({
+        "clean_links", "clone_mode", "custom_signature", "remove_signature",
+        "blacklist_words", "replace_words", "auto_translate", "target_lang", "source_lang",
+        "image_watermark_type", "image_watermark_text", "image_watermark_pos",
+        "video_watermark_type", "video_watermark_text", "video_watermark_pos",
+        "drip_delay_minutes", "night_mode", "ai_paraphrase_mode", "tone_of_voice", "ad_action",
+        "source_topic_id", "target_topic_id", "show_caption_above", "auto_premium_emojis",
+        "auto_cta_buttons", "backup_enabled", "auto_catchup",
+    })
+
+    async def update_pair_fields(self, pair_id: int, fields: Dict[str, Any]) -> bool:
+        """Updates a whitelisted subset of channel pair columns in one statement."""
+        clean = {k: v for k, v in fields.items() if k in self.UPDATABLE_PAIR_COLUMNS}
+        if not clean:
+            return False
+        columns = sorted(clean)
+        assignments = ", ".join(f"{col} = ?" for col in columns)
+        values = [int(clean[c]) if isinstance(clean[c], bool) else clean[c] for c in columns]
         async with self.write_transaction() as db:
-            await db.execute(
-                "UPDATE channel_pairs SET source_topic_id = ?, target_topic_id = ? WHERE id = ?",
-                (source_topic_id, target_topic_id, pair_id)
-            )
-            await db.commit()
-            self._notify_pair_cache_invalidated()
+            cursor = await db.execute(f"UPDATE channel_pairs SET {assignments} WHERE id = ?", (*values, pair_id))
+        self._notify_pair_cache_invalidated()
+        return cursor.rowcount > 0
 
     # --- DRIP FEED QUEUE ---
 
@@ -2182,21 +2656,23 @@ class DatabaseManager:
             """, (pair_id, source_id, message_id, text, media_type, media_file_id, entities_json, media_group_id))
             await db.commit()
 
-    async def get_channel_backups(self, pair_id: int, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    async def get_channel_backups(self, pair_id: int, limit: Optional[int] = None,
+                                  after_message_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Archived posts of a pair in message order. `after_message_id` continues a previous page (keyset
+        pagination), so large archives can be read page by page instead of all at once."""
+        query = "SELECT * FROM channel_backups WHERE pair_id = ?"
+        params: List[Any] = [pair_id]
+        if after_message_id is not None:
+            query += " AND message_id > ?"
+            params.append(after_message_id)
+        query += " ORDER BY message_id ASC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(0, int(limit)))
         async with self.get_connection() as db:
-            db.row_factory = aiosqlite.Row
-            if limit is not None:
-                cursor = await db.execute(
-                    "SELECT * FROM channel_backups WHERE pair_id = ? ORDER BY message_id ASC LIMIT ?",
-                    (pair_id, limit)
-                )
-            else:
-                cursor = await db.execute(
-                    "SELECT * FROM channel_backups WHERE pair_id = ? ORDER BY message_id ASC",
-                    (pair_id,)
-                )
+            cursor = await db.execute(query, params)
             rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+        return [dict(r) for r in rows]
 
     async def get_channel_backup_count(self, pair_id: int) -> int:
         async with self.get_connection() as db:
@@ -2273,12 +2749,13 @@ class DatabaseManager:
                     (bot_id, chat_id, user_id, t_id, dest)
                 )
                 row = await cursor.fetchone()
-                if row and (not row[0] or row[0] in ("{}", "null", '""')):
+                if not row:
+                    return
+                if not row[0] or row[0] in ("{}", "null", '""'):
                     await db.execute(
                         "DELETE FROM fsm_storage WHERE bot_id = ? AND chat_id = ? AND user_id = ? AND thread_id = ? AND destiny = ?",
                         (bot_id, chat_id, user_id, t_id, dest)
                     )
-                    await db.commit()
                     return
             await db.execute("""
                 INSERT INTO fsm_storage (bot_id, chat_id, user_id, thread_id, destiny, state, updated_at)
@@ -2389,36 +2866,11 @@ class DatabaseManager:
             await db.commit()
 
     async def prune_database(self, max_age_days: int = 30) -> Dict[str, int]:
-        """Safely prunes old completed drip queue records and stale clone logs to prevent database bloating"""
-        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).strftime("%Y-%m-%d %H:%M:%S")
-        res = {"deleted_drip_items": 0, "deleted_cloned_messages": 0}
-        async with self.write_transaction() as db:
-            cur_drip = await db.execute(
-                "DELETE FROM drip_queue WHERE status IN ('sent', 'skipped', 'failed') AND created_at < ?",
-                (cutoff_date,)
-            )
-            res["deleted_drip_items"] = cur_drip.rowcount if cur_drip and cur_drip.rowcount > 0 else 0
+        """Backward-compatible alias of run_maintenance(). The retention periods are fixed by policy there;
+        `max_age_days` is accepted for compatibility but no longer shortens the clone deduplication ledger
+        (deleting it made history cloning re-post old messages)."""
+        return await self.run_maintenance()
 
-            cur_logs = await db.execute(
-                "DELETE FROM cloned_messages WHERE cloned_at < ?",
-                (cutoff_date,)
-            )
-            res["deleted_cloned_messages"] = cur_logs.rowcount if cur_logs and cur_logs.rowcount > 0 else 0
-
-            # Prune abandoned FSM conversations older than 7 days
-            cur_fsm = await db.execute(
-                "DELETE FROM fsm_storage WHERE updated_at < datetime('now', '-7 days')"
-            )
-            res["deleted_fsm_rows"] = cur_fsm.rowcount if cur_fsm and cur_fsm.rowcount > 0 else 0
-
-            # Prune old image hashes older than 60 days
-            cur_hashes = await db.execute(
-                "DELETE FROM image_hashes WHERE created_at < datetime('now', '-60 days')"
-            )
-            res["deleted_image_hashes"] = cur_hashes.rowcount if cur_hashes and cur_hashes.rowcount > 0 else 0
-
-            await db.commit()
-        return res
     # ==========================================
     # --- USER TELETHON SESSIONS & STORY SYSTEM ---
     # ==========================================
@@ -2494,26 +2946,6 @@ class DatabaseManager:
                 logger.debug("Ignored exception", exc_info=True)
             await db.commit()
             return True
-
-    async def get_all_active_user_sessions(self) -> List[Dict[str, Any]]:
-        """Returns all active user sessions with decrypted session string"""
-        results = []
-        async with self.get_connection() as db:
-            async with db.execute(
-                "SELECT user_id, session_encrypted, phone, first_name, username FROM user_sessions WHERE is_active = 1"
-            ) as cursor:
-                rows = await cursor.fetchall()
-                for r in rows:
-                    decrypted = security_vault.decrypt_secret(r[1])
-                    if decrypted:
-                        results.append({
-                            "user_id": r[0],
-                            "session": decrypted,
-                            "phone": r[2],
-                            "first_name": r[3],
-                            "username": r[4]
-                        })
-        return results
 
     async def get_story_settings(self, user_id: int) -> StorySettings:
         """Retrieves story cloner settings for the user, or creates default"""
@@ -2606,14 +3038,34 @@ class DatabaseManager:
             await db.commit()
             return True
 
+    STORY_SETTINGS_COLUMNS = frozenset({
+        "source_channel", "source_title", "source_id", "target_type", "target_channel", "target_id",
+        "min_price", "max_price", "require_photos", "require_price", "filter_demands", "background_style",
+        "is_active", "prime_hours_enabled", "prime_hours_start", "prime_hours_end", "drip_delay_minutes",
+        "max_stories_per_day", "enable_smart_badges", "pin_to_profile", "video_duration", "enable_ai_voice",
+    })
+
     async def update_story_settings(self, user_id: int, **kwargs) -> StorySettings:
-        """Helper to partially update and save story settings for a user"""
-        st = await self.get_story_settings(user_id)
-        for k, v in kwargs.items():
-            if hasattr(st, k):
-                setattr(st, k, v)
-        await self.save_story_settings(st)
-        return st
+        """Partially updates story settings with a column-level UPDATE, so concurrent writers (e.g. a
+        subscription revoke switching is_active off) are never overwritten by a stale full-row save."""
+        clean = {k: v for k, v in kwargs.items() if k in self.STORY_SETTINGS_COLUMNS}
+        if clean:
+            async with self.write_transaction() as db:
+                cursor = await db.execute("SELECT 1 FROM story_settings WHERE user_id = ?", (user_id,))
+                if not await cursor.fetchone():
+                    st = StorySettings(user_id=user_id)
+                    for k, v in clean.items():
+                        setattr(st, k, v)
+                    await self.save_story_settings(st)
+                else:
+                    columns = sorted(clean)
+                    values = [int(clean[c]) if isinstance(clean[c], bool) else clean[c] for c in columns]
+                    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    await db.execute(
+                        f"UPDATE story_settings SET {', '.join(f'{c} = ?' for c in columns)}, updated_at = ? WHERE user_id = ?",
+                        (*values, now, user_id)
+                    )
+        return await self.get_story_settings(user_id)
 
     async def get_all_active_story_settings(self) -> List[StorySettings]:
         """Returns list of all active story settings across all users"""
@@ -2624,7 +3076,7 @@ class DatabaseManager:
                           min_price, max_price, require_photos, require_price, filter_demands, background_style,
                           is_active, prime_hours_enabled, prime_hours_start, prime_hours_end,
                           drip_delay_minutes, max_stories_per_day, enable_smart_badges, pin_to_profile,
-                          video_duration, created_at, updated_at
+                          video_duration, created_at, updated_at, enable_ai_voice
                    FROM story_settings WHERE is_active = 1"""
             ) as cursor:
                 rows = await cursor.fetchall()
@@ -2653,7 +3105,8 @@ class DatabaseManager:
                         pin_to_profile=bool(row[20]) if row[20] is not None else True,
                         video_duration=int(row[21]) if row[21] is not None else 25,
                         created_at=row[22],
-                        updated_at=row[23]
+                        updated_at=row[23],
+                        enable_ai_voice=bool(row[24]) if row[24] is not None else True
                     ))
         return settings_list
 
@@ -2689,10 +3142,11 @@ class DatabaseManager:
         channel_title: str = "",
         channel_id: Optional[int] = None
     ) -> Optional[int]:
-        """Adds a new source channel for multi-channel story cloner. Returns channel id or None if already exists."""
+        """Adds a new source channel for multi-channel story cloner. Returns channel id or None if already exists.
+        `channel_username` is '@name' (a bare name gets the '@'), a '-100<id>' channel id or an invite link."""
         clean_user = channel_username.strip()
-        if not clean_user.startswith("@") and not clean_user.startswith("-100") and not clean_user.startswith("+"):
-            clean_user = f"@{clean_user.lstrip('@')}"
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", clean_user):
+            clean_user = f"@{clean_user}"
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         async with self.write_transaction() as db:
             async with db.execute(
@@ -2718,11 +3172,19 @@ class DatabaseManager:
             return cur.lastrowid
 
     async def delete_story_source_channel(self, user_id: int, channel_id: int) -> bool:
-        """Deletes a source channel entry by ID"""
+        """Deletes a source channel entry of the user; False when the user has no such entry."""
         async with self.write_transaction() as db:
-            await db.execute("DELETE FROM story_source_channels WHERE user_id = ? AND id = ?", (user_id, channel_id))
-            await db.commit()
-            return True
+            cursor = await db.execute("DELETE FROM story_source_channels WHERE user_id = ? AND id = ?", (user_id, channel_id))
+            return cursor.rowcount > 0
+
+    async def set_story_source_channel_active(self, user_id: int, channel_id: int, active: bool) -> bool:
+        """Pauses or resumes one of the user's extra story source channels; False when it does not exist."""
+        async with self.write_transaction() as db:
+            cursor = await db.execute(
+                "UPDATE story_source_channels SET is_active = ? WHERE id = ? AND user_id = ?",
+                (1 if active else 0, channel_id, user_id)
+            )
+            return cursor.rowcount > 0
 
     async def is_listing_duplicate(self, user_id: int, listing_hash: str, days: int = 14) -> bool:
         """
@@ -2796,7 +3258,7 @@ class DatabaseManager:
                 SELECT id, user_id, source_channel, source_msg_id, price, district, rooms,
                        area, score, payload_json, status, scheduled_at, created_at, error_message
                 FROM story_queue
-                WHERE status = 'pending' AND scheduled_at <= ?
+                WHERE status = 'pending' AND datetime(scheduled_at) <= datetime(?)
                 ORDER BY score DESC, scheduled_at ASC
                 LIMIT 10
             """, (now_utc,)) as cur:
@@ -3023,6 +3485,288 @@ class DatabaseManager:
             recent.remove(clean_name)
         recent.append(clean_name)
         await self.set_app_setting("recent_story_music", json.dumps(recent[-max_history:]))
+
+    # --- SUPPLIER & STORE MANAGEMENT ---
+
+    async def get_supplier_config(self, supplier_id: int = 1) -> Optional[SupplierConfig]:
+        """Fetches active supplier configuration (API URL, API Key, Margin)"""
+        async with self.get_connection() as db:
+            async with db.execute("""
+                SELECT id, provider_name, api_url, api_key, margin_percent, balance, currency, last_synced_at, is_active
+                FROM supplier_configs WHERE id = ?
+            """, (supplier_id,)) as cur:
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                return SupplierConfig(
+                    id=row[0],
+                    provider_name=row[1],
+                    api_url=row[2],
+                    api_key=row[3],
+                    margin_percent=row[4],
+                    balance=row[5],
+                    currency=row[6],
+                    last_synced_at=row[7],
+                    is_active=bool(row[8])
+                )
+
+    async def save_supplier_config(self, config: SupplierConfig) -> None:
+        """Saves or updates supplier API configuration"""
+        async with self.write_transaction() as db:
+            if config.id:
+                await db.execute("""
+                    UPDATE supplier_configs
+                    SET provider_name = ?, api_url = ?, api_key = ?, margin_percent = ?, balance = ?, currency = ?, is_active = ?
+                    WHERE id = ?
+                """, (config.provider_name, config.api_url, config.api_key, config.margin_percent, config.balance, config.currency, int(config.is_active), config.id))
+            else:
+                await db.execute("""
+                    INSERT INTO supplier_configs (provider_name, api_url, api_key, margin_percent, balance, currency, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (config.provider_name, config.api_url, config.api_key, config.margin_percent, config.balance, config.currency, int(config.is_active)))
+            await db.commit()
+
+    async def update_supplier_balance_and_sync_time(self, supplier_id: int, balance: float) -> None:
+        """Updates supplier cached balance and last synced timestamp"""
+        async with self.write_transaction() as db:
+            await db.execute("""
+                UPDATE supplier_configs
+                SET balance = ?, last_synced_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (balance, supplier_id))
+            await db.commit()
+
+    async def get_store_products(self, category: Optional[str] = None, only_available: bool = False) -> List[StoreProduct]:
+        """Lists products from store catalogue with optional category filter"""
+        async with self.get_connection() as db:
+            sql = """
+                SELECT id, supplier_id, supplier_service_id, name, category, type, supplier_rate,
+                       selling_price_stars, min_quantity, max_quantity, is_available, stock_status,
+                       description, created_at, updated_at
+                FROM store_products
+                WHERE 1=1
+            """
+            params: List[Any] = []
+            if category:
+                sql += " AND category = ?"
+                params.append(category)
+            if only_available:
+                sql += " AND is_available = 1 AND stock_status = 'in_stock'"
+            sql += " ORDER BY category ASC, id ASC"
+
+            async with db.execute(sql, tuple(params)) as cur:
+                rows = await cur.fetchall()
+                products = []
+                for r in rows:
+                    products.append(StoreProduct(
+                        id=r[0],
+                        supplier_id=r[1],
+                        supplier_service_id=r[2],
+                        name=r[3],
+                        category=r[4],
+                        type=r[5],
+                        supplier_rate=r[6],
+                        selling_price_stars=r[7],
+                        min_quantity=r[8],
+                        max_quantity=r[9],
+                        is_available=bool(r[10]),
+                        stock_status=r[11],
+                        description=r[12],
+                        created_at=r[13],
+                        updated_at=r[14]
+                    ))
+                return products
+
+    async def get_store_product(self, product_id: int) -> Optional[StoreProduct]:
+        """Fetches single product by ID"""
+        async with self.get_connection() as db:
+            async with db.execute("""
+                SELECT id, supplier_id, supplier_service_id, name, category, type, supplier_rate,
+                       selling_price_stars, min_quantity, max_quantity, is_available, stock_status,
+                       description, created_at, updated_at
+                FROM store_products WHERE id = ?
+            """, (product_id,)) as cur:
+                r = await cur.fetchone()
+                if not r:
+                    return None
+                return StoreProduct(
+                    id=r[0],
+                    supplier_id=r[1],
+                    supplier_service_id=r[2],
+                    name=r[3],
+                    category=r[4],
+                    type=r[5],
+                    supplier_rate=r[6],
+                    selling_price_stars=r[7],
+                    min_quantity=r[8],
+                    max_quantity=r[9],
+                    is_available=bool(r[10]),
+                    stock_status=r[11],
+                    description=r[12],
+                    created_at=r[13],
+                    updated_at=r[14]
+                )
+
+    async def upsert_synced_product(self, p_data: Dict[str, Any], margin_percent: float = 25.0) -> None:
+        """Inserts or updates product from supplier API sync"""
+        supplier_rate = float(p_data.get("rate") or 0.0)
+        selling_stars = max(1, int(round(supplier_rate * 50 * (1.0 + margin_percent / 100.0))))
+
+        async with self.write_transaction() as db:
+            cur = await db.execute("""
+                SELECT id FROM store_products
+                WHERE supplier_id = ? AND supplier_service_id = ?
+            """, (p_data.get("supplier_id", 1), p_data["service"]))
+            row = await cur.fetchone()
+            if row:
+                await db.execute("""
+                    UPDATE store_products
+                    SET name = ?, category = ?, type = ?, supplier_rate = ?, selling_price_stars = ?,
+                        min_quantity = ?, max_quantity = ?, is_available = 1, stock_status = 'in_stock',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (
+                    p_data.get("name", ""),
+                    p_data.get("category", "General"),
+                    p_data.get("type", "Default"),
+                    supplier_rate,
+                    selling_stars,
+                    int(p_data.get("min", 10)),
+                    int(p_data.get("max", 10000)),
+                    row[0]
+                ))
+            else:
+                await db.execute("""
+                    INSERT INTO store_products (
+                        supplier_id, supplier_service_id, name, category, type, supplier_rate,
+                        selling_price_stars, min_quantity, max_quantity, is_available, stock_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'in_stock')
+                """, (
+                    p_data.get("supplier_id", 1),
+                    p_data["service"],
+                    p_data.get("name", ""),
+                    p_data.get("category", "General"),
+                    p_data.get("type", "Default"),
+                    supplier_rate,
+                    selling_stars,
+                    int(p_data.get("min", 10)),
+                    int(p_data.get("max", 10000))
+                ))
+            await db.commit()
+
+    async def mark_unlisted_products_out_of_stock(self, active_service_ids: Set[int], supplier_id: int = 1) -> int:
+        """Marks any products not present in supplier API as 'out_of_stock' (Qolmadi)"""
+        async with self.write_transaction() as db:
+            cur = await db.execute("SELECT id, supplier_service_id FROM store_products WHERE supplier_id = ?", (supplier_id,))
+            rows = await cur.fetchall()
+            updated_count = 0
+            for r_id, s_id in rows:
+                if s_id not in active_service_ids:
+                    await db.execute("UPDATE store_products SET stock_status = 'out_of_stock' WHERE id = ?", (r_id,))
+                    updated_count += 1
+            await db.commit()
+            return updated_count
+
+    async def create_store_order(self, order: StoreOrder) -> int:
+        """Creates a new store order record"""
+        async with self.write_transaction() as db:
+            cur = await db.execute("""
+                INSERT INTO store_orders (
+                    user_id, product_id, product_name, quantity, price_stars,
+                    target_link, supplier_order_id, status, admin_notified, note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                order.user_id, order.product_id, order.product_name, order.quantity,
+                order.price_stars, order.target_link, order.supplier_order_id,
+                order.status, int(order.admin_notified), order.note or ""
+            ))
+            await db.commit()
+            return cur.lastrowid
+
+    async def get_store_order(self, order_id: int) -> Optional[StoreOrder]:
+        async with self.get_connection() as db:
+            async with db.execute("""
+                SELECT id, user_id, product_id, product_name, quantity, price_stars,
+                       target_link, supplier_order_id, status, admin_notified, note, created_at
+                FROM store_orders WHERE id = ?
+            """, (order_id,)) as cur:
+                r = await cur.fetchone()
+        if not r:
+            return None
+        return StoreOrder(
+            id=r[0], user_id=r[1], product_id=r[2], product_name=r[3], quantity=r[4],
+            price_stars=r[5], target_link=r[6], supplier_order_id=r[7], status=r[8],
+            admin_notified=bool(r[9]), note=r[10], created_at=r[11]
+        )
+
+    STORE_ORDER_UPDATABLE = frozenset({"status", "supplier_order_id", "admin_notified", "note"})
+
+    async def update_store_order(self, order_id: int, **fields) -> None:
+        clean = {k: v for k, v in fields.items() if k in self.STORE_ORDER_UPDATABLE}
+        if not clean:
+            return
+        columns = sorted(clean)
+        values = [int(clean[c]) if isinstance(clean[c], bool) else clean[c] for c in columns]
+        async with self.write_transaction() as db:
+            await db.execute(
+                f"UPDATE store_orders SET {', '.join(f'{c} = ?' for c in columns)} WHERE id = ?",
+                (*values, order_id)
+            )
+            await db.commit()
+
+    async def mark_store_order_paid(self, order_id: int, user_id: int, charge_id: str, amount: int) -> bool:
+        """Atomically records the Stars payment and moves the order from awaiting_payment to paid.
+        Returns False for replays (charge already recorded) or orders that are not awaiting payment."""
+        async with self.write_transaction() as db:
+            cur = await db.execute(
+                "SELECT status, user_id, price_stars FROM store_orders WHERE id = ?", (order_id,)
+            )
+            row = await cur.fetchone()
+            if not row or row[0] != "awaiting_payment" or row[1] != user_id or int(amount) < int(row[2]):
+                return False
+            await db.execute(
+                "INSERT OR IGNORE INTO users (user_id, full_name) VALUES (?, ?)", (user_id, f"User {user_id}")
+            )
+            try:
+                await db.execute(
+                    "INSERT INTO payments (user_id, telegram_payment_charge_id, amount, tier) VALUES (?, ?, ?, 'store')",
+                    (user_id, charge_id, amount)
+                )
+            except Exception as e_pay:
+                if "unique" in str(e_pay).lower():
+                    await db.rollback()
+                    return False
+                raise
+            await db.execute("UPDATE store_orders SET status = 'paid' WHERE id = ?", (order_id,))
+            await db.commit()
+            return True
+
+    async def get_user_store_orders(self, user_id: int) -> List[StoreOrder]:
+        """Gets user order history"""
+        async with self.get_connection() as db:
+            async with db.execute("""
+                SELECT id, user_id, product_id, product_name, quantity, price_stars,
+                       target_link, supplier_order_id, status, admin_notified, note, created_at
+                FROM store_orders WHERE user_id = ? ORDER BY id DESC LIMIT 50
+            """, (user_id,)) as cur:
+                rows = await cur.fetchall()
+                orders = []
+                for r in rows:
+                    orders.append(StoreOrder(
+                        id=r[0],
+                        user_id=r[1],
+                        product_id=r[2],
+                        product_name=r[3],
+                        quantity=r[4],
+                        price_stars=r[5],
+                        target_link=r[6],
+                        supplier_order_id=r[7],
+                        status=r[8],
+                        admin_notified=bool(r[9]),
+                        note=r[10],
+                        created_at=r[11]
+                    ))
+                return orders
 
 
 db_manager = DatabaseManager()

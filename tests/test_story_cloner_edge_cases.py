@@ -1,8 +1,8 @@
 import os
 import pytest
 from PIL import Image
-from services.story_cloner_service import StoryClonerService, story_cloner_service
-from database.models import StorySettings, PostedStory
+from services.story_cloner_service import StoryClonerService
+from database.models import StorySettings
 from database.db_manager import db_manager
 from bot.handlers.story_menu import router as story_menu_router
 from aiogram import Dispatcher

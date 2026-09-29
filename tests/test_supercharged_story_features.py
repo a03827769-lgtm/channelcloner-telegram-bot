@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 import pytest
 import pytest_asyncio
-import asyncio
 from datetime import datetime, timedelta, timezone
 from database.db_manager import DatabaseManager
-from database.models import StorySettings, StorySourceChannel, StoryQueueItem
-from services.listing_analyzer import listing_analyzer
-from services.story_queue_service import story_queue_service, UZB_TZ
+from database.models import StorySettings, StorySourceChannel
 from bot.keyboards.story_keyboards import (
     get_story_main_menu_keyboard,
     get_story_channels_keyboard,
@@ -184,7 +181,9 @@ def test_keyboards_structure():
     assert "story_toggle_prime_hours" in q_callbacks
     assert "story_menu_cooldown" in q_callbacks
     assert "story_menu_daily_limit" in q_callbacks
-    assert "story_toggle_badges" in q_callbacks
+    # Each screen has its own badges toggle, so the screen it was tapped on is redrawn
+    assert "story_toggle_badges_q" in q_callbacks
+    assert "story_toggle_badges_f" in [b.callback_data for row in get_story_filters_keyboard(st).inline_keyboard for b in row]
     assert "story_toggle_pin" in q_callbacks
     assert "story_view_queue_list" in q_callbacks
 

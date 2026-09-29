@@ -1,12 +1,8 @@
 import pytest
-import os
 import re
-import tempfile
-import asyncio
 from services.text_processor import TextProcessor
 from services.security_vault import SecurityVault
 from services.affiliate_replacer import AffiliateReplacer
-from services.translator_service import translator_service
 from services.cloner_engine import ClonerEngine
 from database.db_manager import DatabaseManager, ReentrantAsyncLock
 

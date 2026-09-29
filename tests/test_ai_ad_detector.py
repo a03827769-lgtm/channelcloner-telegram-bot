@@ -1,8 +1,6 @@
 import unittest
-import asyncio
-from unittest.mock import AsyncMock, patch
 
-from services.ai_ad_detector import AIAdDetector, ai_ad_detector
+from services.ai_ad_detector import AIAdDetector
 from database.models import ChannelPair
 from services.cloner_engine import ClonerEngine
 

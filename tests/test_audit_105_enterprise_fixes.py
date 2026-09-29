@@ -1,13 +1,9 @@
 import pytest
 import os
-import aiosqlite
-from datetime import datetime, timezone, timedelta
 from database.db_manager import DatabaseManager
-from database.models import Subscription, ChannelPair
 from services.text_processor import TextProcessor
 from services.ai_paraphraser import ai_paraphraser
 from services.watermark_service import watermark_service
-from services.cloner_engine import cloner_engine
 
 @pytest.mark.asyncio
 async def test_paid_notified_lifecycle(tmp_path):
@@ -85,12 +81,17 @@ def test_text_processor_match_case_title():
 def test_text_processor_void_tags_omitted_from_closing():
     html_text = "<b>Assalomu alaykum</b><br>Bu yangilik.<hr>Davomi bor."
     caption, overflow = TextProcessor.fit_caption_limit(html_text, max_limit=30)
-    # Ensure neither </br> nor </hr> are appended
-    assert "</br>" not in caption
-    assert "</hr>" not in caption
-    if overflow:
-        assert "<br>" not in overflow
-        assert "<hr>" not in overflow
+    # Void tags are never "closed" and never duplicated into the overflow
+    assert "</br>" not in caption and "</hr>" not in caption
+    assert overflow is not None
+    assert "</br>" not in overflow and "</hr>" not in overflow
+    assert caption.count("<br>") + overflow.count("<br>") == 1
+    assert caption.count("<hr>") + overflow.count("<hr>") == 1
+    assert TextProcessor.get_visible_text_length(caption) <= 30
+    # The split falls at the end of the sentence that fits, not inside a word
+    assert TextProcessor.html_to_plain(caption).endswith("Bu yangilik.")
+    assert TextProcessor.html_to_plain(overflow).strip() == "Davomi bor."
+
 
 def test_text_processor_attach_signature_entity_truncation():
     # Long text ending near boundary with incomplete entity

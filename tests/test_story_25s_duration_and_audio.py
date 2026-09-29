@@ -1,11 +1,7 @@
-import os
 import json
-import shutil
-import pytest
 import subprocess
-from PIL import Image
 
-from services.story_video_generator import StoryVideoGenerator, story_video_generator
+from services.story_video_generator import StoryVideoGenerator
 from telethon.tl import types
 
 
@@ -85,23 +81,16 @@ def test_single_slide_ffmpeg_command_enforces_30fps_and_overlay_repeat():
 
 
 def test_mtproto_video_story_attributes_guarantee_audio():
-    """Verify DocumentAttributeVideo and InputMediaUploadedDocument explicitly flag sound=True"""
-    video_attr = types.DocumentAttributeVideo(
-        duration=25.0,
-        w=1080,
-        h=1920,
-        supports_streaming=True,
-        nosound=False
-    )
-    assert video_attr.nosound is False
-    assert video_attr.duration == 25.0
-    assert video_attr.supports_streaming is True
-
-    doc_media = types.InputMediaUploadedDocument(
-        file=types.InputFile(id=1, parts=1, name="video.mp4", md5_checksum=""),
-        mime_type="video/mp4",
-        attributes=[video_attr],
-        nosound_video=False
-    )
-    assert doc_media.nosound_video is False
-    assert doc_media.attributes[0].nosound is False
+    """The video story document built by the service plays its music (sound on) and streams"""
+    from services.story_cloner_service import StoryClonerService
+    uploaded = types.InputFile(id=1, parts=1, name="video.mp4", md5_checksum="")
+    media = StoryClonerService.video_story_media(uploaded, 25, {"video_w": 720, "video_h": 1280})
+    assert isinstance(media, types.InputMediaUploadedDocument)
+    assert media.mime_type == "video/mp4" and media.nosound_video is False
+    video_attr = media.attributes[0]
+    assert isinstance(video_attr, types.DocumentAttributeVideo)
+    assert (video_attr.duration, video_attr.w, video_attr.h) == (25.0, 720, 1280)
+    assert video_attr.nosound is False and video_attr.supports_streaming is True
+    # Missing size information falls back to Full HD
+    fallback = StoryClonerService.video_story_media(uploaded, 15, {}).attributes[0]
+    assert (fallback.w, fallback.h) == (1080, 1920)

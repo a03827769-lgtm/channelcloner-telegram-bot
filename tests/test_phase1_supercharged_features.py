@@ -1,15 +1,13 @@
+import datetime
 import asyncio
-import os
-import tempfile
 import pytest
 import numpy as np
 import cv2
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from services.image_hasher import calculate_phash, hamming_distance, image_hasher
-from services.render_queue import HardwareAwareRenderQueue, render_queue
+from services.render_queue import HardwareAwareRenderQueue
 from database.db_manager import DatabaseManager
-from database.models import ChannelPair, ClonedMessage
 
 
 @pytest.fixture
@@ -194,78 +192,76 @@ async def test_story_cloner_service_source_delete():
                 mock_del.assert_called_once_with(user_id=123, story_id=999)
 
 
+def _clone_record(record_id, target_msg_id, media_type, last_caption, price=950.0):
+    """A clone record as returned by db_manager.get_cloned_messages_for_source."""
+    return {
+        "id": record_id,
+        "pair_id": 3,
+        "source_msg_id": 101,
+        "target_channel": "@my_dest_channel",
+        "pair_target_channel": "@my_dest_channel",
+        "pair_target_id": -1009990001112,
+        "pair_is_active": 1,
+        "target_msg_id": target_msg_id,
+        "status": "active",
+        "media_type": media_type,
+        "media_group_id": None,
+        "last_caption": last_caption,
+        "price": price,
+    }
+
+
 @pytest.mark.asyncio
 async def test_telethon_listener_message_deleted_sync():
-    from services.telethon_listener import telethon_listener
+    from services.telethon_listener import telethon_listener, SOLD_TAG
     from services.cloner_engine import cloner_engine
     from database.db_manager import db_manager
 
-    event = MagicMock()
-    event.deleted_ids = [101]
-    mock_chat = MagicMock()
-    mock_chat.username = "cityjoyestateuz"
-    mock_chat.id = 12345
+    event = MagicMock(deleted_ids=[101], chat_id=-1000000012345)
+    mock_chat = MagicMock(username="cityjoyestateuz", id=12345)
     event.get_chat = AsyncMock(return_value=mock_chat)
-
     mock_bot = AsyncMock()
 
-    with patch.object(cloner_engine, "bot", mock_bot):
-        with patch.object(db_manager, "get_cloned_messages_by_source", new=AsyncMock()) as mock_get_cloned:
-            mock_get_cloned.return_value = [{
-                "id": 7,
-                "target_channel": "@my_dest_channel",
-                "pair_target_channel": "@my_dest_channel",
-                "target_msg_id": 888,
-                "status": "active",
-                "media_type": "photo",
-                "last_caption": "Chiroyli 3 xonali uy"
-            }]
-            with patch.object(db_manager, "update_cloned_message_status", new=AsyncMock()) as mock_upd_status:
-                with patch("services.story_cloner_service.story_cloner_service.handle_source_message_deleted", new=AsyncMock()) as mock_st_del:
-                    await telethon_listener._handle_message_deleted(event)
+    listing = _clone_record(7, 888, "photo", "Chiroyli 3 xonali uy")
+    news = _clone_record(9, 890, "photo", "Oddiy yangilik", price=0)
+    with patch.object(cloner_engine, "bot", mock_bot), \
+         patch.object(db_manager, "get_cloned_messages_for_source", new=AsyncMock(return_value=[listing, news])) as lookup, \
+         patch.object(db_manager, "update_cloned_message_status", new=AsyncMock()) as mock_upd_status, \
+         patch("services.story_cloner_service.story_cloner_service.handle_source_message_deleted", new=AsyncMock()) as mock_st_del:
+        await telethon_listener._handle_message_deleted(event)
 
-                    # Verify destination message edited with SOLD tag
-                    mock_bot.edit_message_caption.assert_called_once()
-                    assert "🔴 <b>SOTILDI / YOPILGAN E'LON</b>" in mock_bot.edit_message_caption.call_args[1]["caption"]
-                    # Verify status set to sold
-                    mock_upd_status.assert_called_once_with(7, "sold")
-                    # Verify story deleted
-                    mock_st_del.assert_called_once_with(source_channel="cityjoyestateuz", source_msg_id=101)
+    lookup.assert_awaited_once_with(101, peer_id=12345, username="cityjoyestateuz")
+    # Only the priced listing is marked SOLD, addressed by the pair's numeric target id
+    mock_bot.edit_message_caption.assert_called_once()
+    kwargs = mock_bot.edit_message_caption.call_args.kwargs
+    assert kwargs["chat_id"] == -1009990001112 and kwargs["message_id"] == 888
+    assert kwargs["caption"].startswith(SOLD_TAG.strip()) or SOLD_TAG.strip() in kwargs["caption"]
+    mock_upd_status.assert_called_once_with(7, "sold")
+    # The Story generated from the post is deleted
+    mock_st_del.assert_called_once_with(source_channel="cityjoyestateuz", source_msg_id=101)
 
 
 @pytest.mark.asyncio
 async def test_telethon_listener_message_edited_sold_sync():
-    from services.telethon_listener import telethon_listener
+    from services.telethon_listener import telethon_listener, SOLD_TAG
     from services.cloner_engine import cloner_engine
     from database.db_manager import db_manager
 
-    event = MagicMock()
-    event.message = MagicMock()
-    event.message.id = 102
-    event.message.message = "Ushbu uy sotildi, rahmat barchaga!"
-    mock_chat = MagicMock()
-    mock_chat.username = "cityjoyestateuz"
-    mock_chat.id = 12345
+    event = MagicMock(chat_id=-1000000012345, is_private=False)
+    event.message = MagicMock(id=102, message="Ushbu uy sotildi, rahmat barchaga!", action=None,
+                              edit_date=datetime.datetime(2026, 1, 1, 12, 0))
+    mock_chat = MagicMock(username="cityjoyestateuz", id=12345)
     event.get_chat = AsyncMock(return_value=mock_chat)
-
     mock_bot = AsyncMock()
 
-    with patch.object(cloner_engine, "bot", mock_bot):
-        with patch.object(db_manager, "get_cloned_messages_by_source", new=AsyncMock()) as mock_get_cloned:
-            mock_get_cloned.return_value = [{
-                "id": 8,
-                "target_channel": "@my_dest_channel",
-                "pair_target_channel": "@my_dest_channel",
-                "target_msg_id": 889,
-                "status": "active",
-                "media_type": "text",
-                "last_caption": "3 xonali uy"
-            }]
-            with patch.object(db_manager, "update_cloned_message_status", new=AsyncMock()) as mock_upd_status:
-                with patch("services.story_cloner_service.story_cloner_service.handle_source_message_deleted", new=AsyncMock()):
-                    await telethon_listener._handle_message_edited(event)
+    listing = _clone_record(8, 889, "text", "3 xonali uy")
+    with patch.object(cloner_engine, "bot", mock_bot), \
+         patch.object(db_manager, "get_cloned_messages_for_source", new=AsyncMock(return_value=[listing])), \
+         patch.object(db_manager, "update_cloned_message_status", new=AsyncMock()) as mock_upd_status, \
+         patch("services.story_cloner_service.story_cloner_service.handle_source_message_deleted", new=AsyncMock()):
+        await telethon_listener._handle_message_edited(event)
 
-                    # Verify text updated with SOLD tag
-                    mock_bot.edit_message_text.assert_called_once()
-                    assert "🔴 <b>SOTILDI / YOPILGAN E'LON</b>" in mock_bot.edit_message_text.call_args[1]["text"]
-                    mock_upd_status.assert_called_once_with(8, "sold")
+    mock_bot.edit_message_text.assert_called_once()
+    kwargs = mock_bot.edit_message_text.call_args.kwargs
+    assert SOLD_TAG.strip() in kwargs["text"] and "3 xonali uy" in kwargs["text"]
+    mock_upd_status.assert_called_once_with(8, "sold")

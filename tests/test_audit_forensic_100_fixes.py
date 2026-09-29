@@ -3,12 +3,9 @@ import os
 import glob
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timezone, timedelta
 
 from database.db_manager import DatabaseManager
-from database.models import ChannelPair, StorySettings
-from services.story_cloner_service import StoryClonerService, story_cloner_service
 from services.ai_paraphraser import ai_paraphraser
 from services.story_queue_service import story_queue_service
 

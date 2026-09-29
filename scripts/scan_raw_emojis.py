@@ -5,6 +5,10 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
+# Lint helper: lists raw emoji literals in handler/service code (premium custom emojis are preferred).
+# Paths are relative to the project root, whatever the current directory is.
+os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 emoji_regex = re.compile(r'[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50\u2b55\u200d\ufe0f]')
 dirs_to_check = ['bot/handlers', 'admin_bot/handlers', 'services']
 

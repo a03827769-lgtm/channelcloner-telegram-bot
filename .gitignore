@@ -12,14 +12,15 @@ cloud_env_ready.txt
 cloud_raw_session.txt
 cloud_*.txt
 app.pid
+app.lock
 *.token
 *.secret
 *.key
 *.pem
 *.cer
 oracle_vps.key
-.vault_key
-database/.vault_key
+**/.vault_key
+docker-compose.override.yml
 
 # 2. Telethon & Pyrogram MTProto Session Files
 *.session
@@ -30,6 +31,7 @@ database/.vault_key
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
 *.sqlite
 *.sqlite3
 database/*.db*
@@ -44,6 +46,7 @@ tests/*.db
 temp_media/*
 !temp_media/.gitkeep
 temp_media/
+temp_media_test/
 *.tmp
 *.bak
 test.txt
@@ -78,7 +81,7 @@ venv/
 env/
 ENV/
 
-# 7. IDE, OS & Agent metadata
+# 7. IDE, OS, tooling & Agent metadata
 .idea/
 .vscode/
 *.swp
@@ -88,11 +91,16 @@ Thumbs.db
 .agents/
 .gemini/
 .pytest_cache/
+.ruff_cache/
 .coverage
 logs/
 *.log
 
-# Cloudflare Tunnel Credentials (SECRET)
-.cloudflared/cert.json
-.cloudflared/cert.pem
+# 8. Cloudflare Tunnel: config and credentials stay on the host (see .cloudflared/config.yml.example)
+.cloudflared/*
+!.cloudflared/config.yml.example
 cloudflared.exe
+
+# 9. Frontend dependencies & build artefacts (install with `npm ci` in webapp/)
+node_modules/
+webapp/vite.config.ts.timestamp-*

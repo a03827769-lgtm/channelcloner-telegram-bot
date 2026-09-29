@@ -1,6 +1,4 @@
-import os
 import pytest
-import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 from config.settings import Settings
 from services.cloner_engine import ClonerEngine
@@ -15,12 +13,14 @@ def test_watchdog_health_url():
     assert url.endswith("/health")
 
 
-def test_settings_security_defaults():
-    """Verify settings do not contain hardcoded active super admin IDs in source defaults."""
-    s = Settings(BOT_TOKEN="mock:token", ADMIN_BOT_TOKEN="mock:token", TELEGRAM_API_ID=12345, TELEGRAM_API_HASH="hash")
-    # PRIMARY_SUPER_ADMIN_ID should default to 0 if not provided in env
-    assert s.PRIMARY_SUPER_ADMIN_ID == 0 or isinstance(s.PRIMARY_SUPER_ADMIN_ID, int)
-    # ENABLE_PLAYWRIGHT should default to False to conserve RAM on small VPS
+def test_settings_security_defaults(monkeypatch):
+    """Source defaults contain no super admin ID and keep Playwright (RAM heavy) disabled."""
+    for var in ("PRIMARY_SUPER_ADMIN_ID", "ADMIN_IDS", "ENABLE_PLAYWRIGHT"):
+        monkeypatch.delenv(var, raising=False)
+    s = Settings(_env_file=None, BOT_TOKEN="1:mock_token", ADMIN_BOT_TOKEN="2:mock_token",
+                 TELEGRAM_API_ID=12345, TELEGRAM_API_HASH="hash")
+    assert s.PRIMARY_SUPER_ADMIN_ID == 0
+    assert s.admin_ids == set()
     assert s.ENABLE_PLAYWRIGHT is False
 
 
@@ -73,33 +73,39 @@ async def test_process_message_text_unbound_safety():
         custom_signature="— VIP Kanal"
     )
     
-    # Empty initial text
+    # Empty text (e.g. a photo without caption): nothing to process, and the owner's signature is not
+    # posted on its own either
     with patch("database.db_manager.db_manager.get_user_subscription", return_value=Subscription(user_id=12345, tier="free")):
-        res = await engine.process_post_text("", pair)
-        # Should cleanly return empty text without UnboundLocalError
-        assert res == "" or res is None or isinstance(res, str)
+        assert await engine.process_post_text("", pair) == ""
+        assert await engine.process_post_text("", pair, has_media=True) == ""
+        assert await engine.process_post_text(None, pair) == ""
+        # With text the signature is appended
+        assert (await engine.process_post_text("Yangi e'lon", pair)).endswith("— VIP Kanal")
 
 
 @pytest.mark.asyncio
 async def test_story_cloner_lru_client_eviction():
-    """Verify story cloner service limits client cache to 20 connections."""
-    from services.story_cloner_service import StoryClonerService
+    """The story client pool evicts idle clients beyond its soft limit (least recently used first) and
+    never a client that serves a live story monitor."""
+    from services.story_cloner_service import CLIENT_POOL_SOFT_LIMIT, StoryClonerService
     svc = StoryClonerService()
-    
-    # Mock 20 clients
-    for i in range(25):
-        client_mock = MagicMock()
-        client_mock.is_connected.return_value = True
-        client_mock.disconnect = AsyncMock()
-        client_mock.is_user_authorized = AsyncMock(return_value=True)
-        client_mock.connect = AsyncMock()
-        
-        # Insert client
-        if len(svc._user_clients) >= 20:
-            old_uid, old_c = next(iter(svc._user_clients.items()))
-            svc._user_clients.pop(old_uid, None)
-            if old_c.is_connected():
-                await old_c.disconnect()
-        svc._user_clients[i] = client_mock
-        
-    assert len(svc._user_clients) == 20
+
+    def make_client():
+        client = MagicMock()
+        client.is_connected.return_value = True
+        client.disconnect = AsyncMock()
+        return client
+
+    monitored = {0, 1}  # users 0 and 1 have running monitors
+    with patch.object(svc, "_has_active_monitor", side_effect=lambda uid: uid in monitored):
+        clients = {}
+        for uid in range(CLIENT_POOL_SOFT_LIMIT + 5):
+            clients[uid] = make_client()
+            await svc._install_user_client(uid, clients[uid])
+
+    assert len(svc._user_clients) == CLIENT_POOL_SOFT_LIMIT
+    assert {0, 1} <= set(svc._user_clients)             # monitored clients survive
+    assert not {2, 3, 4, 5, 6} & set(svc._user_clients)  # the oldest idle ones were evicted...
+    for uid in (2, 3, 4, 5, 6):
+        clients[uid].disconnect.assert_awaited()         # ...and disconnected
+    assert CLIENT_POOL_SOFT_LIMIT + 4 in svc._user_clients

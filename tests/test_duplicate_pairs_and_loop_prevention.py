@@ -1,7 +1,6 @@
 import unittest
 import os
 import uuid
-import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 from aiogram.types import Message, Chat, User as AiogramUser
 from aiogram.fsm.context import FSMContext
@@ -10,15 +9,16 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from database.db_manager import DatabaseManager
 from database.models import ChannelPair
 from services.cloner_engine import ClonerEngine
-from services.custom_emojis import WARN, LINK, SUCCESS
+from services.custom_emojis import WARN
 from bot.handlers.cloner_menu import process_target_channel
 from bot.states.cloner_states import AddChannelPairSG
 
-TEST_DB_PATH = "database/test_duplicate_and_loops.db"
-
 class TestDuplicatePairsAndLoopPrevention(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.test_db_path = f"database/test_duplicate_{uuid.uuid4().hex[:8]}.db"
+        import tempfile
+        # Temporary directory (never next to the live database/cloner.db)
+        self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.test_db_path = os.path.join(self._tmp_dir.name, f"test_duplicate_{uuid.uuid4().hex[:8]}.db")
         self.db = DatabaseManager(self.test_db_path)
         await self.db.init_db()
         self.storage = MemoryStorage()
@@ -26,6 +26,7 @@ class TestDuplicatePairsAndLoopPrevention(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         from tests.test_utils import safe_cleanup_db
         await safe_cleanup_db(self.test_db_path, self.db)
+        self._tmp_dir.cleanup()
 
     def _create_mock_message(self, user_id: int, text: str = "") -> Message:
         msg = MagicMock(spec=Message)
@@ -122,11 +123,29 @@ class TestDuplicatePairsAndLoopPrevention(unittest.IsolatedAsyncioTestCase):
         async with self.db.get_connection() as conn:
             await self.db._deduplicate_existing_pairs(conn)
 
-        # Check count after cleanup: 8 duplicates -> 1 canonical, self-loop -> 0. Total = 1!
+        # Nothing is deleted: 7 later duplicates and the self-loop are deactivated and marked as paused by the
+        # owner (so a plan purchase never switches them back on); only the oldest pair stays active
         pairs_after = await self.db.get_user_channel_pairs(user_id)
-        self.assertEqual(len(pairs_after), 1)
-        self.assertEqual(pairs_after[0].source_channel, "@ArendaKvartir")
-        self.assertEqual(pairs_after[0].target_channel, "@aRieltorUz")
+        self.assertEqual(len(pairs_after), 9)
+        active = [p for p in pairs_after if p.is_active]
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].source_channel, "@ArendaKvartir")
+        self.assertEqual(active[0].target_channel, "@aRieltorUz")
+        self.assertEqual(active[0].id, min(p.id for p in pairs_after))
+        async with self.db.get_connection() as conn:
+            cur = await conn.execute(
+                "SELECT COUNT(*) FROM channel_pairs WHERE user_id = ? AND is_active = 0 AND paused_by_user = 1", (user_id,))
+            self.assertEqual((await cur.fetchone())[0], 8)
+
+        # Resuming a duplicate or the self-loop is refused
+        duplicate = next(p for p in pairs_after if not p.is_active and p.source_channel == "@ArendaKvartir")
+        self_loop = next(p for p in pairs_after if p.source_channel == "@SameChannel")
+        self.assertEqual(await self.db.set_pair_active_by_owner(duplicate.id, True), (False, "duplicate"))
+        self.assertEqual(await self.db.set_pair_active_by_owner(self_loop.id, True), (False, "self_loop"))
+
+        # A later purchase re-applies the plan limits without reviving them
+        await self.db.activate_subscription(user_id, tier="vip", stars=300, charge_id="dedupe_vip", days=30)
+        self.assertEqual(len([p for p in await self.db.get_user_channel_pairs(user_id) if p.is_active]), 1)
 
     async def test_4_wizard_rejects_self_cloning_loop(self):
         """Verify process_target_channel blocks setting source == target"""

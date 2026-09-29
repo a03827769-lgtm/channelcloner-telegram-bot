@@ -2,6 +2,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional, List, Dict
 from datetime import datetime, timezone, timedelta
+from config.plans import TIER_MAX_CHANNELS, TRIAL_DAYS
 
 @dataclass
 class User:
@@ -46,11 +47,11 @@ class Subscription:
             exp = self._parse_iso_to_utc_naive(self.expires_at)
             return bool(exp and exp > now)
         
-        # Free Tier: active only during 14-day trial
+        # Free Tier: active only during the trial window
         if not self.trial_expires_at:
             if self.created_at:
                 c_date = self._parse_iso_to_utc_naive(self.created_at)
-                return bool(c_date and (c_date + timedelta(days=14)) > now)
+                return bool(c_date and (c_date + timedelta(days=TRIAL_DAYS)) > now)
             return False
         trial_exp = self._parse_iso_to_utc_naive(self.trial_expires_at)
         return bool(trial_exp and trial_exp > now)
@@ -63,7 +64,7 @@ class Subscription:
         if not self.trial_expires_at:
             if self.created_at:
                 c_date = self._parse_iso_to_utc_naive(self.created_at)
-                return bool(c_date and (c_date + timedelta(days=14)) > now)
+                return bool(c_date and (c_date + timedelta(days=TRIAL_DAYS)) > now)
             return False
         trial_exp = self._parse_iso_to_utc_naive(self.trial_expires_at)
         return bool(trial_exp and trial_exp > now)
@@ -76,11 +77,7 @@ class Subscription:
     def max_channels(self) -> int:
         if not self.is_active:
             return 0
-        if self.tier == "vip":
-            return 999
-        elif self.tier == "pro":
-            return 5
-        return 1
+        return TIER_MAX_CHANNELS.get(self.tier, TIER_MAX_CHANNELS["free"])
 
 @dataclass
 class Payment:
@@ -249,7 +246,8 @@ class StorySettings:
     require_price: bool = True
     filter_demands: bool = True
     background_style: str = "telegram_green"
-    is_active: bool = True
+    # Story automation starts only after the user explicitly enables it (account + source configured)
+    is_active: bool = False
     prime_hours_enabled: bool = True
     prime_hours_start: int = 9
     prime_hours_end: int = 22
@@ -309,5 +307,50 @@ class PostedStory:
     target_type: str = "self"
     posted_at: Optional[str] = None
     status: str = "success"
+
+@dataclass
+class SupplierConfig:
+    id: Optional[int] = None
+    provider_name: str = "Standard SMM/Reseller API"
+    api_url: str = "https://justanotherpanel.com/api/v2"
+    api_key: str = ""
+    margin_percent: float = 25.0  # Automatic profit margin
+    balance: float = 0.0
+    currency: str = "USD"
+    last_synced_at: Optional[str] = None
+    is_active: bool = True
+
+@dataclass
+class StoreProduct:
+    id: Optional[int] = None
+    supplier_id: int = 1
+    supplier_service_id: int = 0
+    name: str = ""
+    category: str = "Telegram"
+    type: str = "Default"
+    supplier_rate: float = 0.0
+    selling_price_stars: int = 50
+    min_quantity: int = 10
+    max_quantity: int = 10000
+    is_available: bool = True
+    stock_status: str = "in_stock"  # "in_stock", "out_of_stock"
+    description: str = ""
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+@dataclass
+class StoreOrder:
+    id: Optional[int] = None
+    user_id: int = 0
+    product_id: int = 0
+    product_name: str = ""
+    quantity: int = 1
+    price_stars: int = 0
+    target_link: str = ""
+    supplier_order_id: Optional[int] = None
+    status: str = "completed"  # "completed", "pending_admin", "failed"
+    admin_notified: bool = False
+    note: Optional[str] = None
+    created_at: Optional[str] = None
 
 

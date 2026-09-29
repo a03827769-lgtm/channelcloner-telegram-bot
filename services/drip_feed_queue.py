@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Set
 from database.db_manager import db_manager
 from database.models import ChannelPair
 
@@ -11,6 +11,15 @@ logger = logging.getLogger(__name__)
 
 # Standard Tashkent Timezone (UTC+5)
 UZB_TZ = timezone(timedelta(hours=5))
+
+# Night window of the "buffer" night mode (Tashkent time)
+NIGHT_START_HOUR = 23
+NIGHT_END_HOUR = 8
+# A post is never scheduled further ahead than this; a larger backlog is compacted at the horizon (the rate limiter
+# still spaces the actual sends), so queued media never waits for days.
+MAX_SCHEDULE_AHEAD = timedelta(hours=24)
+MAX_DISPATCH_RETRIES = 3
+
 
 class DripFeedQueueService:
     """
@@ -22,13 +31,25 @@ class DripFeedQueueService:
         """Returns current timezone-aware Uzbekistan datetime"""
         return datetime.now(UZB_TZ)
 
-    def is_night_time(self, start_hour: int = 23, end_hour: int = 8) -> bool:
+    def is_night_time(self, start_hour: int = NIGHT_START_HOUR, end_hour: int = NIGHT_END_HOUR) -> bool:
         """Returns True if current UTC+5 (Tashkent time) is in night window"""
-        now = self.get_current_time()
-        current_hour = now.hour
+        return self._is_night_hour(self.get_current_time().hour, start_hour, end_hour)
+
+    @staticmethod
+    def _is_night_hour(hour: int, start_hour: int = NIGHT_START_HOUR, end_hour: int = NIGHT_END_HOUR) -> bool:
         if start_hour > end_hour:
-            return current_hour >= start_hour or current_hour < end_hour
-        return start_hour <= current_hour < end_hour
+            return hour >= start_hour or hour < end_hour
+        return start_hour <= hour < end_hour
+
+    def _clamp_out_of_night(self, target_time: datetime) -> datetime:
+        """Moves a delivery time that falls into the night window to the next 08:00 (Tashkent time)."""
+        local = target_time.astimezone(UZB_TZ)
+        if not self._is_night_hour(local.hour):
+            return target_time
+        morning = local.replace(hour=NIGHT_END_HOUR, minute=0, second=0, microsecond=0)
+        if morning <= local:
+            morning += timedelta(days=1)
+        return morning
 
     async def calculate_scheduled_time(self, pair: ChannelPair) -> datetime:
         """Calculates next delivery datetime based on drip delay and night mode, staggering posts to prevent avalanches"""
@@ -37,9 +58,10 @@ class DripFeedQueueService:
         delay = timedelta(minutes=drip_delay_min)
         target_time = now + delay
 
-        if pair.night_mode == "buffer" and self.is_night_time():
+        night_buffer = pair.night_mode == "buffer"
+        if night_buffer and self.is_night_time():
             # Schedule for next morning 08:00 Tashkent time
-            target_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
+            target_time = now.replace(hour=NIGHT_END_HOUR, minute=0, second=0, microsecond=0)
             if target_time <= now:
                 target_time += timedelta(days=1)
 
@@ -50,6 +72,15 @@ class DripFeedQueueService:
             stagger_interval = timedelta(minutes=max(1, drip_delay_min))
             if latest_uzb >= target_time:
                 target_time = latest_uzb + stagger_interval
+
+        # Cap the backlog: never further ahead than MAX_SCHEDULE_AHEAD
+        horizon = now + MAX_SCHEDULE_AHEAD
+        if target_time > horizon:
+            target_time = horizon
+
+        # The night buffer applies to the delivery time, not only to "now"
+        if night_buffer:
+            target_time = self._clamp_out_of_night(target_time)
 
         return target_time
 
@@ -64,24 +95,58 @@ class DripFeedQueueService:
         return item_id
 
     @staticmethod
-    def _cleanup_payload_files(payload: Optional[Dict[str, Any]]):
+    def payload_media_paths(payload: Optional[Dict[str, Any]]) -> List[str]:
+        """Local media files referenced by a queued payload."""
+        if not isinstance(payload, dict):
+            return []
+        paths: List[str] = []
+        for key in ("media_path", "media_file_id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                paths.append(value)
+        for mf in payload.get("media_files", []) or []:
+            if isinstance(mf, dict) and isinstance(mf.get("path"), str) and mf.get("path"):
+                paths.append(mf["path"])
+        return paths
+
+    async def get_pending_media_paths(self) -> Set[str]:
+        """Media files referenced by pending queue rows; the temp cleaner must keep them until the row is done."""
+        paths: Set[str] = set()
+        async with db_manager.get_connection() as db:
+            cursor = await db.execute("SELECT msg_data_json FROM drip_queue WHERE status = 'pending'")
+            rows = await cursor.fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row[0])
+            except Exception:
+                continue
+            paths.update(self.payload_media_paths(payload))
+        return paths
+
+    @classmethod
+    def _cleanup_payload_files(cls, payload: Optional[Dict[str, Any]]):
         """Removes any temporary media files referenced in the queued payload"""
+        for m_path in cls.payload_media_paths(payload):
+            if os.path.isfile(m_path):
+                try:
+                    os.remove(m_path)
+                except Exception:
+                    logger.debug("Ignored exception", exc_info=True)
+
+    @staticmethod
+    async def _release_undelivered(pair_id: int, payload: Optional[Dict[str, Any]]):
+        """The queued source messages were never published: drop their "queued" records so catch-up / history
+        cloning can pick them up again. Messages already delivered by an earlier step are kept."""
         if not isinstance(payload, dict):
             return
-        m_path = payload.get("media_file_id")
-        if isinstance(m_path, str) and os.path.exists(m_path):
-            try:
-                os.remove(m_path)
-            except Exception:
-                logger.debug("Ignored exception", exc_info=True)
-        for mf in payload.get("media_files", []):
-            if isinstance(mf, dict):
-                mf_path = mf.get("path")
-                if isinstance(mf_path, str) and os.path.exists(mf_path):
-                    try:
-                        os.remove(mf_path)
-                    except Exception:
-                        logger.debug("Ignored exception", exc_info=True)
+        source_ids = [int(m) for m in (payload.get("source_msg_ids") or []) if str(m).lstrip("-").isdigit()]
+        progress = payload.get("progress") or {}
+        if not source_ids or progress.get("delivered_target_id"):
+            return
+        try:
+            await db_manager.forget_cloned_messages(pair_id, source_ids)
+        except Exception:
+            logger.debug("Could not release undelivered drip records", exc_info=True)
 
     async def start_worker(self, bot_instance, cloner_engine):
         """Asynchronous background worker polling and dispatching due drip posts"""
@@ -110,10 +175,20 @@ class DripFeedQueueService:
                             # Pair deleted or deactivated — mark as skipped, not sent, and clean up temporary files
                             await db_manager.mark_drip_item_done(item_id, "skipped")
                             self._cleanup_payload_files(payload)
+                            await self._release_undelivered(pair_id, payload)
                             logger.info(f"Drip item #{item_id} skipped: pair #{pair_id} inactive or not found")
+                    except asyncio.CancelledError:
+                        raise
+                    except FileNotFoundError as missing:
+                        # The queued media is gone and there is no text to publish: retrying cannot help
+                        logger.error(f"Drip item #{item_id} cannot be delivered: {missing}")
+                        await db_manager.mark_drip_item_done(item_id, "failed", error_message=str(missing)[:500])
+                        self._cleanup_payload_files(payload)
+                        await self._release_undelivered(pair_id, payload)
                     except Exception as e:
                         retries = (payload.get("retry_count", 0) if isinstance(payload, dict) else 0) + 1
-                        if retries <= 3 and isinstance(payload, dict):
+                        if retries <= MAX_DISPATCH_RETRIES and isinstance(payload, dict):
+                            # The engine records finished steps in payload["progress"], so a retry resumes after them
                             payload["retry_count"] = retries
                             logger.warning(f"Drip item #{item_id} transient error ({e}), rescheduling retry #{retries} in {30 * retries}s...")
                             new_sched = (datetime.now(timezone.utc) + timedelta(seconds=30 * retries)).strftime("%Y-%m-%d %H:%M:%S")
@@ -125,6 +200,7 @@ class DripFeedQueueService:
                             logger.error(f"Failed to dispatch drip item #{item_id} after {retries} attempts: {e}")
                             await db_manager.mark_drip_item_done(item_id, "failed", error_message=str(e)[:500])
                             self._cleanup_payload_files(payload)
+                            await self._release_undelivered(pair_id, payload)
             except asyncio.CancelledError:
                 logger.info("Drip feed worker cancelled; shutting down cleanly.")
                 break

@@ -24,6 +24,17 @@ from admin_bot.handlers.mtproto_auth import (
     AuthStates, process_phone_input, process_code_input, process_2fa_input
 )
 
+SUPER_ADMIN_ID = 8881989487
+
+
+@pytest.fixture(autouse=True)
+def super_admin_configured():
+    """The handlers under test are super-admin-only: the test user is the configured super admin."""
+    with patch.object(settings, "ADMIN_IDS_RAW", str(SUPER_ADMIN_ID)), \
+         patch.object(settings, "PRIMARY_SUPER_ADMIN_ID", 0):
+        yield
+
+
 @pytest.fixture
 def memory_storage():
     return MemoryStorage()

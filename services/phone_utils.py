@@ -23,9 +23,9 @@ def normalize_phone_number(raw_phone: str) -> Tuple[bool, str, Optional[str]]:
     if not digits_only:
         return False, "", None
 
-    # Case 1: Already has plus
+    # Case 1: Already has plus (E.164 numbers have at most 15 digits)
     if cleaned.startswith("+"):
-        if len(digits_only) >= 10:
+        if 10 <= len(digits_only) <= 15:
             formatted = f"+{digits_only}"
             return True, formatted, format_display(formatted)
         elif len(digits_only) == 9:

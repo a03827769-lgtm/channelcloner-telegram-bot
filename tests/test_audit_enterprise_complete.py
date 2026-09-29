@@ -1,17 +1,13 @@
 import pytest
 import os
 import zipfile
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
-from config.settings import Settings, settings
 from database.db_manager import DatabaseManager
-from database.models import ChannelPair, User, Subscription
-from services.text_processor import TextProcessor
 from services.cloner_engine import ClonerEngine
 from services.video_watermark_service import video_watermark_service
 from services.media_handler import MediaHandler
 from services.disaster_recovery import DisasterRecoveryService
-from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
+from aiogram.exceptions import TelegramRetryAfter
 
 import pytest_asyncio
 
@@ -155,17 +151,23 @@ async def test_disaster_recovery_unlimited_limit(db):
             db=db
         )
 
-    res = await service.restore_channel(
-        bot=mock_bot,
-        pair_id=pair_id,
-        new_target_channel="-100999999",
-        limit=None,
-        db=db
-    )
+    destination = MagicMock(id=-100999999)
+    with patch("services.disaster_recovery.verify_destination_access",
+               new=AsyncMock(return_value=(True, destination, None))), \
+         patch.object(DisasterRecoveryService, "SEND_INTERVAL_SECONDS", 0):
+        res = await service.restore_channel(
+            bot=mock_bot,
+            pair_id=pair_id,
+            new_target_channel="-100999999",
+            limit=None,
+            db=db,
+            requester_id=555
+        )
 
     assert res["total_archived"] == 3
     assert res["restored"] == 3
     assert res["failed"] == 0
+    assert mock_bot.send_message.await_count == 3
 
 @pytest.mark.asyncio
 async def test_admin_backup_zip_creation(tmp_path):

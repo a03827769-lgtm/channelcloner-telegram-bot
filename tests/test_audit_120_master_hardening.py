@@ -1,13 +1,10 @@
-import os
-import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from database.db_manager import DatabaseManager
 from bot.filters.admin_filter import IsAdminFilter
 from services.text_processor import TextProcessor
-from services.video_watermark_service import video_watermark_service
-from services.media_handler import MediaGroupBuffer, MediaHandler
+from services.media_handler import MediaHandler
 
 @pytest.mark.asyncio
 async def test_pair_toggle_and_update_cache_invalidation(tmp_path):
@@ -102,23 +99,29 @@ async def test_activate_subscription_resets_trial_notified(tmp_path):
 
 @pytest.mark.asyncio
 async def test_is_admin_filter_dynamic_db_check():
-    """Verify IsAdminFilter properly awaits db_manager.is_admin for database-persisted admins"""
+    """IsAdminFilter recognises database-granted admins through the in-memory admin cache (filled at startup
+    and on every grant/revoke), so filtering the updates of regular users costs no database query"""
     flt = IsAdminFilter()
     mock_event = MagicMock()
     mock_event.from_user.id = 99999
 
-    with patch("bot.filters.admin_filter.db_manager.is_admin", new_callable=AsyncMock) as mock_is_admin:
-        mock_is_admin.return_value = True
-        res = await flt(mock_event)
-        assert res is True
-        mock_is_admin.assert_called_once_with(99999)
+    with patch("bot.filters.admin_filter.db_manager.is_admin_sync", return_value=True) as sync_check, \
+         patch("bot.filters.admin_filter.db_manager.is_admin", new_callable=AsyncMock) as db_check:
+        assert await flt(mock_event) is True
+        sync_check.assert_called_once_with(99999)
+        db_check.assert_not_called()
+
+    with patch("bot.filters.admin_filter.db_manager.is_admin_sync", return_value=False):
+        assert await flt(mock_event) is False
 
 def test_clean_links_preserves_html_attribute_usernames():
     """Verify that usernames inside HTML attributes are not corrupted by regex"""
     html_text = "<a href=\"https://example.com/checkout?aff=@superaffiliate\">Kanalga kirish</a> va @public_channel_to_remove obuna bo'ling"
     cleaned = TextProcessor.clean_links_and_usernames(html_text)
-    assert "@superaffiliate" in cleaned or "https://example.com/checkout?aff=@superaffiliate" in cleaned or "Kanalga kirish" in cleaned
+    # The anchor (and the @ inside its href) is kept intact; only the bare @username in the text is removed
+    assert '<a href="https://example.com/checkout?aff=@superaffiliate">Kanalga kirish</a>' in cleaned
     assert "@public_channel_to_remove" not in cleaned
+    assert cleaned.endswith("obuna bo'ling")
 
 @pytest.mark.asyncio
 async def test_media_handler_flush_pending_albums():

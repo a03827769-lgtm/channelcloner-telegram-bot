@@ -2,7 +2,6 @@ import asyncio
 import ctypes
 import gc
 import logging
-import os
 import sys
 import time
 
@@ -15,9 +14,12 @@ class SystemSupervisor:
     - Memory Optimizer (periodic GC collection and Linux malloc_trim)
     - Prevents Docker OOM crashes and keeps RAM < 200MB indefinitely
     """
-    def __init__(self, memory_interval: int = 300, lag_threshold_ms: float = 150.0):
+    def __init__(self, memory_interval: int = 300, lag_threshold_ms: float = 150.0, lag_report_interval: float = 60.0):
         self.memory_interval = memory_interval
         self.lag_threshold_ms = lag_threshold_ms
+        # Lag warnings are rate limited: a CPU-heavy phase (video watermarking, big albums) would otherwise
+        # write one line every 0.5 s and push everything else out of the in-memory log viewer.
+        self.lag_report_interval = lag_report_interval
         self._is_running = False
         self._tasks = []
         self._libc = None
@@ -48,6 +50,13 @@ class SystemSupervisor:
                 t.cancel()
         self._tasks.clear()
 
+    async def aclose(self, timeout: float = 5.0):
+        """Stops the supervisor loops and waits (bounded) until they have exited."""
+        tasks = [t for t in self._tasks if not t.done()]
+        self.stop()
+        if tasks:
+            await asyncio.wait(tasks, timeout=timeout)
+
     async def _memory_loop(self):
         try:
             gc.set_threshold(50000, 10, 10)
@@ -76,6 +85,9 @@ class SystemSupervisor:
 
     async def _lag_monitor_loop(self):
         interval = 0.5
+        last_report = 0.0
+        suppressed = 0
+        worst_ms = 0.0
         while self._is_running:
             try:
                 t0 = time.monotonic()
@@ -83,7 +95,16 @@ class SystemSupervisor:
                 elapsed = time.monotonic() - t0
                 lag_ms = (elapsed - interval) * 1000.0
                 if lag_ms > self.lag_threshold_ms:
-                    logger.warning(f"⚠️ Event loop lag detected: {lag_ms:.1f}ms! (A blocking operation ran on main thread)")
+                    worst_ms = max(worst_ms, lag_ms)
+                    now = time.monotonic()
+                    if now - last_report >= self.lag_report_interval:
+                        extra = f" ({suppressed} more stalls since the last report)" if suppressed else ""
+                        logger.warning(f"⚠️ Event loop lag detected: {worst_ms:.1f}ms! (A blocking operation ran on main thread){extra}")
+                        last_report = now
+                        suppressed = 0
+                        worst_ms = 0.0
+                    else:
+                        suppressed += 1
             except asyncio.CancelledError:
                 break
             except Exception as e:

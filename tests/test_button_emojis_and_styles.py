@@ -6,11 +6,9 @@ from bot.keyboards.inline_buttons import (
     get_main_menu_keyboard,
     get_quickstart_keyboard,
     get_cloner_menu_keyboard,
-    get_pairs_list_keyboard,
     get_pair_detail_keyboard,
     get_translate_lang_keyboard,
     get_history_count_keyboard,
-    get_delete_confirmation_keyboard,
     get_video_watermark_keyboard,
     get_drip_feed_keyboard,
     get_ai_paraphrase_keyboard,
@@ -19,17 +17,13 @@ from bot.keyboards.inline_buttons import (
 )
 from bot.keyboards.stars_keyboards import (
     get_stars_plans_keyboard,
-    get_back_to_stars_keyboard,
 )
 from admin_bot.keyboards.admin_keyboards import (
-    get_admin_reply_keyboard,
     get_admin_dashboard_keyboard,
-    get_auth_menu_keyboard,
-    get_logout_confirm_keyboard,
 )
 from services.custom_emojis import (
-    ID_SUCCESS, ID_ERROR, ID_STARS, ID_CROWN, ID_HOME, ID_BACK, ID_FLASH,
-    ID_ROCKET, ID_STATS, ID_FAQ, ID_TRASH, ID_FLAG_UZ, ID_SETTINGS, ID_REFRESH
+    ID_SUCCESS, ID_ERROR, ID_STARS, ID_CROWN, ID_FLASH,
+    ID_ROCKET, ID_STATS, ID_TRASH, ID_FLAG_UZ, ID_REFRESH
 )
 
 class TestButtonEmojisAndStyles(unittest.TestCase):

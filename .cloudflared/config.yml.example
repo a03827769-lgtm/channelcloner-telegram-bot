@@ -1,0 +1,19 @@
+# Named Cloudflare tunnel for the Telegram Mini App — example configuration.
+#
+# 1. cloudflared tunnel login
+# 2. cloudflared tunnel create miniapp          -> prints the tunnel UUID and writes <UUID>.json
+# 3. cloudflared tunnel route dns miniapp app.example.com
+# 4. Copy this file to .cloudflared/config.yml, put the credentials JSON next to it and
+#    replace the placeholders. config.yml and *.json are git-ignored: they never leave the host.
+#
+# Paths are the ones seen by the `cloudflared` container of docker-compose.yml
+# (./.cloudflared is mounted read-only at /etc/cloudflared).
+tunnel: 00000000-0000-0000-0000-000000000000
+credentials-file: /etc/cloudflared/00000000-0000-0000-0000-000000000000.json
+
+ingress:
+  # Docker edge proxy (docker-compose `miniapp_web`), which forwards to the bot on port 8080.
+  # When cloudflared runs on the Windows host itself (watchdog), use http://127.0.0.1:8080 instead.
+  - hostname: app.example.com
+    service: http://miniapp_web:80
+  - service: http_status:404

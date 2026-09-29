@@ -1,186 +1,239 @@
 #!/usr/bin/env python3
 """
 ==============================================================================
-Oracle Cloud Always Free "Anti-Reclamation" Professional Daemon
+Oracle Cloud Always Free anti-reclamation helper (OPTIONAL)
 ==============================================================================
-Guarantees 24/7 immunity against Oracle Cloud's 7-day idle reclamation policy:
-1. Dynamic Memory Keeper: Allocates exactly 24% of VM Total RAM (satisfies RAM >= 20% rule).
-2. Calibrated Low-Priority CPU Generator: Maintains ~22-25% CPU at nice=19 (satisfies CPU >= 20% rule).
-3. Outbound Network & Health Heartbeat: Regular ping to Telegram API & Health server (satisfies Network >= 20% rule).
-4. Status Telemetry: Writes real-time metrics to /tmp/oracle_anti_reclaim_status.json for Admin Bot.
+Oracle may reclaim an Always Free instance that stayed idle for 7 days: 95th-percentile CPU below 20%,
+network below 20% and — on Ampere A1 shapes — memory below 20%. This helper keeps the VM above them:
+
+* Memory: reserves ANTI_RECLAIM_RAM_PERCENT (default 24%) of the RAM and keeps the pages resident
+  (on hosts with less than 2 GB only a small, safe amount).
+* CPU: one worker PROCESS per core, each busy for ANTI_RECLAIM_CPU_PERCENT (default 23%) of every second
+  at nice 19 — threads could not do this, the GIL serialised them onto a single core (~23% of ONE core).
+  The bot always wins the CPU because the workers run at the lowest priority.
+* Network: a light HTTPS heartbeat every minute.
+
+Status for the admin bot is written atomically to <tempdir>/oracle_anti_reclaim_status.json.
+
+It burns CPU and RAM on purpose: install it only on Oracle Always Free instances
+(`sudo bash deploy/oracle_master_setup.sh --with-anti-reclaim`). ANTI_RECLAIM_CPU_PERCENT=0 disables
+the CPU workers, ANTI_RECLAIM_RAM_PERCENT=0 the memory reservation.
 ==============================================================================
 """
 
-import os
-import sys
-import time
 import json
+import logging
+import multiprocessing
+import os
 import signal
-import urllib.request
-import threading
-from datetime import datetime, timezone, timedelta
-
-# Set lowest process priority (nice = 19) so Telegram Bot and Docker get 100% precedence
-try:
-    os.nice(19)
-except Exception:
-    pass
-
+import sys
 import tempfile
+import threading
+import time
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional
+
+logger = logging.getLogger("AntiReclaim")
+
 STATUS_FILE = os.path.join(tempfile.gettempdir(), "oracle_anti_reclaim_status.json")
 UZB_TZ = timezone(timedelta(hours=5))
+HEARTBEAT_INTERVAL_SECONDS = 60
+PAGE_SIZE = 4096
+
+
+def _env_fraction(name: str, default: float) -> float:
+    """Reads a percentage (0-90) from the environment and returns it as a fraction."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw) / 100.0
+    except ValueError:
+        logger.warning(f"Invalid {name}={raw!r}; using {default * 100:.0f}%")
+        return default
+    return min(max(value, 0.0), 0.9)
+
+
+def cpu_burn_worker(duty_cycle: float, stop_event) -> None:
+    """Runs in a separate process: busy for `duty_cycle` of every second, asleep for the rest."""
+    try:
+        os.nice(19)
+    except (AttributeError, OSError):
+        pass
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    period = 1.0
+    busy = period * duty_cycle
+    counter = 0
+    while not stop_event.is_set():
+        start = time.monotonic()
+        while time.monotonic() - start < busy:
+            counter = (counter * 1103515245 + 12345) % 2147483648
+        stop_event.wait(max(0.01, period - (time.monotonic() - start)))
+
+
+def write_status_atomic(path: str, data: dict) -> None:
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".anti_reclaim_", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
 
 class OracleAntiReclaimDaemon:
-    def __init__(self, target_ram_pct: float = 0.24, target_cpu_pct: float = 0.23):
-        self.target_ram_pct = target_ram_pct
-        self.target_cpu_pct = target_cpu_pct
+    def __init__(self, target_ram_pct: Optional[float] = None, target_cpu_pct: Optional[float] = None):
+        self.target_ram_pct = _env_fraction("ANTI_RECLAIM_RAM_PERCENT", 0.24) if target_ram_pct is None else target_ram_pct
+        self.target_cpu_pct = _env_fraction("ANTI_RECLAIM_CPU_PERCENT", 0.23) if target_cpu_pct is None else target_cpu_pct
+        self.health_url = os.getenv("ANTI_RECLAIM_HEALTH_URL", "http://127.0.0.1:8080/health")
         self.is_running = True
         self.total_ram_mb = self._get_total_memory_mb()
         if self.total_ram_mb < 2048:
+            # Small VMs (1 GB AMD micro): never starve the bot
             self.allocated_ram_mb = min(120, int(self.total_ram_mb * 0.12))
         else:
             self.allocated_ram_mb = int(self.total_ram_mb * self.target_ram_pct)
-        self.allocated_buffer = None
+        if self.target_ram_pct <= 0:
+            self.allocated_ram_mb = 0
+        self.allocated_buffer: Optional[bytearray] = None
         self.heartbeat_count = 0
         self.cpu_cores = os.cpu_count() or 1
+        self._stop_event = None
+        self._workers: List[multiprocessing.Process] = []
 
-    def _get_total_memory_mb(self) -> int:
-        """Reads Total Physical Memory from /proc/meminfo or psutil fallback"""
-        try:
-            with open("/proc/meminfo", "r") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        kb = int(line.split()[1])
-                        return kb // 1024
-        except Exception:
-            pass
+    @staticmethod
+    def _get_total_memory_mb() -> int:
+        """Total physical memory from /proc/meminfo, psutil as a fallback."""
+        if os.path.exists("/proc/meminfo"):
+            try:
+                with open("/proc/meminfo", "r") as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            return int(line.split()[1]) // 1024
+            except (OSError, ValueError):
+                pass
         try:
             import psutil
             return psutil.virtual_memory().total // (1024 * 1024)
         except Exception:
-            pass
-        return 2048
+            return 2048
 
-    def start_memory_keeper(self):
-        """Allocates a resident memory block and periodically touches pages to prevent swapping"""
+    def start_memory_keeper(self) -> None:
+        """Allocates the resident block (always leaving 150 MB of the available RAM for the bot)."""
+        target_mb = self.allocated_ram_mb
         try:
-            target_mb = self.allocated_ram_mb
+            import psutil
+            available_mb = psutil.virtual_memory().available // (1024 * 1024)
+            target_mb = min(target_mb, max(0, available_mb - 150))
+        except Exception:
+            pass
+        if target_mb <= 0:
+            logger.info("Memory keeper: nothing reserved (disabled or low available RAM)")
+            self.allocated_ram_mb = 0
+            return
+        self.allocated_buffer = bytearray(target_mb * 1024 * 1024)
+        self.allocated_ram_mb = target_mb
+        self.touch_memory()
+        logger.info(f"Memory keeper: {target_mb} MB reserved ({target_mb / max(1, self.total_ram_mb) * 100:.1f}% of {self.total_ram_mb} MB)")
+
+    def touch_memory(self) -> None:
+        """Writes one byte per page so the kernel keeps the whole block resident."""
+        buf = self.allocated_buffer
+        if buf:
+            pages = len(range(0, len(buf), PAGE_SIZE))
+            buf[::PAGE_SIZE] = b"\x01" * pages
+
+    def start_cpu_workers(self) -> None:
+        if self.target_cpu_pct <= 0:
+            logger.info("CPU workers disabled (ANTI_RECLAIM_CPU_PERCENT=0)")
+            return
+        self._stop_event = multiprocessing.Event()
+        for index in range(self.cpu_cores):
+            worker = multiprocessing.Process(
+                target=cpu_burn_worker,
+                args=(self.target_cpu_pct, self._stop_event),
+                name=f"anti-reclaim-cpu-{index}",
+                daemon=True,
+            )
+            worker.start()
+            self._workers.append(worker)
+        logger.info(f"CPU workers: {len(self._workers)} processes at {self.target_cpu_pct * 100:.0f}% duty cycle (nice 19)")
+
+    def stop(self) -> None:
+        self.is_running = False
+        if self._stop_event is not None:
+            self._stop_event.set()
+        for worker in self._workers:
+            worker.join(timeout=3)
+            if worker.is_alive():
+                worker.terminate()
+        self._workers = []
+        try:
+            os.remove(STATUS_FILE)
+        except OSError:
+            pass
+
+    def status_payload(self) -> dict:
+        return {
+            "status": "active",
+            "total_ram_mb": self.total_ram_mb,
+            "allocated_ram_mb": self.allocated_ram_mb,
+            "ram_percent": round((self.allocated_ram_mb / max(1, self.total_ram_mb)) * 100, 1),
+            "cpu_cores": self.cpu_cores,
+            "cpu_workers": len(self._workers),
+            "target_cpu_percent": round(self.target_cpu_pct * 100, 1),
+            "network_heartbeats": self.heartbeat_count,
+            "last_heartbeat": datetime.now(UZB_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def heartbeat_once(self) -> None:
+        self.heartbeat_count += 1
+        for name, url in (("Bot health", self.health_url), ("Telegram API", "https://api.telegram.org"),
+                          ("Cloudflare DNS", "https://1.1.1.1")):
             try:
-                import psutil
-                avail_mb = psutil.virtual_memory().available // (1024 * 1024)
-                # Always leave at least 150MB free for bot process and system services
-                safe_cap = max(16, avail_mb - 150)
-                target_mb = min(target_mb, safe_cap)
-            except Exception:
-                pass
-
-            if target_mb <= 0:
-                print("[-] Memory Keeper: Low available system RAM, skipping artificial reservation.")
-                return
-
-            size_bytes = target_mb * 1024 * 1024
-            self.allocated_buffer = bytearray(size_bytes)
-            
-            # Touch memory pages across the entire buffer so kernel commits physical RAM (RSS)
-            page_size = 4096
-            for i in range(0, size_bytes, page_size):
-                self.allocated_buffer[i] = 1
-
-            print(f"[+] Memory Keeper: Safely reserved {target_mb} MB ({target_mb/self.total_ram_mb*100:.1f}% of {self.total_ram_mb} MB Total RAM).")
-        except Exception as e:
-            print(f"[-] Memory Keeper error: {e}", file=sys.stderr)
-
-    def cpu_worker(self):
-        """Generates calibrated, steady ~22-25% CPU pulse across available cores"""
-        cycle_sec = 1.0
-        active_sec = cycle_sec * self.target_cpu_pct
-
-        while self.is_running:
-            start_time = time.monotonic()
-            # Active computation phase
-            while (time.monotonic() - start_time) < active_sec:
-                _ = (314159 * 271828) % 1000007
-
-            # Idle sleep phase
-            elapsed_active = time.monotonic() - start_time
-            remaining_sleep = max(0.01, cycle_sec - elapsed_active)
-            time.sleep(remaining_sleep)
-
-    def network_and_health_heartbeat(self):
-        """Sends periodic outbound network requests and updates status JSON"""
-        endpoints = [
-            ("Docker Local Health", "http://127.0.0.1:8080/health"),
-            ("Telegram MTProto Gateway", "https://api.telegram.org"),
-            ("Cloudflare DNS", "https://1.1.1.1")
-        ]
-
-        while self.is_running:
-            self.heartbeat_count += 1
-            now_str = datetime.now(UZB_TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-            for name, url in endpoints:
-                try:
-                    req = urllib.request.Request(url, headers={"User-Agent": "Oracle-Anti-Reclaim-Daemon/2.0"})
-                    with urllib.request.urlopen(req, timeout=5) as response:
-                        _ = response.read(128)
-                except Exception:
-                    pass
-
-            # Write telemetry file for Admin Bot inspection
-            actual_ram_pct = round((self.allocated_ram_mb / max(1, self.total_ram_mb)) * 100, 1)
-            status_data = {
-                "status": "active",
-                "total_ram_mb": self.total_ram_mb,
-                "allocated_ram_mb": self.allocated_ram_mb,
-                "ram_percent": actual_ram_pct,
-                "cpu_cores": self.cpu_cores,
-                "target_cpu_percent": round(self.target_cpu_pct * 100, 1),
-                "network_heartbeats": self.heartbeat_count,
-                "last_heartbeat": now_str,
-                "oracle_7day_safety": "100% SECURE (CPU >= 20%, RAM >= 20%, Network active)"
-            }
-
-            try:
-                with open(STATUS_FILE + ".tmp", "w") as f:
-                    json.dump(status_data, f, indent=2)
-                os.replace(STATUS_FILE + ".tmp", STATUS_FILE)
+                req = urllib.request.Request(url, headers={"User-Agent": "Oracle-Anti-Reclaim/3.0"})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    response.read(128)
             except Exception as e:
-                print(f"[-] Status write error: {e}", file=sys.stderr)
+                logger.debug(f"Heartbeat {name} skipped: {e}")
+        self.touch_memory()
+        try:
+            write_status_atomic(STATUS_FILE, self.status_payload())
+        except OSError as e:
+            logger.warning(f"Status write failed: {e}")
 
-            time.sleep(60)
-
-    def run(self):
-        print(f"[*] Starting Oracle Anti-Reclamation Daemon v2.0 (Cores: {self.cpu_cores}, Total RAM: {self.total_ram_mb} MB)...")
+    def run(self) -> None:
+        try:
+            os.nice(19)
+        except (AttributeError, OSError):
+            pass
+        logger.info(f"Starting anti-reclaim helper (cores: {self.cpu_cores}, RAM: {self.total_ram_mb} MB)")
         self.start_memory_keeper()
+        self.start_cpu_workers()
 
-        # Start CPU worker threads for each core
-        cpu_threads = []
-        for _ in range(self.cpu_cores):
-            t = threading.Thread(target=self.cpu_worker, daemon=True)
-            t.start()
-            cpu_threads.append(t)
+        stop_requested = threading.Event()
 
-        # Start Network & Heartbeat thread
-        hb_thread = threading.Thread(target=self.network_and_health_heartbeat, daemon=True)
-        hb_thread.start()
+        def _on_signal(signum, frame):
+            logger.info(f"Signal {signum} received; stopping")
+            stop_requested.set()
 
-        # Handle graceful shutdown
-        def sig_handler(sig, frame):
-            print("\n[!] Stopping Oracle Anti-Reclamation Daemon...")
-            self.is_running = False
-            try:
-                if os.path.exists(STATUS_FILE):
-                    os.remove(STATUS_FILE)
-            except Exception:
-                pass
-            sys.exit(0)
+        signal.signal(signal.SIGINT, _on_signal)
+        signal.signal(signal.SIGTERM, _on_signal)
+        try:
+            while not stop_requested.is_set():
+                self.heartbeat_once()
+                stop_requested.wait(HEARTBEAT_INTERVAL_SECONDS)
+        finally:
+            self.stop()
 
-        signal.signal(signal.SIGINT, sig_handler)
-        signal.signal(signal.SIGTERM, sig_handler)
-
-        while self.is_running:
-            time.sleep(1)
 
 if __name__ == "__main__":
-    daemon = OracleAntiReclaimDaemon(target_ram_pct=0.24, target_cpu_pct=0.23)
-    daemon.run()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    OracleAntiReclaimDaemon().run()
+    sys.exit(0)

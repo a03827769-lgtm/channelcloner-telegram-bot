@@ -1,5 +1,6 @@
 import unittest
 import os
+import tempfile
 import uuid
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,14 +12,15 @@ from services.disaster_recovery import disaster_recovery_service
 
 class TestAudit100FixesV2(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        os.makedirs("temp_media", exist_ok=True)
-        self.test_db_path = f"temp_media/test_audit_{uuid.uuid4().hex[:8]}.db"
+        self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.test_db_path = os.path.join(self._tmp_dir.name, f"test_audit_{uuid.uuid4().hex[:8]}.db")
         self.db = DatabaseManager(self.test_db_path)
         await self.db.init_db()
 
     async def asyncTearDown(self):
         from tests.test_utils import safe_cleanup_db
         await safe_cleanup_db(self.test_db_path, self.db)
+        self._tmp_dir.cleanup()
 
     async def test_get_user_subscription_concurrency(self):
         """DB-01: Multiple concurrent get_user_subscription calls should not lock SQLite"""
@@ -164,7 +166,10 @@ class TestAudit100FixesV2(unittest.IsolatedAsyncioTestCase):
         mock_bot.send_photo.side_effect = Exception("TelegramBadRequest: wrong type of file_id")
         mock_bot.send_video.return_value = MagicMock()
 
+        owner_id = 4242
         mock_db = AsyncMock()
+        mock_db.get_pair_by_id.return_value = MagicMock(user_id=owner_id)
+        mock_db.get_channel_backup_count.return_value = 1
         mock_db.get_channel_backups.return_value = [
             {
                 "text": "Caption video",
@@ -173,13 +178,19 @@ class TestAudit100FixesV2(unittest.IsolatedAsyncioTestCase):
                 "message_id": 101
             }
         ]
+        destination = MagicMock(id=-1001234567890)
 
-        res = await disaster_recovery_service.restore_channel(
-            bot=mock_bot,
-            pair_id=1,
-            new_target_channel="@target",
-            db=mock_db
-        )
+        with patch("services.disaster_recovery.verify_destination_access",
+                   new=AsyncMock(return_value=(True, destination, None))), \
+             patch.object(type(disaster_recovery_service), "SEND_INTERVAL_SECONDS", 0):
+            res = await disaster_recovery_service.restore_channel(
+                bot=mock_bot,
+                pair_id=1,
+                new_target_channel="@target",
+                db=mock_db,
+                requester_id=owner_id
+            )
         self.assertEqual(res["restored"], 1)
         self.assertEqual(res["failed"], 0)
         mock_bot.send_video.assert_called_once()
+        self.assertEqual(mock_bot.send_video.call_args.kwargs["chat_id"], destination.id)

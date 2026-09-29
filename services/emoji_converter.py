@@ -76,7 +76,6 @@ EMOJI_TO_PREMIUM_ID: Dict[str, str] = {
     "🎯": "5330088116944380969",
     "👉": "5332819376842226496",
     "👈": "5877629862306385808",
-    "👇": "5332348837405145999",
     "👆": "5886505193180239900",
     "📍": "5206246162348136684",
     "📌": "5796440171364749940",
@@ -200,12 +199,9 @@ EMOJI_TO_PREMIUM_ID: Dict[str, str] = {
     "🏡": "5278702045883292456",
     "🏘️": "5278702045883292456",
     "🛋️": "5278702045883292456",
-    "🛏️": "5332632279476886878",
     "📐": "5877495434124988415",
     "📏": "5877495434124988415",
     "🤝": "5778575233422200567",
-    "🚗": "5372917041193828849",
-    "🚘": "5372917041193828849",
     "🌳": "5778184941154078090",
     "🌲": "5778184941154078090",
     "☀️": "5463289097336405244",
@@ -249,13 +245,11 @@ EMOJI_TO_PREMIUM_ID: Dict[str, str] = {
     "🔻": "5875008416132370818",
     "🔺": "5332348837405145999",
     "🟢": "5456432998092133477",
-    "🔴": "5161208387957950108",
     "🔵": "5427168083074628963",
     "🟡": "5463289097336405244",
     "🟣": "5438496463044752972",
     "🟤": "5350396951407895212",
     "🟠": "5463289097336405244",
-    "🟥": "5161208387957950108",
     "🟦": "5427168083074628963",
     "🟩": "5456432998092133477",
     "🟨": "5463289097336405244",
@@ -277,7 +271,6 @@ EMOJI_TO_PREMIUM_ID: Dict[str, str] = {
     "❕": "5447644880824181073",
     "‼️": "5447644880824181073",
     "⁉️": "5447644880824181073",
-    "🔟": "5208519140645551525",
     "💯": "5402406965252989103",
     "⬆️": "5332348837405145999",
     "⬇️": "5875008416132370818",
@@ -287,7 +280,6 @@ EMOJI_TO_PREMIUM_ID: Dict[str, str] = {
     "↖️": "5352759161945867747",
     "↔️": "5258440967161137445",
     "↕️": "5258440967161137445",
-    "🔄": "5258440967161137445",
     "🌴": "5778184941154078090",
     "🌊": "5427168083074628963",
     "💥": "5402406965252989103",
@@ -302,8 +294,6 @@ EMOJI_TO_PREMIUM_ID: Dict[str, str] = {
     "🏭": "5319084384962248505",
     "☑️": "5456432998092133477",
     "❎": "5161208387957950108",
-    "➕": "5456432998092133477",
-    "➖": "5161208387957950108",
     "➗": "5350396951407895212",
     "📋": "5233237686751355290",
     "🚨": "5447644880824181073",
@@ -323,9 +313,34 @@ for emoji_char, emoji_id in list(EMOJI_TO_PREMIUM_ID.items()):
         _EXTRA_MAP[clean_char] = emoji_id
 EMOJI_TO_PREMIUM_ID.update(_EXTRA_MAP)
 
-# Build regex pattern sorted by length descending to match composite emojis first
-_SORTED_EMOJIS = sorted(EMOJI_TO_PREMIUM_ID.keys(), key=len, reverse=True)
-_EMOJI_REGEX = re.compile("|".join(re.escape(e) for e in _SORTED_EMOJIS))
+# Tokenizer for whole emoji grapheme clusters: flag pairs, keycaps and ZWJ / skin-tone / tag sequences are taken as
+# one unit, so a cluster is converted only when the WHOLE cluster is in the map. Parts of sequences such as 👍🏽, ❤️‍🔥,
+# 👨‍💻 or the second half of 🇫🇷 are never wrapped on their own.
+_EMOJI_BASE = r'[©®‼⁉™ℹ↔-↙↩↪⌚-⏿Ⓜ▪-➿⤴⤵⬅-⭕〰〽㊗㊙\U0001F000-\U0001FAFF]'
+_EMOJI_ELEMENT = _EMOJI_BASE + r'[︎️]?[\U0001F3FB-\U0001F3FF]?(?:[\U000E0020-\U000E007E]+\U000E007F)?'
+_EMOJI_CLUSTER_REGEX = re.compile(
+    r'[\U0001F1E6-\U0001F1FF]{2}'
+    r'|[0-9#*]️?⃣'
+    r'|' + _EMOJI_ELEMENT + r'(?:‍' + _EMOJI_ELEMENT + r')*'
+)
+
+
+def _premium_id_for(cluster: str):
+    """Premium emoji id for a whole emoji cluster, or None. Text-presentation clusters (U+FE0E) stay plain."""
+    if "︎" in cluster:
+        return None
+    emoji_id = EMOJI_TO_PREMIUM_ID.get(cluster)
+    if emoji_id is None:
+        emoji_id = EMOJI_TO_PREMIUM_ID.get(cluster.replace("️", ""))
+    return emoji_id
+
+
+def _wrap_cluster(match: re.Match) -> str:
+    cluster = match.group(0)
+    emoji_id = _premium_id_for(cluster)
+    if emoji_id is None:
+        return cluster
+    return f'<tg-emoji emoji-id="{emoji_id}">{cluster}</tg-emoji>'
 
 # Regex to find existing HTML tags (including complete <a>...</a>, <tg-emoji>...</tg-emoji>, <code>...</code>, <pre>...</pre>)
 # This ensures emojis inside anchor tags or existing custom tags are NOT double-wrapped
@@ -356,12 +371,8 @@ class EmojiConverter:
                 # Preserve existing HTML tags and their inner content untouched
                 result_parts.append(part)
             else:
-                # Replace unicode emojis in plain text chunks
-                converted = _EMOJI_REGEX.sub(
-                    lambda m: f'<tg-emoji emoji-id="{EMOJI_TO_PREMIUM_ID[m.group(0)]}">{m.group(0)}</tg-emoji>',
-                    part
-                )
-                result_parts.append(converted)
+                # Replace whole unicode emoji clusters in plain text chunks
+                result_parts.append(_EMOJI_CLUSTER_REGEX.sub(_wrap_cluster, part))
 
         return "".join(result_parts)
 

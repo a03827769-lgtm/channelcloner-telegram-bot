@@ -1,5 +1,4 @@
 import unittest
-import asyncio
 import os
 from unittest.mock import AsyncMock, MagicMock
 from aiogram.types import CallbackQuery, Message

@@ -1,6 +1,6 @@
 import re
 import logging
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 try:
@@ -9,6 +9,15 @@ except Exception:
     ReplyInlineMarkup = None
 
 logger = logging.getLogger(__name__)
+
+# Links into Telegram: t.me / telegram.me / telegram.dog (also username.t.me) and every tg:// deep link
+_TELEGRAM_LINK_RE = re.compile(
+    r'^(?:https?://)?(?:www\.)?(?:[a-z0-9_-]{1,64}\.)?(?:t\.me|telegram\.me|telegram\.dog)(?:[/?#]|$)|^tg:',
+    re.IGNORECASE
+)
+# Inline URL buttons only accept these schemes; anything else makes Telegram reject the whole post
+_ALLOWED_BUTTON_URL_RE = re.compile(r'^(?:https?://|tg://)\S+$', re.IGNORECASE)
+
 
 class SmartButtonRemapper:
     """
@@ -53,6 +62,10 @@ class SmartButtonRemapper:
             logger.debug(f"Button extraction notice: {e}")
             return None
 
+    @staticmethod
+    def is_telegram_link(url: str) -> bool:
+        return bool(_TELEGRAM_LINK_RE.match((url or "").strip()))
+
     @classmethod
     def build_remapped_markup(
         cls,
@@ -63,6 +76,8 @@ class SmartButtonRemapper:
     ) -> Optional[InlineKeyboardMarkup]:
         """
         Builds a production Aiogram InlineKeyboardMarkup with remapped URLs.
+        Buttons pointing into Telegram (another channel, bot or invite) are remapped to the destination channel,
+        or dropped when the destination has no public link; buttons with unsupported URL schemes are dropped.
         """
         inline_keyboard: List[List[InlineKeyboardButton]] = []
 
@@ -76,11 +91,17 @@ class SmartButtonRemapper:
                     if not text or not url:
                         continue
 
-                    # Check if link points to another Telegram channel / group
-                    is_tg_link = bool(re.search(r'(?:t\.me|telegram\.me)\/(?:[a-zA-Z0-9_\+]+)', url, re.IGNORECASE))
-                    if is_tg_link and block_competitor_links and target_channel_link:
+                    # Check if link points to another Telegram channel / group / bot
+                    if block_competitor_links and cls.is_telegram_link(url):
+                        if not target_channel_link:
+                            logger.debug(f"Dropping competitor button '{text}' ({url}): destination has no public link")
+                            continue
                         # Remap competitor channel link to our destination channel
                         url = target_channel_link
+
+                    if not _ALLOWED_BUTTON_URL_RE.match(url):
+                        logger.debug(f"Dropping button '{text}' with unsupported URL scheme")
+                        continue
 
                     aiogram_row.append(InlineKeyboardButton(text=text, url=url))
                 if aiogram_row:

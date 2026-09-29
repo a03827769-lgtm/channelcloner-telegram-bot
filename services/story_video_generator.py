@@ -1,6 +1,6 @@
 import os
-import sys
 import time
+import uuid
 import asyncio
 import glob
 import random
@@ -12,19 +12,44 @@ from typing import List, Optional, Dict, Any, Tuple
 from PIL import Image, ImageFilter
 
 from services.story_renderer import story_card_renderer
+from services.render_queue import render_queue
 
 logger = logging.getLogger(__name__)
+
+STORY_FPS = 30
+FULL_HD_SIZE = (1080, 1920)
+# Telegram's own clients upload video stories at 720x1280; used on small hosts (OOM / slow CPU)
+LOW_MEMORY_SIZE = (720, 1280)
+MIN_DURATION = 15.0
+MAX_DURATION = 40.0
+# Blurred ambient slides are computed at this fraction of the output size (the blur hides the difference)
+_SLIDE_WORK_SCALE = 2
+
+
+def _temp_media_dir() -> str:
+    temp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp_media")
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
+
+def _remove_quietly(path: Optional[str]) -> None:
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            logger.debug("Ignored exception", exc_info=True)
 
 
 class StoryVideoGenerator:
     """
-    Generates 25-second luxury vertical MP4 video stories (1080x1920 Full HD)
+    Generates luxury vertical MP4 video stories (1080x1920, or 720x1280 on low-memory hosts)
     for Telegram Stories. Features:
     - Ambient room slideshow with smooth 0.8s crossfade transitions (xfade)
-    - 1:1 Telegram native repost card overlay (Playwright transparent PNG)
+    - 1:1 Telegram native repost card overlay (transparent PNG)
     - Curated luxury lounge & chill music with synchronized audio fade-in/fade-out
-    - Strict anti-repetition engine: consecutive video generations never repeat music
+    - Strict anti-repetition engine: consecutive video generations never repeat music (history survives restarts)
     - Precise bounding box coordinates for InputMediaAreaChannelPost
+    Every slide is decoded and converted once (looped in memory), so encoding cost is dominated by x264 only.
     """
 
     def __init__(self, audio_dir: Optional[str] = None, max_history: int = 10):
@@ -37,6 +62,7 @@ class StoryVideoGenerator:
         self._history_lock = threading.RLock()
         self._recent_tracks: List[str] = []
         self._user_recent_tracks: Dict[int, List[str]] = {}
+        self._history_seeded = False
 
     def get_available_tracks(self) -> List[str]:
         """Returns sorted list of audio track filepaths found in self.audio_dir or fallbacks"""
@@ -46,8 +72,7 @@ class StoryVideoGenerator:
             fallbacks = [
                 os.path.join(base_dir, "assets", "audio"),
                 os.path.join(os.getcwd(), "assets", "audio"),
-                "/app/assets/audio",
-                r"c:\Users\victus\Desktop\channelcloner\assets\audio"
+                "/app/assets/audio"
             ]
             for fb in fallbacks:
                 if os.path.exists(fb):
@@ -99,6 +124,21 @@ class StoryVideoGenerator:
         """Sets max anti-repetition history window size"""
         with self._history_lock:
             self.max_history = max(1, limit)
+
+    async def seed_history_from_db(self) -> None:
+        """Loads the persisted music history once per process, so a restart does not replay the same tracks"""
+        if self._history_seeded:
+            return
+        self._history_seeded = True
+        try:
+            from database.db_manager import db_manager
+            persisted = await db_manager.get_recent_story_music(limit=self.max_history)
+        except Exception:
+            logger.debug("Could not load persisted story music history", exc_info=True)
+            return
+        with self._history_lock:
+            older = [name for name in persisted if name and name not in self._recent_tracks]
+            self._recent_tracks = older + self._recent_tracks
 
     def get_random_music_track(
         self,
@@ -159,6 +199,21 @@ class StoryVideoGenerator:
             )
             return chosen
 
+    @staticmethod
+    def choose_render_profile() -> Dict[str, Any]:
+        """Output size / x264 preset for this host: 720x1280 when memory is tight, 1080x1920 otherwise"""
+        try:
+            low_memory = render_queue.is_low_memory_host()
+        except Exception:
+            low_memory = False
+        width, height = LOW_MEMORY_SIZE if low_memory else FULL_HD_SIZE
+        return {"width": width, "height": height, "preset": "veryfast", "low_memory": low_memory}
+
+    @staticmethod
+    def encode_timeout(duration: float, width: int = FULL_HD_SIZE[0]) -> float:
+        """FFmpeg time budget derived from the story length (a 25 s full HD story needs ~1-2.5 min on a busy host)"""
+        per_second = 6.0 if width >= FULL_HD_SIZE[0] else 3.0
+        return 60.0 + float(duration) * per_second
 
     @staticmethod
     def create_ambient_slide(
@@ -169,25 +224,33 @@ class StoryVideoGenerator:
     ) -> str:
         """
         Creates an ambient blurred vertical slide from any aspect ratio photo:
-        - Scales and center-crops to 1080x1920
-        - Gaussian blur (radius 32)
+        - Scales and center-crops to width x height
+        - Gaussian blur (radius 32 at 1080 px width)
         - Subtle luxury darkening for elegant contrast behind the repost card
+        The blur is computed at half resolution and upscaled: visually identical, a quarter of the memory.
         """
-        orig = Image.open(photo_path).convert("RGB")
+        work_w = max(1, width // _SLIDE_WORK_SCALE)
+        work_h = max(1, height // _SLIDE_WORK_SCALE)
+        with Image.open(photo_path) as src:
+            src.draft("RGB", (work_w, work_h))
+            orig = src.convert("RGB")
         orig_w, orig_h = orig.size
 
-        scale = max(width / orig_w, height / orig_h)
-        nw, nh = int(orig_w * scale), int(orig_h * scale)
-        resized = orig.resize((nw, nh), Image.Resampling.LANCZOS)
+        scale = max(work_w / orig_w, work_h / orig_h)
+        nw, nh = max(work_w, int(round(orig_w * scale))), max(work_h, int(round(orig_h * scale)))
+        resized = orig.resize((nw, nh), Image.Resampling.BILINEAR)
+        del orig
 
-        left = (nw - width) // 2
-        top = (nh - height) // 2
-        cropped = resized.crop((left, top, left + width, top + height))
+        left = (nw - work_w) // 2
+        top = (nh - work_h) // 2
+        cropped = resized.crop((left, top, left + work_w, top + work_h))
 
-        blurred = cropped.filter(ImageFilter.GaussianBlur(radius=32))
-        dimmer = Image.new("RGB", (width, height), (15, 20, 18))
+        blur_radius = max(4, int(round(32 * width / 1080.0 / _SLIDE_WORK_SCALE)))
+        blurred = cropped.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+        dimmer = Image.new("RGB", (work_w, work_h), (15, 20, 18))
         final_bg = Image.blend(blurred, dimmer, alpha=0.30)
-        final_bg.save(out_path, quality=95)
+        final_bg = final_bg.resize((width, height), Image.Resampling.BICUBIC)
+        final_bg.save(out_path, format="JPEG", quality=92)
         return out_path
 
     def build_ffmpeg_command(
@@ -199,120 +262,58 @@ class StoryVideoGenerator:
         total_duration: float = 25.0,
         xfade_duration: float = 0.8,
         voiceover_path: Optional[str] = None,
-        volume: float = 1.0
+        volume: float = 1.0,
+        width: int = FULL_HD_SIZE[0],
+        height: int = FULL_HD_SIZE[1],
+        preset: str = "veryfast"
     ) -> List[str]:
-        """Constructs the optimized FFmpeg command line for crossfade, overlay, audio muxing and AI voice ducking"""
+        """Constructs the FFmpeg command (argument list, no shell) for crossfade, overlay and audio muxing.
+        Each slide / the overlay is a single decoded frame looped in memory; no per-frame zoom or re-decoding."""
         n = len(slide_paths)
         if n == 0:
             raise ValueError("At least one slide image is required")
 
         ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
-        cmd = [ffmpeg_bin, "-y"]
+        cmd = [ffmpeg_bin, "-y", "-nostdin", "-hide_banner", "-loglevel", "error"]
         has_voice = bool(voiceover_path and os.path.exists(voiceover_path))
-
         threads_val = str(min(4, os.cpu_count() or 2))
+        fps = STORY_FPS
 
-        # 1. Single slide case
         if n == 1:
-            fade_dur = 1.5 if total_duration >= 3.0 else min(1.5, max(0.2, total_duration / 3.0))
-            fade_out_start = max(0.0, total_duration - fade_dur)
-            cmd.extend([
-                "-loop", "1", "-framerate", "30", "-t", str(total_duration), "-i", slide_paths[0],
-                "-loop", "1", "-framerate", "30", "-t", str(total_duration), "-i", overlay_path
-            ])
-            if audio_path and os.path.exists(audio_path):
-                cmd.extend(["-i", audio_path])
-                if has_voice:
-                    cmd.extend(["-i", voiceover_path])
-                    filter_str = (
-                        f"[0:v]scale=1188:2112,zoompan=z='min(zoom+0.0002,1.05)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1[bg];"
-                        f"[bg][1:v]overlay=0:0:format=auto:eof_action=repeat[vout];"
-                        f"[2:a]aloop=loop=-1:size=2e+09,afade=t=in:ss=0:d=1.0,afade=t=out:st={fade_out_start:.1f}:d={fade_dur:.1f}[bg_music];"
-                        f"[3:a]volume=1.3,asplit=2[voice_sc][voice_mix];"
-                        f"[bg_music][voice_sc]sidechaincompress=threshold=0.08:ratio=5:attack=100:release=500[ducked_bg];"
-                        f"[ducked_bg][voice_mix]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-                    )
-                else:
-                    filter_str = (
-                        f"[0:v]scale=1188:2112,zoompan=z='min(zoom+0.0002,1.05)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1[bg];"
-                        f"[bg][1:v]overlay=0:0:format=auto:eof_action=repeat[vout];"
-                        f"[2:a]aloop=loop=-1:size=2e+09,volume={volume:.2f},afade=t=in:ss=0:d=1.0,afade=t=out:st={fade_out_start:.1f}:d={fade_dur:.1f}[aout]"
-                    )
-                cmd.extend([
-                    "-filter_complex", filter_str,
-                    "-map", "[vout]",
-                    "-map", "[aout]",
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-                    "-ar", "44100",
-                    "-ac", "2"
-                ])
-            else:
-                # No audio track: generate silent stream or use voice only
-                if has_voice:
-                    cmd.extend(["-i", voiceover_path])
-                    filter_str = (
-                        "[0:v]scale=1188:2112,zoompan=z='min(zoom+0.0002,1.05)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1[bg];"
-                        "[bg][1:v]overlay=0:0:format=auto:eof_action=repeat[vout];"
-                        f"[2:a]volume=1.2,afade=t=in:ss=0:d=0.5,afade=t=out:st={fade_out_start:.1f}:d={fade_dur:.1f}[aout]"
-                    )
-                else:
-                    filter_str = (
-                        "[0:v]scale=1188:2112,zoompan=z='min(zoom+0.0002,1.05)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1[bg];"
-                        "[bg][1:v]overlay=0:0:format=auto:eof_action=repeat[vout];"
-                        f"[2:a]afade=t=in:ss=0:d=1.0,afade=t=out:st={fade_out_start:.1f}:d={fade_dur:.1f}[aout]"
-                    )
-                    cmd.extend(["-f", "lavfi", "-t", str(total_duration), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"])
-
-                cmd.extend([
-                    "-filter_complex", filter_str,
-                    "-map", "[vout]",
-                    "-map", "[aout]",
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-                    "-ar", "44100",
-                    "-ac", "2"
-                ])
-
-            cmd.extend([
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-threads", threads_val,
-                "-crf", "22",
-                "-pix_fmt", "yuv420p",
-                "-t", str(total_duration),
-                "-movflags", "+faststart",
-                output_mp4
-            ])
-            return cmd
-
-        # 2. Multi-slide crossfade case (N >= 2)
-        s_duration = (total_duration + (n - 1) * xfade_duration) / n
-        step = s_duration - xfade_duration
-
-        for p in slide_paths:
-            cmd.extend(["-loop", "1", "-framerate", "30", "-t", f"{s_duration:.3f}", "-i", p])
-
-        overlay_idx = n
-        cmd.extend(["-loop", "1", "-framerate", "30", "-t", str(total_duration), "-i", overlay_path])
-
-        has_audio = audio_path and os.path.exists(audio_path)
-        if has_audio:
-            audio_idx = n + 1
-            cmd.extend(["-i", audio_path])
+            slide_durations = [float(total_duration)]
+            step = 0.0
         else:
-            audio_idx = n + 1
+            s_duration = (total_duration + (n - 1) * xfade_duration) / n
+            slide_durations = [s_duration] * n
+            step = s_duration - xfade_duration
+
+        # 1. Inputs: slides and overlay are single frames, audio / silence afterwards
+        for p in slide_paths:
+            cmd.extend(["-framerate", str(fps), "-i", p])
+        overlay_idx = n
+        cmd.extend(["-framerate", str(fps), "-i", overlay_path])
+
+        has_audio = bool(audio_path and os.path.exists(audio_path))
+        audio_idx = n + 1
+        voice_idx = None
+        if has_audio:
+            cmd.extend(["-i", audio_path])
+            if has_voice:
+                voice_idx = audio_idx + 1
+                cmd.extend(["-i", voiceover_path])
+        elif has_voice:
+            voice_idx = audio_idx
+            cmd.extend(["-i", voiceover_path])
+        else:
             cmd.extend(["-f", "lavfi", "-t", str(total_duration), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"])
 
-        if has_voice:
-            voice_idx = audio_idx + 1
-            cmd.extend(["-i", voiceover_path])
-
-        # Build filtergraph with cinematic ambient zoom
+        # 2. Video graph
         filters = []
-        for i in range(n):
+        for i, dur in enumerate(slide_durations):
+            frames = max(1, int(round(dur * fps)) + (1 if n == 1 else 0))
             filters.append(
-                f"[{i}:v]scale=1188:2112,zoompan=z='min(zoom+0.0003,1.06)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1[v{i}]"
+                f"[{i}:v]scale={width}:{height}:flags=bicubic,format=yuv420p,"
+                f"loop=loop={frames - 1}:size=1:start=0,setpts=N/{fps}/TB,setsar=1[v{i}]"
             )
 
         last_v = "v0"
@@ -323,34 +324,42 @@ class StoryVideoGenerator:
             filters.append(f"[{last_v}][{next_v}]xfade=transition=fade:duration={xfade_duration:.2f}:offset={offset:.3f}[{out_v}]")
             last_v = out_v
 
-        # Overlay card PNG
-        filters.append(f"[{last_v}][{overlay_idx}:v]overlay=0:0:format=auto:eof_action=repeat[vout]")
+        overlay_src = f"[{overlay_idx}:v]"
+        if (width, height) != FULL_HD_SIZE:
+            filters.append(f"{overlay_src}scale={width}:{height}:flags=bicubic[ov_scaled]")
+            overlay_src = "[ov_scaled]"
+        # The overlay is one frame: eof_action=repeat keeps it on screen for the whole story
+        filters.append(f"[{last_v}]{overlay_src}overlay=0:0:format=yuv420:eof_action=repeat[vout]")
 
-        # Audio fade in/out with continuous looping and voiceover sidechain ducking
+        # 3. Audio graph: fade in/out, continuous looping, optional voiceover sidechain ducking
         fade_dur = 1.5 if total_duration >= 3.0 else min(1.5, max(0.2, total_duration / 3.0))
         fade_out_start = max(0.0, total_duration - fade_dur)
 
-        if has_voice:
+        if has_audio and has_voice:
             filters.append(
                 f"[{audio_idx}:a]aloop=loop=-1:size=2e+09,afade=t=in:ss=0:d=1.0,afade=t=out:st={fade_out_start:.1f}:d={fade_dur:.1f}[bg_music];"
                 f"[{voice_idx}:a]volume=1.3,asplit=2[voice_sc][voice_mix];"
                 f"[bg_music][voice_sc]sidechaincompress=threshold=0.08:ratio=5:attack=100:release=500[ducked_bg];"
                 f"[ducked_bg][voice_mix]amix=inputs=2:duration=first:dropout_transition=2[aout]"
             )
+        elif has_voice:
+            filters.append(f"[{voice_idx}:a]volume=1.2,afade=t=in:ss=0:d=0.5,afade=t=out:st={fade_out_start:.1f}:d={fade_dur:.1f}[aout]")
         else:
-            filters.append(f"[{audio_idx}:a]aloop=loop=-1:size=2e+09,volume={volume:.2f},afade=t=in:ss=0:d=1.0,afade=t=out:st={fade_out_start:.1f}:d={fade_dur:.1f}[aout]")
-
-        filter_complex_str = ";".join(filters)
+            filters.append(
+                f"[{audio_idx}:a]aloop=loop=-1:size=2e+09,volume={volume:.2f},"
+                f"afade=t=in:ss=0:d=1.0,afade=t=out:st={fade_out_start:.1f}:d={fade_dur:.1f}[aout]"
+            )
 
         cmd.extend([
-            "-filter_complex", filter_complex_str,
+            "-filter_complex", ";".join(filters),
             "-map", "[vout]",
             "-map", "[aout]",
             "-c:v", "libx264",
-            "-preset", "veryfast",
+            "-preset", preset,
             "-threads", threads_val,
             "-crf", "22",
             "-pix_fmt", "yuv420p",
+            "-r", str(fps),
             "-c:a", "aac",
             "-b:a", "192k",
             "-ar", "44100",
@@ -359,8 +368,70 @@ class StoryVideoGenerator:
             "-movflags", "+faststart",
             output_mp4
         ])
-
         return cmd
+
+    # ------------------------------------------------------------------
+    # Rendering pipeline
+    # ------------------------------------------------------------------
+
+    def _prepare_visuals(
+        self,
+        job_dir: str,
+        photo_paths: List[str],
+        channel_title: str,
+        caption: str,
+        price: Optional[float],
+        date_str: Optional[str],
+        avatar_path: Optional[str],
+        forward_title: Optional[str],
+        badges: Optional[List[str]],
+        width: int,
+        height: int
+    ) -> Tuple[str, Dict[str, float], List[str]]:
+        """CPU work done in a worker thread: card overlay, cover photo selection, blurred slides"""
+        overlay_path = os.path.join(job_dir, "overlay.png")
+        overlay_path, card_coords = story_card_renderer.render_card_overlay_png_with_coords(
+            channel_title=channel_title,
+            photo_paths=photo_paths,
+            caption=caption,
+            price=price,
+            date_str=date_str,
+            avatar_path=avatar_path,
+            forward_title=forward_title,
+            badges=badges,
+            output_path=overlay_path
+        )
+
+        # Reorder photos using aesthetic visual scorer: sharpest, most vibrant photo becomes Slide 1!
+        from services.aesthetic_scorer import aesthetic_scorer
+        valid_photos = aesthetic_scorer.reorder_photos_by_aesthetic(photo_paths)
+
+        # Cap ambient background slides to at most 4 photos (best 4 photos)
+        valid_photos = valid_photos[:4]
+
+        slide_paths = []
+        for i, p in enumerate(valid_photos):
+            sp = os.path.join(job_dir, f"slide_{i}.jpg")
+            self.create_ambient_slide(p, sp, width=width, height=height)
+            slide_paths.append(sp)
+        return overlay_path, card_coords, slide_paths
+
+    def _choose_audio(self, audio_path: Optional[str], user_id: Optional[int]) -> Optional[str]:
+        if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+            self.record_track_usage(audio_path, user_id=user_id)
+            return audio_path
+        return self.get_random_music_track(user_id=user_id)
+
+    @staticmethod
+    def _new_job_dir() -> str:
+        # "story_" prefix: protected work directory of the story pipeline (removed by this class when done)
+        job_dir = os.path.join(_temp_media_dir(), f"story_job_{uuid.uuid4().hex}")
+        os.makedirs(job_dir, exist_ok=True)
+        return job_dir
+
+    @staticmethod
+    def _output_ok(path: str) -> bool:
+        return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
 
     def create_video_story(
         self,
@@ -381,157 +452,99 @@ class StoryVideoGenerator:
         volume: float = 1.0
     ) -> Tuple[str, Dict[str, float]]:
         """
-        Creates a complete 25-second luxury video story ready for MTProto stories.sendStory.
-        Returns (video_path, card_coordinates_dict).
+        Creates a complete video story ready for MTProto stories.sendStory (blocking; scripts / worker threads).
+        Returns (video_path, card_coordinates_dict); the dict also carries video_w / video_h.
+        Voice narration is not supported for stories (voiceover_path / enable_ai_voice are ignored).
         """
-        temp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp_media")
-        os.makedirs(temp_dir, exist_ok=True)
-        timestamp = int(time.time() * 1000)
-
-        # 1. Render transparent card overlay PNG
-        overlay_path = os.path.join(temp_dir, f"overlay_{timestamp}.png")
-        story_card_renderer.render_card_overlay_png(
-            channel_title=channel_title,
-            photo_paths=photo_paths,
-            caption=caption,
-            price=price,
-            date_str=date_str,
-            avatar_path=avatar_path,
-            forward_title=forward_title,
-            badges=badges,
-            output_path=overlay_path
-        )
-        card_coords = story_card_renderer.get_last_card_coordinates()
-
-        # Clamp duration to 15s - 40s (strict Telegram Story standards)
-        duration = max(15.0, min(40.0, float(duration or 25.0)))
-
-        # 2. Prepare ambient background slides
         valid_photos = [p for p in photo_paths if p and os.path.exists(p)]
         if not valid_photos:
             raise ValueError("Kamida bitta fotosurat talab qilinadi (video istoriya fotosuratsiz yaratilmaydi)")
 
-        # Reorder photos using aesthetic visual scorer: sharpest, most vibrant photo becomes Slide 1!
-        from services.aesthetic_scorer import aesthetic_scorer
-        valid_photos = aesthetic_scorer.reorder_photos_by_aesthetic(valid_photos)
-
-        # Cap ambient background slides to at most 4 photos (best 4 photos)
-        # Keeps FFmpeg RAM under 150MB, prevents OOM, and ensures smooth, elegant transitions!
-        valid_photos = valid_photos[:4]
-
-        slide_paths = []
-        for i, p in enumerate(valid_photos):
-            sp = os.path.join(temp_dir, f"slide_{timestamp}_{i}.jpg")
-            self.create_ambient_slide(p, sp)
-            slide_paths.append(sp)
-
-        # 3. Select music track with anti-repetition
-        if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
-            chosen_audio = audio_path
-            self.record_track_usage(chosen_audio, user_id=user_id)
-        else:
-            chosen_audio = self.get_random_music_track(user_id=user_id)
-
-        # Video stories have NO voiceover narration ("gapiradigan narsa olib tashlangan")
-        voiceover_path = None
-
-        # 4. Define final output MP4 path
+        # Clamp duration to 15s - 40s (strict Telegram Story standards)
+        duration = max(MIN_DURATION, min(MAX_DURATION, float(duration or 25.0)))
+        profile = self.choose_render_profile()
+        width, height = profile["width"], profile["height"]
         if not output_path:
-            output_path = os.path.join(temp_dir, f"video_story_{timestamp}.mp4")
+            output_path = os.path.join(_temp_media_dir(), f"video_story_{uuid.uuid4().hex}.mp4")
 
-        # 5. Build and execute FFmpeg command
-        cmd = self.build_ffmpeg_command(
-            slide_paths=slide_paths,
-            overlay_path=overlay_path,
-            audio_path=chosen_audio,
-            output_mp4=output_path,
-            total_duration=duration,
-            xfade_duration=0.8,
-            voiceover_path=None,
-            volume=volume
-        )
-
-        logger.info(f"Encoding {duration}s video story with {len(slide_paths)} slides and audio {os.path.basename(chosen_audio) if chosen_audio else 'none'}...")
-        t0 = time.time()
+        job_dir = self._new_job_dir()
+        succeeded = False
         try:
-            res = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120
+            overlay_path, card_coords, slide_paths = self._prepare_visuals(
+                job_dir, valid_photos, channel_title, caption, price, date_str, avatar_path, forward_title, badges, width, height
             )
-        except subprocess.TimeoutExpired:
-            logger.error("FFmpeg video story encoding timed out after 120s")
-            if os.path.exists(output_path):
-                try:
-                    os.remove(output_path)
-                except Exception:
-                    logger.debug("Ignored exception", exc_info=True)
-            for sp in slide_paths:
-                if os.path.exists(sp):
-                    try:
-                        os.remove(sp)
-                    except Exception:
-                        logger.debug("Ignored exception", exc_info=True)
-            if os.path.exists(overlay_path):
-                try:
-                    os.remove(overlay_path)
-                except Exception:
-                    logger.debug("Ignored exception", exc_info=True)
-            raise TimeoutError("FFmpeg video encoding timed out")
+            chosen_audio = self._choose_audio(audio_path, user_id)
+            timeout = self.encode_timeout(duration, width)
 
-        elapsed = time.time() - t0
-
-        if res.returncode != 0:
-            err_msg = f"FFmpeg video encoding failed (code {res.returncode}): {res.stderr[-500:]}"
-            logger.warning(f"{err_msg} - Attempting resilient single-slide audio video fallback...")
-            # Resilient fallback: if multi-slide failed, retry with single slide
-            if len(slide_paths) > 1 and valid_photos:
+            attempts = [slide_paths] if len(slide_paths) <= 1 else [slide_paths, slide_paths[:1]]
+            last_error = ""
+            for idx, slides in enumerate(attempts):
+                cmd = self.build_ffmpeg_command(
+                    slide_paths=slides,
+                    overlay_path=overlay_path,
+                    audio_path=chosen_audio,
+                    output_mp4=output_path,
+                    total_duration=duration,
+                    xfade_duration=0.8,
+                    volume=volume,
+                    width=width,
+                    height=height,
+                    preset=profile["preset"]
+                )
+                logger.info(f"Encoding {duration}s {width}x{height} video story with {len(slides)} slides and audio {os.path.basename(chosen_audio) if chosen_audio else 'none'}...")
+                t0 = time.time()
                 try:
-                    fallback_cmd = self.build_ffmpeg_command(
-                        slide_paths=[slide_paths[0]],
-                        overlay_path=overlay_path,
-                        audio_path=chosen_audio,
-                        output_mp4=output_path,
-                        total_duration=duration,
-                        xfade_duration=0.8,
-                        volume=volume
+                    res = subprocess.run(
+                        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout
                     )
-                    res_fb = subprocess.run(
-                        fallback_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30
-                    )
-                    if res_fb.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 10000:
-                        logger.info(f"Resilient single-slide audio video succeeded -> {output_path} ({os.path.getsize(output_path)} bytes)")
-                        if os.path.exists(overlay_path):
-                            try: os.remove(overlay_path)
-                            except Exception: logger.debug("Ignored exception", exc_info=True)
-                        for sp in slide_paths:
-                            if os.path.exists(sp):
-                                try: os.remove(sp)
-                                except Exception: logger.debug("Ignored exception", exc_info=True)
-                        return output_path, card_coords
-                except Exception as fb_err:
-                    logger.error(f"Fallback single-slide encoding also failed: {fb_err}")
-            raise RuntimeError(err_msg)
+                except subprocess.TimeoutExpired:
+                    # subprocess.run() kills and reaps the child before raising
+                    logger.error(f"FFmpeg video story encoding timed out after {timeout:.0f}s")
+                    raise TimeoutError("FFmpeg video encoding timed out")
+                if res.returncode == 0 and self._output_ok(output_path):
+                    logger.info(f"Video story encoded in {time.time() - t0:.2f}s -> {output_path} ({os.path.getsize(output_path)} bytes)")
+                    succeeded = True
+                    coords = dict(card_coords)
+                    coords.update({"video_w": width, "video_h": height})
+                    return output_path, coords
+                err_bytes = res.stderr if isinstance(res.stderr, (bytes, bytearray)) else b""
+                last_error = f"FFmpeg video encoding failed (code {res.returncode}): {err_bytes.decode('utf-8', 'ignore')[-500:]}"
+                if idx + 1 < len(attempts):
+                    logger.warning(f"{last_error} - Attempting resilient single-slide video fallback...")
+            raise RuntimeError(last_error or "FFmpeg video encoding failed")
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            if not succeeded:
+                _remove_quietly(output_path)
 
-        logger.info(f"Video story encoded successfully in {elapsed:.2f}s -> {output_path} ({os.path.getsize(output_path)} bytes)")
-
-        # 6. Clean up temporary slide & overlay files
+    async def _run_ffmpeg_async(self, cmd: List[str], timeout: float) -> Tuple[int, str]:
+        """Runs FFmpeg without blocking the loop; on timeout / cancellation the process is killed AND reaped"""
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE
+        )
         try:
-            if os.path.exists(overlay_path):
-                os.remove(overlay_path)
-            for sp in slide_paths:
-                if os.path.exists(sp):
-                    os.remove(sp)
-        except Exception as cl_err:
-            logger.debug(f"Note on temp cleanup: {cl_err}")
+            _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            await self._kill_process(proc)
+            raise
+        err_text = stderr.decode("utf-8", errors="ignore")[-500:] if isinstance(stderr, (bytes, bytearray)) else ""
+        return proc.returncode, err_text
 
-        # 7. Maintain preview copy for live inspection
+    @staticmethod
+    async def _kill_process(proc) -> None:
         try:
-            preview_copy = os.path.join(temp_dir, "real_realtor_story_preview.mp4")
-            with open(output_path, "rb") as src, open(preview_copy, "wb") as dst:
-                dst.write(src.read())
+            proc.kill()
+        except ProcessLookupError:
+            return
         except Exception:
             logger.debug("Ignored exception", exc_info=True)
-
-        return output_path, card_coords
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=15.0)
+        except Exception:
+            logger.warning("FFmpeg process did not exit after kill()", exc_info=True)
 
     async def create_video_story_async(
         self,
@@ -552,181 +565,76 @@ class StoryVideoGenerator:
         volume: float = 1.0
     ) -> Tuple[str, Dict[str, float]]:
         """
-        Asynchronously creates a complete 25-second luxury video story using non-blocking FFmpeg.
-        Guarantees the asyncio event loop remains 100% responsive.
+        Asynchronously creates a complete video story using non-blocking FFmpeg.
+        Returns (video_path, card_coordinates_dict); the dict also carries video_w / video_h.
+        Voice narration is not supported for stories (voiceover_path / enable_ai_voice are ignored).
         """
-        temp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp_media")
-        os.makedirs(temp_dir, exist_ok=True)
-        timestamp = int(time.time() * 1000)
-
-        # 1. Render transparent card overlay PNG in thread
-        overlay_path = os.path.join(temp_dir, f"overlay_{timestamp}.png")
-        await asyncio.to_thread(
-            story_card_renderer.render_card_overlay_png,
-            channel_title=channel_title,
-            photo_paths=photo_paths,
-            caption=caption,
-            price=price,
-            date_str=date_str,
-            avatar_path=avatar_path,
-            forward_title=forward_title,
-            badges=badges,
-            output_path=overlay_path
-        )
-        card_coords = story_card_renderer.get_last_card_coordinates()
-
-        # Clamp duration to 15s - 40s (strict Telegram Story standards)
-        duration = max(15.0, min(40.0, float(duration or 25.0)))
-
-        # 2. Prepare ambient background slides
         valid_photos = [p for p in photo_paths if p and os.path.exists(p)]
         if not valid_photos:
             raise ValueError("Kamida bitta fotosurat talab qilinadi (video istoriya fotosuratsiz yaratilmaydi)")
 
-        # Reorder photos in worker thread using aesthetic visual scorer: sharpest, most vibrant photo becomes Slide 1!
-        from services.aesthetic_scorer import aesthetic_scorer
-        valid_photos = await asyncio.to_thread(aesthetic_scorer.reorder_photos_by_aesthetic, valid_photos)
+        # Clamp duration to 15s - 40s (strict Telegram Story standards)
+        duration = max(MIN_DURATION, min(MAX_DURATION, float(duration or 25.0)))
+        profile = self.choose_render_profile()
+        width, height = profile["width"], profile["height"]
+        if not output_path:
+            output_path = os.path.join(_temp_media_dir(), f"video_story_{uuid.uuid4().hex}.mp4")
 
-        # Cap ambient background slides to at most 4 photos (best 4 photos)
-        # Keeps FFmpeg RAM under 150MB, prevents OOM, and ensures smooth, elegant transitions!
-        valid_photos = valid_photos[:4]
+        job_dir = self._new_job_dir()
+        succeeded = False
+        try:
+            overlay_path, card_coords, slide_paths = await asyncio.to_thread(
+                self._prepare_visuals,
+                job_dir, valid_photos, channel_title, caption, price, date_str, avatar_path, forward_title, badges, width, height
+            )
 
-        slide_paths = []
-        for i, p in enumerate(valid_photos):
-            sp = os.path.join(temp_dir, f"slide_{timestamp}_{i}.jpg")
-            await asyncio.to_thread(self.create_ambient_slide, p, sp)
-            slide_paths.append(sp)
-
-        # 3. Select music track with anti-repetition
-        if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
-            chosen_audio = audio_path
-            self.record_track_usage(chosen_audio, user_id=user_id)
-        else:
-            chosen_audio = self.get_random_music_track(user_id=user_id)
-
-        # Asynchronously record to persistent DB if db_manager is available
-        if chosen_audio:
-            try:
-                from database.db_manager import db_manager
+            # Music selection with anti-repetition (persisted history survives restarts)
+            await self.seed_history_from_db()
+            chosen_audio = self._choose_audio(audio_path, user_id)
+            if chosen_audio:
                 try:
+                    from database.db_manager import db_manager
                     await db_manager.record_used_story_music(chosen_audio)
                 except Exception:
-                    asyncio.create_task(db_manager.record_used_story_music(chosen_audio))
-            except Exception:
-                logger.debug("Ignored exception", exc_info=True)
+                    logger.debug("Could not persist story music usage", exc_info=True)
 
-        # Video stories have NO voiceover narration ("gapiradigan narsa olib tashlangan")
-        voiceover_path = None
-        voice_file_to_clean = None
-
-        # 4. Define final output MP4 path
-        if not output_path:
-            output_path = os.path.join(temp_dir, f"video_story_{timestamp}.mp4")
-
-        # 5. Build FFmpeg command
-        cmd = self.build_ffmpeg_command(
-            slide_paths=slide_paths,
-            overlay_path=overlay_path,
-            audio_path=chosen_audio,
-            output_mp4=output_path,
-            total_duration=duration,
-            xfade_duration=0.8,
-            voiceover_path=None,
-            volume=volume
-        )
-
-        logger.info(f"Async encoding {duration}s video story with {len(slide_paths)} slides and audio {os.path.basename(chosen_audio) if chosen_audio else 'none'}...")
-        t0 = time.time()
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        try:
-            _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
-            try:
-                proc.kill()
-            except Exception:
-                logger.debug("Ignored exception", exc_info=True)
-            if os.path.exists(output_path):
+            timeout = self.encode_timeout(duration, width)
+            attempts = [slide_paths] if len(slide_paths) <= 1 else [slide_paths, slide_paths[:1]]
+            last_error = ""
+            for idx, slides in enumerate(attempts):
+                cmd = self.build_ffmpeg_command(
+                    slide_paths=slides,
+                    overlay_path=overlay_path,
+                    audio_path=chosen_audio,
+                    output_mp4=output_path,
+                    total_duration=duration,
+                    xfade_duration=0.8,
+                    volume=volume,
+                    width=width,
+                    height=height,
+                    preset=profile["preset"]
+                )
+                logger.info(f"Async encoding {duration}s {width}x{height} video story with {len(slides)} slides and audio {os.path.basename(chosen_audio) if chosen_audio else 'none'}...")
+                t0 = time.time()
                 try:
-                    os.remove(output_path)
-                except Exception:
-                    logger.debug("Ignored exception", exc_info=True)
-            for sp in slide_paths:
-                if os.path.exists(sp):
-                    try:
-                        os.remove(sp)
-                    except Exception:
-                        logger.debug("Ignored exception", exc_info=True)
-            if os.path.exists(overlay_path):
-                try:
-                    os.remove(overlay_path)
-                except Exception:
-                    logger.debug("Ignored exception", exc_info=True)
-            if isinstance(exc, asyncio.TimeoutError):
-                raise TimeoutError("FFmpeg async video encoding timed out after 120s")
-            raise
-
-        elapsed = time.time() - t0
-        if proc.returncode != 0:
-            err_text = stderr.decode('utf-8', errors='ignore')[-500:] if stderr else ''
-            err_msg = f"FFmpeg video encoding failed (code {proc.returncode}): {err_text}"
-            logger.warning(f"{err_msg} - Attempting resilient single-slide audio video fallback...")
-
-            # Resilient fallback: If multi-slide failed, retry with single slide
-            if len(slide_paths) > 1 and valid_photos:
-                try:
-                    fallback_cmd = self.build_ffmpeg_command(
-                        slide_paths=[slide_paths[0]],
-                        overlay_path=overlay_path,
-                        audio_path=chosen_audio,
-                        output_mp4=output_path,
-                        total_duration=duration,
-                        xfade_duration=0.8,
-                        voiceover_path=None,
-                        volume=volume
-                    )
-                    proc_fb = await asyncio.create_subprocess_exec(
-                        *fallback_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    await asyncio.wait_for(proc_fb.communicate(), timeout=30.0)
-                    if proc_fb.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 10000:
-                        logger.info(f"Resilient single-slide audio video succeeded -> {output_path} ({os.path.getsize(output_path)} bytes)")
-                        if os.path.exists(overlay_path):
-                            try: os.remove(overlay_path)
-                            except Exception: logger.debug("Ignored exception", exc_info=True)
-                        for sp in slide_paths:
-                            if os.path.exists(sp):
-                                try: os.remove(sp)
-                                except Exception: logger.debug("Ignored exception", exc_info=True)
-                        if voice_file_to_clean and os.path.exists(voice_file_to_clean):
-                            try: os.remove(voice_file_to_clean)
-                            except Exception: logger.debug("Ignored exception", exc_info=True)
-                        return output_path, card_coords
-                except Exception as fb_err:
-                    logger.error(f"Fallback single-slide encoding also failed: {fb_err}")
-
-            raise RuntimeError(err_msg)
-
-        logger.info(f"Video story async encoded in {elapsed:.2f}s -> {output_path} ({os.path.getsize(output_path)} bytes)")
-
-        # 6. Clean up temporary slide, overlay, and generated voice files
-        try:
-            if os.path.exists(overlay_path):
-                os.remove(overlay_path)
-            for sp in slide_paths:
-                if os.path.exists(sp):
-                    os.remove(sp)
-            if voice_file_to_clean and os.path.exists(voice_file_to_clean):
-                os.remove(voice_file_to_clean)
-        except Exception as cl_err:
-            logger.debug(f"Note on temp cleanup: {cl_err}")
-
-        return output_path, card_coords
+                    returncode, err_text = await self._run_ffmpeg_async(cmd, timeout)
+                except asyncio.TimeoutError:
+                    logger.error(f"FFmpeg async video encoding timed out after {timeout:.0f}s")
+                    raise TimeoutError(f"FFmpeg async video encoding timed out after {timeout:.0f}s")
+                if returncode == 0 and self._output_ok(output_path):
+                    logger.info(f"Video story async encoded in {time.time() - t0:.2f}s -> {output_path} ({os.path.getsize(output_path)} bytes)")
+                    succeeded = True
+                    coords = dict(card_coords)
+                    coords.update({"video_w": width, "video_h": height})
+                    return output_path, coords
+                last_error = f"FFmpeg video encoding failed (code {returncode}): {err_text}"
+                if idx + 1 < len(attempts):
+                    logger.warning(f"{last_error} - Attempting resilient single-slide video fallback...")
+            raise RuntimeError(last_error or "FFmpeg video encoding failed")
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            if not succeeded:
+                _remove_quietly(output_path)
 
 
 story_video_generator = StoryVideoGenerator()

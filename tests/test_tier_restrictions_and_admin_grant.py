@@ -1,7 +1,6 @@
 import unittest
 import os
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from aiogram.types import CallbackQuery, Message, User, Chat
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -9,16 +8,20 @@ from aiogram.fsm.storage.base import StorageKey
 
 from config.settings import settings
 from database.db_manager import DatabaseManager
-from database.models import ChannelPair, Subscription
 import bot.handlers.settings_menu as settings_menu_mod
 import admin_bot.handlers.user_management as admin_user_mgmt_mod
 from services.cloner_engine import cloner_engine
 
 class TestTierRestrictionsAndAdminGrant(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        import tempfile
         import uuid
-        self.test_db_path = f"database/test_tier_{uuid.uuid4().hex[:8]}.db"
-        os.makedirs("database", exist_ok=True)
+        # Temporary directory (never next to the live database/cloner.db)
+        self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.test_db_path = os.path.join(self._tmp_dir.name, f"test_tier_{uuid.uuid4().hex[:8]}.db")
+        # settings.ADMIN_IDS_RAW is assigned below; the patcher restores the original value in tearDown
+        self._admin_ids_patch = patch.object(settings, "ADMIN_IDS_RAW", settings.ADMIN_IDS_RAW)
+        self._admin_ids_patch.start()
 
         self.db = DatabaseManager(db_path=self.test_db_path)
         await self.db.init_db()
@@ -67,6 +70,8 @@ class TestTierRestrictionsAndAdminGrant(unittest.IsolatedAsyncioTestCase):
         self.db_patcher_engine.stop()
         from tests.test_utils import safe_cleanup_db
         await safe_cleanup_db(self.test_db_path, self.db)
+        self._tmp_dir.cleanup()
+        self._admin_ids_patch.stop()
 
     def _create_mock_callback(self, user_id: int, data: str):
         cb = AsyncMock(spec=CallbackQuery)
@@ -167,18 +172,24 @@ class TestTierRestrictionsAndAdminGrant(unittest.IsolatedAsyncioTestCase):
 
         # 3. Grant 90 days VIP to Free User
         cb_grant = self._create_mock_callback(self.admin_id, f"adm_grant_{self.free_user_id}_vip_90")
-        with patch("admin_bot.handlers.user_management.Bot") as MockBot:
-            mock_bot_instance = AsyncMock()
-            MockBot.return_value = mock_bot_instance
+        public_bot = AsyncMock()
+        with patch("admin_bot.handlers.user_management.get_public_bot", return_value=public_bot):
             await admin_user_mgmt_mod.cb_grant_tier(cb_grant)
-        
+
         sub = await self.db.get_user_subscription(self.free_user_id)
         self.assertEqual(sub.tier, "vip")
         self.assertTrue(sub.is_active)
+        # The user is told about the new plan through the public bot
+        public_bot.send_message.assert_awaited_once()
+        self.assertEqual(public_bot.send_message.await_args.kwargs["chat_id"], self.free_user_id)
 
-        # 4. Revoke back to Free
+        # 4. Revoke back to Free (the first tap asks for confirmation)
         cb_revoke = self._create_mock_callback(self.admin_id, f"adm_revoke_{self.free_user_id}")
         await admin_user_mgmt_mod.cb_revoke_tier(cb_revoke)
+        self.assertEqual((await self.db.get_user_subscription(self.free_user_id)).tier, "vip")
+
+        cb_revoke_ok = self._create_mock_callback(self.admin_id, f"adm_revoke_ok_{self.free_user_id}")
+        await admin_user_mgmt_mod.cb_revoke_tier_confirm(cb_revoke_ok)
         sub_revoked = await self.db.get_user_subscription(self.free_user_id)
         self.assertEqual(sub_revoked.tier, "free")
 

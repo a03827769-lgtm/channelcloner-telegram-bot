@@ -1,7 +1,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { ActiveTab, User, Subscription, SummaryStats, ChannelPair, StorySettings, AudioTrack, StoryQueueItem, SystemTelemetry } from './types';
+import {
+  ActiveTab, User, Subscription, SummaryStats, ChannelPair, NewPairRequest, StorySettings, AudioTrack,
+  StoryQueueItem, StoryPostedItem, SystemTelemetry, BillingCatalog
+} from './types';
 import { telegram } from './services/telegram';
-import { api } from './services/api';
+import { api, errorText } from './services/api';
 import { DeviceFrame } from './components/layout/DeviceFrame';
 import { Header } from './components/layout/Header';
 import { BottomNav } from './components/layout/BottomNav';
@@ -10,36 +13,78 @@ import { ChannelsTab } from './components/channels/ChannelsTab';
 import { ChannelEditorModal } from './components/channels/ChannelEditorModal';
 import { AddChannelModal } from './components/channels/AddChannelModal';
 import { StoryStudioTab } from './components/story/StoryStudioTab';
+import { StoreTab } from './components/store/StoreTab';
 import { BackfillTab } from './components/backfill/BackfillTab';
 import { BillingTab } from './components/billing/BillingTab';
 import { SystemTab } from './components/system/SystemTab';
 import { ToastContainer, ToastMessage } from './components/ui/Toast';
 import { TelegramGuard } from './components/layout/TelegramGuard';
 
+// Design preview with demo data (`?preview=1`) exists only in the Vite dev server; production builds
+// always require a real Telegram session.
+const PREVIEW_MODE =
+  import.meta.env.DEV && typeof window !== 'undefined' && window.location.search.includes('preview=1');
+
+const PREVIEW_PAIR: ChannelPair = {
+  id: 101,
+  user_id: 10001,
+  source_channel: '@toshkent_news',
+  source_title: 'Toshkent Yangiliklari',
+  target_channel: '@mening_kanalim',
+  target_title: 'Mening Tezkor Kanalim',
+  is_active: true,
+  clone_mode: 'clean',
+  clean_links: true,
+  custom_signature: "👉 @mening_kanalim ga obuna bo'ling!",
+  remove_signature: false,
+  blacklist_words: 'reklama, aksiya',
+  replace_words: '',
+  auto_translate: false,
+  target_lang: 'uz',
+  source_lang: 'auto',
+  image_watermark_type: 'text',
+  image_watermark_text: '@mening_kanalim',
+  image_watermark_pos: 'bottom_right',
+  video_watermark_type: 'none',
+  video_watermark_text: '',
+  video_watermark_pos: 'bottom_right',
+  drip_delay_minutes: 5,
+  night_mode: 'off',
+  ai_paraphrase_mode: 'short',
+  tone_of_voice: 'standard',
+  ad_action: 'clean'
+};
+
 export const App: React.FC = () => {
-  // Enforce Telegram-only access
-  const isPreview = typeof window !== 'undefined' && window.location.search.includes('preview=1');
-  const isTelegramEnv = telegram.isAvailable() || isPreview;
+  // Enforce Telegram-only access (decided before any hooks run, so hook order stays stable)
+  const isTelegramEnv = telegram.isAvailable() || PREVIEW_MODE;
 
   if (!isTelegramEnv) {
     return <TelegramGuard />;
   }
+  return <AppShell isPreview={PREVIEW_MODE} />;
+};
+
+const AppShell: React.FC<{ isPreview: boolean }> = ({ isPreview }) => {
   const [activeTab, setActiveTab] = useState<ActiveTab>('dashboard');
   const [user, setUser] = useState<User | null>(null);
   const [subscription, setSubscription] = useState<Subscription | null>(null);
+  const [billing, setBilling] = useState<BillingCatalog | null>(null);
   const [stats, setStats] = useState<SummaryStats | null>(null);
   const [pairs, setPairs] = useState<ChannelPair[]>([]);
   const [storySettings, setStorySettings] = useState<StorySettings | null>(null);
   const [audioTracks, setAudioTracks] = useState<AudioTrack[]>([]);
   const [storyQueue, setStoryQueue] = useState<StoryQueueItem[]>([]);
-  const [storyPosted, setStoryPosted] = useState<any[]>([]);
+  const [storyPosted, setStoryPosted] = useState<StoryPostedItem[]>([]);
   const [telemetry, setTelemetry] = useState<SystemTelemetry | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
-  
+
   // Modals & Sheets
   const [editingPair, setEditingPair] = useState<ChannelPair | null>(null);
   const [isAddModalOpen, setIsAddModalOpen] = useState<boolean>(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+
+  const isAdmin = Boolean(user?.is_admin);
 
   const addToast = useCallback((type: 'success' | 'error' | 'warning' | 'info', text: string) => {
     const id = Math.random().toString(36).substring(2, 9);
@@ -53,11 +98,13 @@ export const App: React.FC = () => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   };
 
-  // Initial load
+  useEffect(() => {
+    telegram.init();
+  }, []);
+
+  // Initial load (also used by the System tab refresh and after payments)
   const loadData = useCallback(async () => {
     try {
-      telegram.init();
-      
       const [
         meRes,
         pairsRes,
@@ -78,78 +125,15 @@ export const App: React.FC = () => {
         setUser(meRes.value.user);
         setSubscription(meRes.value.subscription);
         setStats(meRes.value.stats);
+        setBilling(meRes.value.billing ?? null);
       }
 
       if (pairsRes.status === 'fulfilled') {
         const fetched = pairsRes.value.pairs || [];
-        if (fetched.length === 0 && isPreview) {
-          // Preview demo pair so editor and channel tabs are fully inspectable
-          setPairs([
-            {
-              id: 101,
-              user_id: 10001,
-              source_channel: '@toshkent_news',
-              source_title: 'Toshkent Yangiliklari',
-              target_channel: '@mening_kanalim',
-              target_title: 'Mening Tezkor Kanalim',
-              is_active: true,
-              clone_mode: 'clean',
-              clean_links: true,
-              custom_signature: "👉 @mening_kanalim ga obuna bo'ling!",
-              remove_signature: false,
-              blacklist_words: 'reklama, aksiya',
-              replace_words: '',
-              auto_translate: false,
-              target_lang: 'uz',
-              source_lang: 'auto',
-              image_watermark_type: 'text',
-              image_watermark_text: '@mening_kanalim',
-              image_watermark_pos: 'bottom_right',
-              video_watermark_type: 'none',
-              video_watermark_text: '',
-              video_watermark_pos: 'bottom_right',
-              drip_delay_minutes: 5,
-              night_mode: 'off',
-              ai_paraphrase_mode: 'short',
-              tone_of_voice: 'standard',
-              ad_action: 'clean'
-            }
-          ]);
-        } else {
-          setPairs(fetched);
-        }
+        // Preview demo pair so editor and channel tabs are fully inspectable
+        setPairs(fetched.length === 0 && isPreview ? [PREVIEW_PAIR] : fetched);
       } else if (isPreview) {
-        setPairs([
-          {
-            id: 101,
-            user_id: 10001,
-            source_channel: '@toshkent_news',
-            source_title: 'Toshkent Yangiliklari',
-            target_channel: '@mening_kanalim',
-            target_title: 'Mening Tezkor Kanalim',
-            is_active: true,
-            clone_mode: 'clean',
-            clean_links: true,
-            custom_signature: "👉 @mening_kanalim ga obuna bo'ling!",
-            remove_signature: false,
-            blacklist_words: 'reklama, aksiya',
-            replace_words: '',
-            auto_translate: false,
-            target_lang: 'uz',
-            source_lang: 'auto',
-            image_watermark_type: 'text',
-            image_watermark_text: '@mening_kanalim',
-            image_watermark_pos: 'bottom_right',
-            video_watermark_type: 'none',
-            video_watermark_text: '',
-            video_watermark_pos: 'bottom_right',
-            drip_delay_minutes: 5,
-            night_mode: 'off',
-            ai_paraphrase_mode: 'short',
-            tone_of_voice: 'standard',
-            ad_action: 'clean'
-          }
-        ]);
+        setPairs([PREVIEW_PAIR]);
       }
 
       if (storyRes.status === 'fulfilled') {
@@ -169,8 +153,7 @@ export const App: React.FC = () => {
         setTelemetry(sysRes.value.telemetry);
         setLogs(sysRes.value.logs || []);
       }
-
-    } catch (err: any) {
+    } catch (err) {
       console.warn('Initial data load error:', err);
     }
   }, [isPreview]);
@@ -180,21 +163,24 @@ export const App: React.FC = () => {
   }, [loadData]);
 
   // Channel Operations
-  const handleSavePair = async (updated: ChannelPair) => {
+  /** Saves only the changed fields; errors propagate so the editor can show them and stay open. */
+  const handleSavePair = async (pairId: number, changes: Partial<ChannelPair>) => {
+    if (Object.keys(changes).length === 0) {
+      addToast('info', "O'zgarish yo'q");
+      return;
+    }
     try {
-      await api.updatePair(updated.id, updated);
-      setPairs((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+      const res = await api.updatePair(pairId, changes);
+      setPairs((prev) => prev.map((p) => (p.id === pairId ? res.pair : p)));
       addToast('success', 'Kanal sozlamalari muvaffaqiyatli saqlandi! ✨');
       telegram.notification('success');
-    } catch (err: any) {
-      if (isPreview) {
-        setPairs((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
-        addToast('success', 'Kanal sozlamalari saqlandi (Preview)! ✨');
-        telegram.notification('success');
-      } else {
-        addToast('error', err.message || 'Saqlashda xatolik');
+    } catch (err) {
+      if (!isPreview) {
         telegram.notification('error');
+        throw err;
       }
+      setPairs((prev) => prev.map((p) => (p.id === pairId ? { ...p, ...changes } : p)));
+      addToast('success', 'Kanal sozlamalari saqlandi (Preview)! ✨');
     }
   };
 
@@ -209,12 +195,13 @@ export const App: React.FC = () => {
         prev.map((p) => (p.id === id ? { ...p, is_active: res.is_active } : p))
       );
       addToast('info', res.is_active ? 'Kanal faollashtirildi' : "Kanal to'xtatildi");
-    } catch (err: any) {
+    } catch (err) {
       if (!isPreview) {
         setPairs((prev) =>
           prev.map((p) => (p.id === id ? { ...p, is_active: !p.is_active } : p))
         );
-        addToast('error', err.message || 'Holatni o\'zgartirib bo\'lmadi');
+        addToast('error', errorText(err, "Holatni o'zgartirib bo'lmadi"));
+        telegram.notification('error');
       }
     }
   };
@@ -223,58 +210,26 @@ export const App: React.FC = () => {
     try {
       await api.deletePair(id);
       setPairs((prev) => prev.filter((p) => p.id !== id));
-      addToast('success', 'Kanal juftligi o\'chirildi');
+      addToast('success', "Kanal juftligi o'chirildi");
       telegram.notification('success');
-    } catch (err: any) {
+    } catch (err) {
       if (isPreview) {
         setPairs((prev) => prev.filter((p) => p.id !== id));
-        addToast('success', 'Kanal juftligi o\'chirildi (Preview)');
+        addToast('success', "Kanal juftligi o'chirildi (Preview)");
         telegram.notification('success');
       } else {
-        addToast('error', err.message || 'O\'chirishda xatolik');
+        addToast('error', errorText(err, "O'chirishda xatolik"));
       }
     }
   };
 
-  const handleAddPair = async (data: Partial<ChannelPair>) => {
-    let newId = Date.now();
-    try {
-      const res = await api.createPair(data);
-      if (res.pair_id) newId = res.pair_id;
-    } catch (err: any) {
-      if (!isPreview) throw err;
+  const handleAddPair = async (data: NewPairRequest) => {
+    // Errors propagate to the modal so the user sees the server's validation message
+    const res = await api.createPair(data);
+    const created = res.pair;
+    if (created) {
+      setPairs((prev) => [created, ...prev.filter((p) => p.id !== created.id)]);
     }
-
-    const newPair: ChannelPair = {
-      id: newId,
-      user_id: user?.id || 10001,
-      source_channel: data.source_channel || '',
-      source_title: data.source_title || data.source_channel || '',
-      target_channel: data.target_channel || '',
-      target_title: data.target_title || data.target_channel || '',
-      is_active: true,
-      clone_mode: data.clone_mode || 'clean',
-      clean_links: data.clean_links ?? true,
-      custom_signature: '',
-      remove_signature: false,
-      blacklist_words: '',
-      replace_words: '',
-      auto_translate: data.auto_translate ?? false,
-      target_lang: 'uz',
-      source_lang: 'auto',
-      image_watermark_type: 'none',
-      image_watermark_text: '',
-      image_watermark_pos: 'bottom_right',
-      video_watermark_type: 'none',
-      video_watermark_text: '',
-      video_watermark_pos: 'bottom_right',
-      drip_delay_minutes: 0,
-      night_mode: 'off',
-      ai_paraphrase_mode: 'off',
-      tone_of_voice: 'standard',
-      ad_action: 'clean'
-    };
-    setPairs((prev) => [newPair, ...prev]);
     addToast('success', 'Yangi kanal juftligi muvaffaqiyatli ulandi! 🚀');
     telegram.notification('success');
   };
@@ -284,12 +239,12 @@ export const App: React.FC = () => {
       const res = await api.sendTestPost(id);
       addToast('success', res.message || 'Sinov xabari yuborildi!');
       telegram.notification('success');
-    } catch (err: any) {
+    } catch (err) {
       if (isPreview) {
         addToast('success', 'Sinov xabari yuborildi (Simulyatsiya)!');
         telegram.notification('success');
       } else {
-        addToast('error', err.message || 'Sinov xabarida xatolik');
+        addToast('error', errorText(err, 'Sinov xabarida xatolik'));
         telegram.notification('error');
       }
     }
@@ -304,62 +259,70 @@ export const App: React.FC = () => {
   };
 
   // Story Settings
-  const handleSaveStorySettings = async (updated: Partial<StorySettings>) => {
+  const handleSaveStorySettings = async (changes: Partial<StorySettings>) => {
+    if (Object.keys(changes).length === 0) {
+      addToast('info', "O'zgarish yo'q");
+      return;
+    }
     try {
-      await api.saveStorySettings(updated);
-      setStorySettings((prev) => (prev ? { ...prev, ...updated } : (updated as StorySettings)));
+      const res = await api.saveStorySettings(changes);
+      setStorySettings(res.settings);
       addToast('success', 'VIP Istoriya sozlamalari saqlandi! 🎬');
       telegram.notification('success');
-    } catch (err: any) {
+    } catch (err) {
       if (isPreview) {
-        setStorySettings((prev) => (prev ? { ...prev, ...updated } : (updated as StorySettings)));
+        setStorySettings((prev) => (prev ? { ...prev, ...changes } : prev));
         addToast('success', 'VIP Istoriya sozlamalari saqlandi (Preview)! 🎬');
         telegram.notification('success');
       } else {
-        addToast('error', err.message || 'Saqlashda xatolik');
+        addToast('error', errorText(err, 'Saqlashda xatolik'));
         telegram.notification('error');
       }
     }
   };
 
-  // Backfill
+  // Backfill (errors propagate to the Backfill tab log)
   const handleTriggerBackfill = async (pairId: number, count: number) => {
     try {
-      await api.triggerBackfill(pairId, count);
-      addToast('info', `${count} ta postni ko'chirish navbatga qo'yildi`);
-    } catch (err: any) {
-      if (isPreview) {
-        addToast('info', `${count} ta postni ko'chirish navbatga qo'yildi (Simulyatsiya)`);
-      } else {
-        addToast('error', err.message || 'Xatolik yuz berdi');
+      const res = await api.triggerBackfill(pairId, count);
+      addToast('info', res.message || `${count} ta postni ko'chirish navbatga qo'yildi`);
+    } catch (err) {
+      if (!isPreview) {
+        addToast('error', errorText(err, 'Xatolik yuz berdi'));
+        throw err;
       }
+      addToast('info', `${count} ta postni ko'chirish navbatga qo'yildi (Simulyatsiya)`);
     }
   };
 
   // Billing
   const handleSelectPlan = async (planKey: string) => {
     telegram.impact('medium');
-    if (planKey === 'free') {
-      addToast('info', 'Siz allaqachon bepul sinovdasiz!');
+    if (planKey !== 'pro' && planKey !== 'vip') {
+      if (subscription?.is_trial_active) {
+        addToast('info', 'Siz allaqachon bepul sinovdasiz!');
+      } else {
+        addToast('warning', "Sinov muddati tugagan. Davom etish uchun Pro yoki VIP tarifini tanlang.");
+      }
       return;
     }
-    
+
     try {
       const res = await api.checkout(planKey);
       telegram.openInvoice(res.invoice_link, (status) => {
         if (status === 'paid') {
-          addToast('success', 'To\'lov muvaffaqiyatli amalga oshirildi! 🎉');
+          addToast('success', "To'lov muvaffaqiyatli amalga oshirildi! 🎉");
           telegram.notification('success');
           loadData();
         } else if (status === 'failed') {
-          addToast('error', 'To\'lov amalga oshmadi');
+          addToast('error', "To'lov amalga oshmadi");
         }
       });
-    } catch (err: any) {
+    } catch (err) {
       if (isPreview) {
         addToast('info', `Telegram Stars to'lov darchasi (Preview: ${planKey.toUpperCase()})`);
       } else {
-        addToast('error', err.message || "To'lov havolasini olishda xatolik");
+        addToast('error', errorText(err, "To'lov havolasini olishda xatolik"));
       }
     }
   };
@@ -367,7 +330,7 @@ export const App: React.FC = () => {
   return (
     <DeviceFrame>
       <div className="ios26-ambient-glow" />
-      
+
       {/* Toast Alert Notifications */}
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
 
@@ -413,6 +376,8 @@ export const App: React.FC = () => {
           />
         )}
 
+        {activeTab === 'store' && <StoreTab />}
+
         {activeTab === 'backfill' && (
           <BackfillTab
             pairs={pairs}
@@ -423,6 +388,7 @@ export const App: React.FC = () => {
         {activeTab === 'billing' && (
           <BillingTab
             subscription={subscription}
+            billing={billing}
             onSelectPlan={handleSelectPlan}
           />
         )}
@@ -431,6 +397,7 @@ export const App: React.FC = () => {
           <SystemTab
             telemetry={telemetry}
             logs={logs}
+            isAdmin={isAdmin}
             onRefresh={loadData}
           />
         )}
@@ -447,10 +414,16 @@ export const App: React.FC = () => {
       {editingPair && (
         <ChannelEditorModal
           pair={editingPair}
+          subscription={subscription}
+          isAdmin={isAdmin}
           onClose={() => setEditingPair(null)}
           onSave={handleSavePair}
           onDelete={handleDeletePair}
           onTestPost={handleTestPost}
+          onOpenBilling={() => {
+            setEditingPair(null);
+            setActiveTab('billing');
+          }}
         />
       )}
 

@@ -4,7 +4,6 @@ Monitors Python source files and application configuration for changes.
 Supports in-process zero-downtime hot-reloading and external notification hooks.
 """
 import os
-import sys
 import time
 import asyncio
 import logging
@@ -113,7 +112,8 @@ class SourceCodeWatcher:
                     if old_mtime is None:
                         rel = os.path.relpath(fpath, self.base_dir)
                         detected.append(f"+ {rel}")
-                    elif mtime > old_mtime + 0.001:
+                    elif abs(mtime - old_mtime) > 0.001:
+                        # Any change counts: restored/copied files can carry an OLDER timestamp
                         rel = os.path.relpath(fpath, self.base_dir)
                         detected.append(f"~ {rel}")
 

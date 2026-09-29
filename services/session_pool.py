@@ -1,11 +1,8 @@
 import asyncio
 import time
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 from telethon import TelegramClient
-from telethon.sessions import StringSession
-from config.settings import settings
-from services.security_vault import security_vault
 
 logger = logging.getLogger(__name__)
 

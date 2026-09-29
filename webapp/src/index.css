@@ -74,20 +74,25 @@
 .vision-glass-panel {
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.13) 0%,
-    rgba(255, 255, 255, 0.07) 100%
+    rgba(255, 255, 255, 0.12) 0%,
+    rgba(255, 255, 255, 0.06) 100%
   );
-  backdrop-filter: blur(40px) saturate(190%);
-  -webkit-backdrop-filter: blur(40px) saturate(190%);
+  background-color: rgba(28, 27, 34, 0.70);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
   border: 0.5px solid rgba(255, 255, 255, 0.20);
   border-top-color: rgba(255, 255, 255, 0.35);
   border-radius: 26px;
   box-shadow:
-    0 20px 50px -12px rgba(0, 0, 0, 0.55),
+    0 16px 40px -10px rgba(0, 0, 0, 0.45),
     0 0 0 0.5px rgba(255, 255, 255, 0.10),
-    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.50),
-    inset 0 -0.5px 0 0 rgba(255, 255, 255, 0.06);
-  transition: transform 0.35s var(--spring), box-shadow 0.35s var(--ease-out-expo);
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.45);
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+  contain: layout style;
+  transition: transform 0.3s var(--spring), box-shadow 0.3s var(--ease-out-expo);
 }
 
 /* 3. Liquid Glass Card — Inner elevated container
@@ -95,41 +100,48 @@
 .vision-card {
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.11) 0%,
-    rgba(255, 255, 255, 0.055) 100%
+    rgba(255, 255, 255, 0.10) 0%,
+    rgba(255, 255, 255, 0.05) 100%
   );
-  backdrop-filter: blur(30px) saturate(180%);
-  -webkit-backdrop-filter: blur(30px) saturate(180%);
+  background-color: rgba(32, 31, 39, 0.65);
+  backdrop-filter: blur(14px) saturate(150%);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
   border: 0.5px solid rgba(255, 255, 255, 0.18);
   border-top-color: rgba(255, 255, 255, 0.30);
   border-radius: 22px;
   box-shadow:
-    0 10px 25px -6px rgba(0, 0, 0, 0.35),
+    0 8px 20px -4px rgba(0, 0, 0, 0.30),
     inset 0 0.5px 0 0 rgba(255, 255, 255, 0.35);
-  transition: all 0.3s var(--spring);
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  backface-visibility: hidden;
+  contain: layout style;
+  transition: all 0.25s var(--spring);
 }
 .vision-card:hover {
-  transform: translateY(-1px);
+  transform: translateY(-1px) translate3d(0, 0, 0);
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.14) 0%,
-    rgba(255, 255, 255, 0.08) 100%
+    rgba(255, 255, 255, 0.13) 0%,
+    rgba(255, 255, 255, 0.07) 100%
   );
   border-color: rgba(255, 255, 255, 0.28);
-  box-shadow:
-    0 14px 35px -6px rgba(0, 0, 0, 0.45),
-    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.45);
 }
 
 /* 4. Grouped Inset List — Settings-style container (Image 4) */
 .vision-grouped-list {
   background: rgba(255, 255, 255, 0.065);
-  backdrop-filter: blur(30px) saturate(170%);
-  -webkit-backdrop-filter: blur(30px) saturate(170%);
+  background-color: rgba(30, 29, 36, 0.70);
+  backdrop-filter: blur(14px) saturate(150%);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
   border: 0.5px solid rgba(255, 255, 255, 0.14);
   border-top-color: rgba(255, 255, 255, 0.22);
   border-radius: 22px;
   overflow: hidden;
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  backface-visibility: hidden;
+  contain: layout style;
   box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.25);
 }
 

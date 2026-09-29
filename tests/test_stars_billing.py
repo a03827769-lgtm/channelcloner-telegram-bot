@@ -1,19 +1,22 @@
 import unittest
 import asyncio
 import os
+import tempfile
 import uuid
+from datetime import datetime, timedelta
 from database.db_manager import DatabaseManager
 
 class TestStarsBilling(unittest.TestCase):
     def setUp(self):
-        self.db_path = f"temp_media/test_stars_{uuid.uuid4().hex[:8]}.db"
-        os.makedirs("temp_media", exist_ok=True)
+        self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.db_path = os.path.join(self._tmp_dir.name, f"test_stars_{uuid.uuid4().hex[:8]}.db")
         self.db = DatabaseManager(self.db_path)
         asyncio.run(self.db.init_db())
 
     def tearDown(self):
         from tests.test_utils import safe_cleanup_db
         asyncio.run(safe_cleanup_db(self.db_path, self.db))
+        self._tmp_dir.cleanup()
 
     def test_subscription_and_quota(self):
         async def run():
@@ -65,10 +68,13 @@ class TestStarsBilling(unittest.TestCase):
             vip_sub = await self.db.activate_subscription(user_id, tier="vip", stars=300, charge_id="chg_vip_1", days=30)
             self.assertEqual(vip_sub.tier, "vip")
 
-            # 2. Purchasing Pro (e.g. 100 stars) MUST NOT retain or extend VIP tier
+            # 2. A Pro purchase never downgrades an active VIP plan: the paid Pro time is added to the VIP
+            #    plan at the price ratio (30 Pro days = 100 Stars = 10 VIP days), it is not VIP time 1:1
             pro_sub = await self.db.activate_subscription(user_id, tier="pro", stars=100, charge_id="chg_pro_2", days=30)
-            self.assertEqual(pro_sub.tier, "pro")
-            self.assertNotEqual(pro_sub.tier, "vip")
+            self.assertEqual(pro_sub.tier, "vip")
+            vip_end = datetime.fromisoformat(vip_sub.expires_at)
+            extended = datetime.fromisoformat(pro_sub.expires_at) - vip_end
+            self.assertAlmostEqual(extended.total_seconds(), timedelta(days=10).total_seconds(), delta=60)
 
         asyncio.run(run())
 

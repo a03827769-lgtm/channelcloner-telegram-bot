@@ -1,13 +1,10 @@
 # ==============================================================================
-# Telegram Channel Cloner - Remove 24/7 Watchdog from Windows Startup
+# Telegram Channel Cloner - remove the 24/7 watchdog autostart (and all legacy registrations)
+# Thin wrapper: the single implementation is scripts\setup_autostart.py
+# The running watchdog keeps running; stop it with:
+#   python scripts\windows_keepalive_watchdog.py --stop
 # ==============================================================================
-
-$startupFolder = [System.Environment]::GetFolderPath('Startup')
-$shortcutPath = Join-Path $startupFolder "ChannelCloner_24_7_Watchdog.lnk"
-
-if (Test-Path $shortcutPath) {
-    Remove-Item $shortcutPath -Force
-    Write-Host "[OK] Startup shortcut removed from: $shortcutPath" -ForegroundColor Green
-} else {
-    Write-Host "Startup shortcut was not present." -ForegroundColor Yellow
-}
+$ErrorActionPreference = "Stop"
+$python = (Get-Command python -ErrorAction Stop).Source
+& $python (Join-Path $PSScriptRoot "setup_autostart.py") uninstall @args
+exit $LASTEXITCODE

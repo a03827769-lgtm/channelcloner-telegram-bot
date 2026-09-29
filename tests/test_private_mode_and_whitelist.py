@@ -1,38 +1,26 @@
 import unittest
 import os
+import tempfile
 import uuid
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timezone, timedelta
 
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message
 from database.db_manager import DatabaseManager
-from database.models import User, Subscription
 from config.settings import settings
-from bot.middlewares.private_mode_middleware import PrivateModeGatekeeperMiddleware, get_private_mode_prompt
+from bot.middlewares.private_mode_middleware import PrivateModeGatekeeperMiddleware
 from bot.handlers.stars_billing import (
     cb_private_unlock_stars_50,
     process_pre_checkout_query,
-    process_successful_payment,
-    PLANS
+    process_successful_payment
 )
 from bot.handlers.start import cb_check_private_access
 from admin_bot.handlers.access_control import (
     render_bot_mode_view,
-    cb_admin_bot_mode,
     cb_toggle_bot_mode,
-    cb_set_support_user,
     process_support_user_input,
-    cb_whitelist_list,
-    cb_whitelist_stars,
     cb_whitelist_revoke,
-    process_whitelist_user_input,
-    AccessControlStates
-)
-from admin_bot.keyboards.admin_keyboards import (
-    get_admin_dashboard_keyboard,
-    get_bot_mode_keyboard,
-    get_whitelist_pagination_keyboard
+    process_whitelist_user_input
 )
 from services.cache_manager import cache_manager
 from tests.test_utils import safe_cleanup_db
@@ -40,16 +28,17 @@ from tests.test_utils import safe_cleanup_db
 
 class TestPrivateModeAndWhitelist(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        os.makedirs("temp_media", exist_ok=True)
-        self.test_db_path = f"temp_media/test_priv_{uuid.uuid4().hex[:8]}.db"
+        self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.test_db_path = os.path.join(self._tmp_dir.name, f"test_priv_{uuid.uuid4().hex[:8]}.db")
         self.db = DatabaseManager(self.test_db_path)
         await self.db.init_db()
 
         await cache_manager.settings_cache.clear()
         await cache_manager.sub_cache.clear()
 
+        # Only the modules under test are pointed at this test's database (patching the singleton in
+        # database.db_manager itself would leak into every module imported for the first time meanwhile)
         self.patchers = [
-            patch("database.db_manager.db_manager", self.db),
             patch("bot.middlewares.private_mode_middleware.db_manager", self.db),
             patch("bot.handlers.stars_billing.db_manager", self.db),
             patch("bot.handlers.start.db_manager", self.db),
@@ -65,6 +54,7 @@ class TestPrivateModeAndWhitelist(unittest.IsolatedAsyncioTestCase):
         await cache_manager.settings_cache.clear()
         await cache_manager.sub_cache.clear()
         await safe_cleanup_db(self.test_db_path, self.db)
+        self._tmp_dir.cleanup()
 
     async def test_public_mode_allows_all(self):
         await self.db.set_private_mode(False)
@@ -288,50 +278,61 @@ class TestPrivateModeAndWhitelist(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_access_control_panel(self):
         state = AsyncMock()
-
-        # 1. Render view
-        text, kb = await render_bot_mode_view()
-        self.assertIn("BOT REJIMI", text)
-        self.assertTrue("Public" in text or "Ommaviy" in text)
-
-        # 2. Toggle mode
-        cb = MagicMock()
-        cb.message = MagicMock()
-        cb.message.edit_text = AsyncMock()
-        cb.answer = AsyncMock()
-
-        await cb_toggle_bot_mode(cb)
-        self.assertTrue(await self.db.is_private_mode())
-        self.assertTrue(cb.answer.called)
-
-        # 3. Change support username
-        msg_sup = MagicMock()
-        msg_sup.text = "@my_support_channel"
-        msg_sup.answer = AsyncMock()
-        await process_support_user_input(msg_sup, state)
-        self.assertEqual(await self.db.get_support_username(), "my_support_channel")
-
-        # 4. Add user by ID
         admin_id = 111
         target_user_id = 888111
-        msg_add = MagicMock()
-        msg_add.from_user.id = admin_id
-        msg_add.text = str(target_user_id)
-        msg_add.answer = AsyncMock()
-        await process_whitelist_user_input(msg_add, state)
 
-        self.assertTrue(await self.db.is_user_whitelisted(target_user_id))
-        self.assertTrue(await self.db.can_user_access_bot(target_user_id))
+        with patch.object(settings, "ADMIN_IDS_RAW", str(admin_id)),              patch.object(settings, "PRIMARY_SUPER_ADMIN_ID", 0):
+            # 1. Render view
+            text, kb = await render_bot_mode_view()
+            self.assertIn("BOT REJIMI", text)
+            self.assertTrue("Public" in text or "Ommaviy" in text)
 
-        # 5. Revoke user
-        cb_rev = MagicMock()
-        cb_rev.data = f"adm_wl_rm_{target_user_id}"
-        cb_rev.answer = AsyncMock()
-        cb_rev.message = MagicMock()
-        cb_rev.message.edit_text = AsyncMock()
+            # 2. Toggle mode
+            cb = MagicMock()
+            cb.from_user.id = admin_id
+            cb.message = MagicMock()
+            cb.message.edit_text = AsyncMock()
+            cb.answer = AsyncMock()
 
-        await cb_whitelist_revoke(cb_rev)
-        self.assertFalse(await self.db.is_user_whitelisted(target_user_id))
+            await cb_toggle_bot_mode(cb)
+            self.assertTrue(await self.db.is_private_mode())
+            self.assertTrue(cb.answer.called)
+
+            # 3. Change support username
+            msg_sup = MagicMock()
+            msg_sup.from_user.id = admin_id
+            msg_sup.text = "@my_support_channel"
+            msg_sup.answer = AsyncMock()
+            await process_support_user_input(msg_sup, state)
+            self.assertEqual(await self.db.get_support_username(), "my_support_channel")
+
+            # 4. Add user by ID
+            msg_add = MagicMock()
+            msg_add.from_user.id = admin_id
+            msg_add.text = str(target_user_id)
+            msg_add.answer = AsyncMock()
+            await process_whitelist_user_input(msg_add, state)
+
+            self.assertTrue(await self.db.is_user_whitelisted(target_user_id))
+            self.assertTrue(await self.db.can_user_access_bot(target_user_id))
+
+            # 5. Revoke user
+            cb_rev = MagicMock()
+            cb_rev.from_user.id = admin_id
+            cb_rev.data = f"adm_wl_rm_{target_user_id}"
+            cb_rev.answer = AsyncMock()
+            cb_rev.message = MagicMock()
+            cb_rev.message.edit_text = AsyncMock()
+
+            await cb_whitelist_revoke(cb_rev)
+            self.assertFalse(await self.db.is_user_whitelisted(target_user_id))
+
+        # A delegated (non-super) admin cannot switch the bot mode
+        cb_other = MagicMock()
+        cb_other.from_user.id = 222
+        cb_other.answer = AsyncMock()
+        await cb_toggle_bot_mode(cb_other)
+        self.assertTrue(await self.db.is_private_mode())
 
     async def test_check_private_access_callback(self):
         await self.db.set_private_mode(True)

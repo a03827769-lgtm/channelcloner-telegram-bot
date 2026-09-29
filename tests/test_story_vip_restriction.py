@@ -7,20 +7,14 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram.types import Message, CallbackQuery, User, Chat, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.storage.base import StorageKey
 
-from config.settings import settings
 from database.db_manager import DatabaseManager
-from database.models import Subscription, StorySettings, StoryQueueItem
+from database.models import Subscription
 from services.story_cloner_service import story_cloner_service
 from services.story_queue_service import story_queue_service
 from bot.handlers.story_menu import (
-    check_is_vip,
     get_story_vip_upgrade_text,
-    get_story_vip_upgrade_text_and_keyboard,
     render_story_main_menu,
-    show_story_menu,
     StoryVipMiddleware
 )
 from bot.keyboards.story_keyboards import get_story_vip_upgrade_keyboard
@@ -100,7 +94,8 @@ async def test_db_manager_is_vip_and_revocation(test_db):
     await test_db.get_or_create_user(free_user_id, "Free User", "freeuser")
     await test_db.get_or_create_user(pro_user_id, "Pro User", "prouser")
     await test_db.get_or_create_user(vip_user_id, "VIP User", "vipuser")
-    await test_db.get_or_create_user(admin_user_id, "Admin User", "adminuser", is_admin=True)
+    await test_db.get_or_create_user(admin_user_id, "Admin User", "adminuser")
+    await test_db.set_admin_status(admin_user_id, True)
 
     # Set subscriptions
     await test_db.activate_subscription(pro_user_id, "pro", 100, "ch_pro", days=30)

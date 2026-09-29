@@ -1,9 +1,21 @@
 import os
+import re
+import html
 import logging
-from typing import Optional, Tuple
-from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageOps
+from typing import Optional
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 logger = logging.getLogger(__name__)
+
+
+def _plain_watermark_text(text: Optional[str]) -> str:
+    """Watermarks are drawn as plain text: HTML tags (e.g. <tg-emoji>, <b>) and entities never reach the image."""
+    clean = html.unescape(re.sub(r'<[^>]*>', '', str(text or "")))
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    if len(clean) > 100:
+        clean = clean[:97] + "..."
+    return clean
+
 
 class WatermarkService:
     @staticmethod
@@ -16,16 +28,12 @@ class WatermarkService:
         """
         Applies a modern, semi-transparent text watermark badge onto an image.
         """
-        if not text or not os.path.exists(image_path):
+        clean_text = _plain_watermark_text(text)
+        if not clean_text or not os.path.exists(image_path):
             return image_path
 
         if image_path.lower().endswith(".gif"):
             return image_path
-
-        # Guard against excessively long watermark text
-        clean_text = str(text or "").strip()
-        if len(clean_text) > 100:
-            clean_text = clean_text[:97] + "..."
 
         out_path = output_path or image_path
         tmp_save_path = f"{out_path}.wm_tmp"
@@ -164,6 +172,8 @@ class WatermarkService:
             return image_path
 
         out_path = output_path or image_path
+        # Defined before the try block: the finally clause must never hit an unbound name after an early failure
+        tmp_save_path = f"{out_path}.logo_tmp"
 
         try:
             with Image.open(image_path) as loaded_img, Image.open(logo_path) as loaded_logo:
@@ -212,7 +222,6 @@ class WatermarkService:
             # Paste with alpha mask
             base_img.paste(logo, pos, mask=logo)
 
-            tmp_save_path = f"{out_path}.logo_tmp"
             if out_path.lower().endswith((".png", ".webp")):
                 base_img.save(tmp_save_path, format="PNG")
             else:
@@ -248,13 +257,11 @@ class WatermarkService:
         """
         effective_text = watermark_text if watermark_text is not None else text
         effective_pos = pos if pos is not None else position
-        if not effective_text or not image_bytes:
+        clean_text = _plain_watermark_text(effective_text)
+        if not clean_text or not image_bytes:
             return image_bytes
         import io
-        clean_text = str(effective_text or "").strip()
         position = effective_pos
-        if len(clean_text) > 100:
-            clean_text = clean_text[:97] + "..."
 
         try:
             input_stream = io.BytesIO(image_bytes)

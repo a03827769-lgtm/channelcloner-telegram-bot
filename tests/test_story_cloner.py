@@ -2,11 +2,21 @@ import os
 import pytest
 from PIL import Image
 
-from database.models import StorySettings, PostedStory
+from database.models import StorySettings
 from database.db_manager import db_manager
-from services.story_cloner_service import StoryClonerService, story_cloner_service
-from services.security_vault import security_vault
-from telethon import types, functions
+from services.story_cloner_service import StoryClonerService
+from telethon import types
+
+
+@pytest.fixture
+async def isolated_db_manager(tmp_path):
+    """Points the shared db_manager at a temporary database for one test and restores it afterwards."""
+    original_path = db_manager.db_path
+    await db_manager.close()
+    db_manager.db_path = str(tmp_path / "story_cloner.db")
+    yield db_manager
+    await db_manager.close()
+    db_manager.db_path = original_path
 
 
 class MockMessage:
@@ -100,30 +110,18 @@ def test_background_assets():
 
 
 def test_story_tl_types_construction():
-    coords = types.MediaAreaCoordinates(x=50.0, y=50.0, w=88.0, h=72.0, rotation=0.0, radius=2.5)
-    assert coords.x == 50.0
-    assert coords.y == 50.0
-
-    dummy_channel = types.InputChannel(channel_id=1234567, access_hash=987654321)
-    area = types.InputMediaAreaChannelPost(coordinates=coords, channel=dummy_channel, msg_id=999)
-    assert area.msg_id == 999
-    assert area.channel.channel_id == 1234567
-
-    uploaded = types.InputFile(id=1, parts=1, name="bg.jpg", md5_checksum="")
-    media = types.InputMediaUploadedPhoto(file=uploaded)
-    req = functions.stories.SendStoryRequest(
-        peer=types.InputPeerSelf(),
-        media=media,
-        privacy_rules=[types.InputPrivacyValueAllowAll()],
-        media_areas=[area],
-        random_id=12345678
-    )
-    assert req.peer is not None
-    assert len(req.media_areas) == 1
+    """The post link area of a story covers the rendered card and points at the source post"""
+    channel = types.InputChannel(channel_id=1234567, access_hash=987654321)
+    area = StoryClonerService.post_link_area({"x": 50.0, "y": 47.5, "w": 81.5, "h": 60.0}, channel, 999)
+    assert isinstance(area, types.InputMediaAreaChannelPost)
+    assert area.msg_id == 999 and area.channel.channel_id == 1234567
+    assert (area.coordinates.x, area.coordinates.y, area.coordinates.w, area.coordinates.h) == (50.0, 47.5, 81.5, 60.0)
+    # Without a resolvable channel there is no area (the story is posted without the link)
+    assert StoryClonerService.post_link_area({"x": 1}, None, 999) is None
 
 
 @pytest.mark.asyncio
-async def test_database_user_session_and_settings():
+async def test_database_user_session_and_settings(isolated_db_manager):
     await db_manager.init_db()
 
     test_uid = 999999001

@@ -1,66 +1,79 @@
 # ==============================================================================
-# Telegram Channel Cloner — Production .dockerignore
+# Telegram Channel Cloner — .dockerignore
+# The image contains application code only. `**/` patterns match at any depth
+# (plain patterns are anchored to the build-context root).
 # ==============================================================================
 
-# Python bytecode & environments
-__pycache__/
-*.py[cod]
-*$py.class
-.Python
-env/
-venv/
-.venv/
-ENV/
-
-# Sensitive credentials & Environment files (CRITICAL SECURITY)
-.env
-.env.*
-!.env.example
-*.env
-*.env.local
-cloud_env_ready.txt
-*.token
-*.secret
-*.key
-*.pem
-*.cer
-
-# Telethon & Pyrogram MTProto Session Files
-*.session
-*.session-journal
-*.session*
-
-# Database & SQLite files
-*.db
-*.db-wal
-*.db-shm
-*.sqlite
-*.sqlite3
-database/*.db*
-database/*.sqlite*
-test_stars.db
-test_next_gen.db
-tests/*.db
-
-# Temporary media & cache
-temp_media/*
-!temp_media/.gitkeep
-temp_media/
-*.tmp
-*.bak
-test.txt
-
-# Git & Development / Agent metadata
-.git/
+# VCS, CI and tooling
+.git
+.github
 .gitignore
+.gitattributes
 .dockerignore
-.agents/
-.gemini/
-.vscode/
-.idea/
-.pytest_cache/
-.coverage
-tests/
-test_channel_perm.py
-audit_report.md
-walkthrough.md
+.agents
+.gemini
+.vscode
+.idea
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.ruff_cache
+**/.coverage
+.venv
+venv
+env
+
+# Secrets & credentials (CRITICAL)
+**/.env
+**/.env.*
+**/*.env
+**/.vault_key
+**/*.key
+**/*.pem
+**/*.cer
+**/*.token
+**/*.secret
+**/*.session
+**/*.session-journal
+**/cloud_env_ready.txt
+**/cloud_*.txt
+.cloudflared
+**/.cloudflared
+app.pid
+**/app.pid
+app.lock
+**/app.lock
+
+# Databases, runtime data, logs and backups
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.db-journal
+**/*.sqlite
+**/*.sqlite3
+data
+logs
+backups
+**/backups
+temp_media
+temp_media_test
+**/*.log
+**/*.bak
+**/*.tmp
+
+# Frontend dependencies and build output (the image builds webapp/ itself)
+**/node_modules
+webapp/dist
+webapp/vite.config.ts.timestamp-*
+
+# Host binaries and tooling that never run inside the image
+**/*.exe
+cloudflared*
+scripts
+deploy
+tests
+docker-compose*.yml
+render.yaml
+Procfile
+setup_wizard.py
+*.md

@@ -1,24 +1,109 @@
 import os
 import re
 import time
+import uuid
 import base64
 import html
 import logging
 import threading
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from typing import List, Optional, Dict, Any
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Dict, Any, Tuple
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from config.settings import settings
+from services.listing_analyzer import format_price_usd
 
 logger = logging.getLogger(__name__)
 
-_PLAYWRIGHT_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="playwright_renderer")
+# Tashkent has no DST: a fixed offset avoids a tzdata dependency on Windows / slim images
+TASHKENT_TZ = timezone(timedelta(hours=5))
+RU_MONTHS = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+
+# Dedicated Chromium workers: every Playwright render runs on one of these threads (whatever thread asked for it),
+# so at most _PLAYWRIGHT_MAX_WORKERS browsers exist and each worker reuses its own browser between cards.
+_PLAYWRIGHT_MAX_WORKERS = 2
+_PLAYWRIGHT_THREAD_PREFIX = "playwright_renderer"
+_PLAYWRIGHT_POOL = ThreadPoolExecutor(max_workers=_PLAYWRIGHT_MAX_WORKERS, thread_name_prefix=_PLAYWRIGHT_THREAD_PREFIX)
+_PLAYWRIGHT_RENDER_TIMEOUT = 90.0
+# A browser idle for longer than this is restarted before the next render (guards against zombie browsers)
+_PLAYWRIGHT_BROWSER_MAX_IDLE = 600.0
+_pw_local = threading.local()
+
+# Photos are decoded at most at this size (the collage is 880x920); full 12 MP decodes cost ~36 MB each
+_COLLAGE_MAX_PHOTOS = 8
+_DEFAULT_CARD_COORDS: Dict[str, float] = {"x": 50.0, "y": 50.0, "w": 81.5, "h": 68.0}
 
 TOKEN_PATTERN = re.compile(
     r'(#[A-Za-z0-9_а-яА-ЯёЁ]+|[\U00010000-\U0010ffff\u2600-\u27bf\u2b50\u231a-\u23f3\u25aa-\u25fe\u200d\ufe0f]+|[^\s#\U00010000-\U0010ffff\u2600-\u27bf\u2b50\u231a-\u23f3\u25aa-\u25fe\u200d\ufe0f]+|\s+)'
 )
+
+
+def tashkent_date_label(dt: Optional[datetime] = None) -> str:
+    """'29 сен, 14:05' in Tashkent time (naive datetimes are treated as UTC, like Telethon message dates)"""
+    if dt is None:
+        dt = datetime.now(TASHKENT_TZ)
+    elif dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(TASHKENT_TZ)
+    else:
+        dt = dt.astimezone(TASHKENT_TZ)
+    return f"{dt.day} {RU_MONTHS[dt.month - 1]}, {dt.strftime('%H:%M')}"
+
+
+def _temp_media_dir() -> str:
+    temp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp_media")
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
+
+def _close_thread_browser() -> None:
+    """Closes the Chromium instance owned by the current Playwright worker thread"""
+    browser = getattr(_pw_local, "browser", None)
+    pw = getattr(_pw_local, "playwright", None)
+    _pw_local.browser = None
+    _pw_local.playwright = None
+    if browser is not None:
+        try:
+            browser.close()
+        except Exception:
+            logger.debug("Ignored exception", exc_info=True)
+    if pw is not None:
+        try:
+            pw.stop()
+        except Exception:
+            logger.debug("Ignored exception", exc_info=True)
+
+
+def _get_thread_browser():
+    """Returns this worker thread's Chromium, launching (or relaunching a stale / dead) one when needed"""
+    browser = getattr(_pw_local, "browser", None)
+    if browser is not None:
+        idle = time.time() - getattr(_pw_local, "last_used", 0.0)
+        try:
+            alive = browser.is_connected()
+        except Exception:
+            alive = False
+        if alive and idle < _PLAYWRIGHT_BROWSER_MAX_IDLE:
+            return browser
+        _close_thread_browser()
+
+    from playwright.sync_api import sync_playwright
+    pw = sync_playwright().start()
+    try:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+        )
+    except Exception:
+        try:
+            pw.stop()
+        except Exception:
+            logger.debug("Ignored exception", exc_info=True)
+        raise
+    _pw_local.playwright = pw
+    _pw_local.browser = browser
+    _pw_local.last_used = time.time()
+    return browser
 
 
 class StoryCardRenderer:
@@ -26,32 +111,26 @@ class StoryCardRenderer:
     Renders 1080x1920 Telegram Story composite images that replicate
     Telegram's native repost card format with 1:1 pixel accuracy.
     Uses high-performance Pillow (PIL) typography rendering, typographic line
-    wrapping, and CSS-style photo collage layouts with thread-safe coordinate tracking.
+    wrapping, and CSS-style photo collage layouts.
+    Card coordinates (for InputMediaAreaChannelPost) are returned by the *_with_coords entry points; the legacy
+    get_last_card_coordinates() only reports renders made on the calling thread, never another job's card.
     """
 
     def __init__(self):
         self._local = threading.local()
-        self._lock = threading.Lock()
-        self.last_card_coords: Dict[str, float] = {
-            "x": 50.0,
-            "y": 50.0,
-            "w": 81.5,
-            "h": 68.0
-        }
 
     def _set_card_coords(self, coords: Dict[str, float]) -> None:
-        """Stores coordinates in thread-local storage and thread-safely in instance state"""
-        c = dict(coords)
-        self._local.last_card_coords = c
-        with self._lock:
-            self.last_card_coords = c
+        """Remembers the coordinates of the last card rendered by the current thread"""
+        self._local.last_card_coords = dict(coords)
 
     def get_last_card_coordinates(self) -> Dict[str, float]:
-        """Returns the exact percentage coordinates of the last rendered card for InputMediaAreaChannelPost"""
-        if hasattr(self._local, "last_card_coords"):
-            return dict(self._local.last_card_coords)
-        with self._lock:
-            return dict(self.last_card_coords)
+        """Percentage coordinates of the last card rendered on THIS thread (defaults when none)"""
+        coords = getattr(self._local, "last_card_coords", None)
+        return dict(coords) if coords else dict(_DEFAULT_CARD_COORDS)
+
+    @property
+    def last_card_coords(self) -> Dict[str, float]:
+        return self.get_last_card_coordinates()
 
     @classmethod
     def _clean_text_for_rendering(cls, text: str, strip_emoji: bool = False) -> str:
@@ -97,6 +176,7 @@ class StoryCardRenderer:
             with Image.open(file_path) as im:
                 im_format = im.format or "JPEG"
                 mime = "image/png" if im_format == "PNG" else "image/jpeg"
+                im.draft("RGB", (max_dim, max_dim))
                 w, h = im.size
                 if max(w, h) > max_dim:
                     scale = max_dim / float(max(w, h))
@@ -122,17 +202,17 @@ class StoryCardRenderer:
         if not caption:
             return ["✨ Yangi e'lon"]
 
-        raw_lines = [re.sub(r'[ \t]+', ' ', l).strip() for l in caption.split('\n')]
-        non_empty = [cls._clean_text_for_rendering(l) for l in raw_lines if l.strip()]
+        raw_lines = [re.sub(r'[ \t]+', ' ', line).strip() for line in caption.split('\n')]
+        non_empty = [cls._clean_text_for_rendering(line) for line in raw_lines if line.strip()]
 
         cleaned = []
         price_line = None
 
-        for l in non_empty:
-            low = l.lower()
-            if any(k in low for k in ['цена', 'нарх', 'narxi', 'стоимость', 'ijara']) and any(c.isdigit() for c in l):
+        for line in non_empty:
+            low = line.lower()
+            if any(k in low for k in ['цена', 'нарх', 'narxi', 'стоимость', 'ijara']) and any(c.isdigit() for c in line):
                 if not price_line:
-                    price_line = l
+                    price_line = line
                 continue
             # Filter strictly lines that are purely contacts, URLs, or handles without content
             is_contact_only = bool(
@@ -142,19 +222,16 @@ class StoryCardRenderer:
             )
             if is_contact_only:
                 continue
-            cleaned.append(l)
+            cleaned.append(line)
 
-        display = []
-        for l in cleaned:
-            if len(display) >= 4:
-                break
-            display.append(l)
+        display = cleaned[:4]
 
         if price_line and price_line not in display:
             display.append(price_line)
         elif price:
-            if not any('$' in l or 'usd' in l.lower() or 'нарх' in l.lower() or 'cena' in l.lower() or 'narx' in l.lower() for l in display):
-                display.append(f"Narxi: ${price:g}")
+            price_markers = ('$', 'usd', 'нарх', 'цена', 'narx')
+            if not any(marker in line.lower() for line in display for marker in price_markers):
+                display.append(f"Narxi: {format_price_usd(price)}")
 
         if not display and non_empty:
             display = non_empty[:3]
@@ -165,7 +242,7 @@ class StoryCardRenderer:
     def _build_caption_html(cls, caption: str, price: Optional[float] = None) -> str:
         """Constructs HTML for caption with native emojis, blue hashtags, and More button"""
         display_lines = cls.extract_story_lines(caption, price)
-        raw_lines = [l.strip() for l in caption.split('\n') if l.strip()] if caption else []
+        raw_lines = [line.strip() for line in caption.split('\n') if line.strip()] if caption else []
 
         lines_html = []
         for i, line in enumerate(display_lines):
@@ -186,13 +263,13 @@ class StoryCardRenderer:
             return ""
         items = []
         for b in badges:
-            escaped = html.escape(b)
+            escaped = html.escape(str(b))
             cls_name = "badge-pill"
-            if "PREMYUM" in b or "💎" in b:
+            if "PREMYUM" in str(b) or "💎" in str(b):
                 cls_name += " badge-luxury"
-            elif "BIZNES" in b or "⭐" in b:
+            elif "BIZNES" in str(b) or "⭐" in str(b):
                 cls_name += " badge-business"
-            elif "SARA" in b or "🔥" in b:
+            elif "SARA" in str(b) or "🔥" in str(b):
                 cls_name += " badge-sara"
             items.append(f'<span class="{cls_name}">{escaped}</span>')
         return f'<div class="badges-container">{"".join(items)}</div>'
@@ -311,17 +388,12 @@ class StoryCardRenderer:
         </div>'''
 
     def _execute_playwright(self, fn, *args, **kwargs):
-        """Executes Playwright synchronously, safely dispatching to dedicated worker pool if inside an asyncio loop"""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            future = _PLAYWRIGHT_POOL.submit(fn, *args, **kwargs)
-            return future.result()
-        else:
+        """Runs a Playwright job on the dedicated worker pool (bounded concurrency, reused browsers).
+        Jobs already running on a pool thread execute inline."""
+        if threading.current_thread().name.startswith(_PLAYWRIGHT_THREAD_PREFIX):
             return fn(*args, **kwargs)
+        future = _PLAYWRIGHT_POOL.submit(fn, *args, **kwargs)
+        return future.result(timeout=_PLAYWRIGHT_RENDER_TIMEOUT)
 
     def render_story_composite_playwright(
         self,
@@ -338,7 +410,7 @@ class StoryCardRenderer:
         transparent: bool = False
     ) -> str:
         """Dispatches Playwright rendering safely across synchronous or asynchronous contexts"""
-        return self._execute_playwright(
+        out_path, coords = self._execute_playwright(
             self._render_playwright_internal,
             bg_base_path=bg_base_path,
             channel_title=channel_title,
@@ -352,39 +424,8 @@ class StoryCardRenderer:
             output_path=output_path,
             transparent=transparent
         )
-
-    async def render_story_composite_playwright_async(
-        self,
-        bg_base_path: Optional[str],
-        channel_title: str,
-        photo_paths: List[str],
-        caption: str,
-        price: Optional[float] = None,
-        date_str: Optional[str] = None,
-        avatar_path: Optional[str] = None,
-        forward_title: Optional[str] = None,
-        badges: Optional[List[str]] = None,
-        output_path: Optional[str] = None,
-        transparent: bool = False
-    ) -> str:
-        """Asynchronously executes Playwright rendering in dedicated thread pool without blocking event loop"""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            _PLAYWRIGHT_POOL,
-            lambda: self._render_playwright_internal(
-                bg_base_path=bg_base_path,
-                channel_title=channel_title,
-                photo_paths=photo_paths,
-                caption=caption,
-                price=price,
-                date_str=date_str,
-                avatar_path=avatar_path,
-                forward_title=forward_title,
-                badges=badges,
-                output_path=output_path,
-                transparent=transparent
-            )
-        )
+        self._set_card_coords(coords)
+        return out_path
 
     def _render_playwright_internal(
         self,
@@ -399,14 +440,13 @@ class StoryCardRenderer:
         badges: Optional[List[str]] = None,
         output_path: Optional[str] = None,
         transparent: bool = False
-    ) -> str:
+    ) -> Tuple[str, Dict[str, float]]:
         """
         Internal implementation: Renders the story using Playwright Chromium for 100% native Telegram styling.
         Guarantees flawless emoji alignment, typography, and precise bounding boxes.
         When transparent=True, renders without background as RGBA PNG for video overlay.
+        Returns (output_path, card_coordinates).
         """
-        from playwright.sync_api import sync_playwright
-
         bg_uri = self._image_to_base64_uri(bg_base_path) if bg_base_path else None
         if not bg_uri and not transparent:
             # Fallback inline SVG green background
@@ -415,11 +455,11 @@ class StoryCardRenderer:
         avatar_uri = self._image_to_base64_uri(avatar_path)
         if not avatar_uri:
             # Fallback avatar badge with initial letter
-            initial = (channel_title[:1] if channel_title else "A").upper()
+            initial = html.escape((channel_title[:1] if channel_title else "A").upper())
             avatar_uri = f"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='72' height='72'><circle cx='36' cy='36' r='36' fill='%238f327e'/><text x='36' y='46' font-size='32' font-family='sans-serif' font-weight='bold' fill='white' text-anchor='middle'>{initial}</text></svg>"
 
         photo_uris = []
-        for p in photo_paths:
+        for p in photo_paths[:_COLLAGE_MAX_PHOTOS]:
             uri = self._image_to_base64_uri(p)
             if uri:
                 photo_uris.append(uri)
@@ -434,7 +474,7 @@ class StoryCardRenderer:
             fwd_escaped = html.escape(self._clean_text_for_rendering(forward_title))
             forward_html = f'<div class="forward-info">Переслано от <span class="forward-channel">{fwd_escaped}</span></div>'
 
-        time_text = html.escape(self._clean_text_for_rendering(date_str or time.strftime("%d сен, %H:%M")))
+        time_text = html.escape(self._clean_text_for_rendering(date_str or tashkent_date_label()))
 
         body_bg_css = "background: transparent !important;" if transparent else f"background: url('{bg_uri}') no-repeat center center; background-size: cover;"
         card_shadow = "filter: drop-shadow(0 20px 40px rgba(0, 0, 0, 0.45));" if transparent else "filter: drop-shadow(0 16px 36px rgba(0, 0, 0, 0.22));"
@@ -478,11 +518,17 @@ html, body {{
     font-size: 28px;
     font-weight: 700;
     letter-spacing: -0.2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }}
 .forward-info {{
     color: #8e8e93;
     font-size: 21px;
     margin-top: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }}
 .forward-channel {{
     color: #c67d32;
@@ -614,60 +660,54 @@ html, body {{
 </html>'''
 
         if not output_path:
-            temp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp_media")
-            os.makedirs(temp_dir, exist_ok=True)
-            output_path = os.path.join(temp_dir, f"story_card_{int(time.time() * 1000)}.jpg")
+            suffix = "png" if transparent else "jpg"
+            prefix = "overlay" if transparent else "story_card"
+            output_path = os.path.join(_temp_media_dir(), f"{prefix}_{uuid.uuid4().hex}.{suffix}")
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-            )
+        coords = dict(_DEFAULT_CARD_COORDS)
+        browser = _get_thread_browser()
+        page = None
+        try:
+            page = browser.new_page(viewport={'width': 1080, 'height': 1920})
+            # "load" waits for the data-URI images; the extra check covers decoding of large embedded photos
+            page.set_content(html_content, wait_until="load", timeout=20000)
             try:
-                page = browser.new_page(viewport={'width': 1080, 'height': 1920})
-                page.set_content(html_content, wait_until="domcontentloaded", timeout=15000)
+                page.wait_for_function(
+                    "() => Array.from(document.images).every(img => img.complete && img.naturalWidth > 0)",
+                    timeout=10000
+                )
+            except Exception:
+                logger.debug("Story card images did not all finish decoding in time", exc_info=True)
 
-                card_el = page.query_selector('#card')
-                if card_el:
-                    box = card_el.bounding_box()
-                    if box:
-                        center_x_pct = (box['x'] + box['width'] / 2.0) / 1080.0 * 100.0
-                        center_y_pct = (box['y'] + box['height'] / 2.0) / 1920.0 * 100.0
-                        w_pct = box['width'] / 1080.0 * 100.0
-                        h_pct = box['height'] / 1920.0 * 100.0
-                        self._set_card_coords({
-                            "x": round(center_x_pct, 1),
-                            "y": round(center_y_pct, 1),
-                            "w": round(w_pct, 1),
-                            "h": round(h_pct, 1)
-                        })
+            card_el = page.query_selector('#card')
+            if card_el:
+                box = card_el.bounding_box()
+                if box:
+                    coords = {
+                        "x": round((box['x'] + box['width'] / 2.0) / 1080.0 * 100.0, 1),
+                        "y": round((box['y'] + box['height'] / 2.0) / 1920.0 * 100.0, 1),
+                        "w": round(box['width'] / 1080.0 * 100.0, 1),
+                        "h": round(box['height'] / 1920.0 * 100.0, 1)
+                    }
 
-                if transparent:
-                    page.screenshot(path=output_path, omit_background=True, type='png', timeout=15000)
-                else:
-                    page.screenshot(path=output_path, quality=95, type='jpeg', timeout=15000)
-            finally:
-                if 'page' in locals() and page:
-                    try:
-                        page.close()
-                    except Exception:
-                        logger.debug("Ignored exception", exc_info=True)
+            if transparent:
+                page.screenshot(path=output_path, omit_background=True, type='png', timeout=15000)
+            else:
+                page.screenshot(path=output_path, quality=95, type='jpeg', timeout=15000)
+        except Exception:
+            # A crashed / disconnected browser is relaunched by the next render on this worker
+            _close_thread_browser()
+            raise
+        finally:
+            if page is not None:
                 try:
-                    browser.close()
+                    page.close()
                 except Exception:
                     logger.debug("Ignored exception", exc_info=True)
+            _pw_local.last_used = time.time()
 
-        # Keep a persistent preview copy for real-time inspection
-        try:
-            preview_dir = os.path.dirname(output_path)
-            preview_file = os.path.join(preview_dir, "real_realtor_story_preview.jpg")
-            with open(output_path, 'rb') as fsrc, open(preview_file, 'wb') as fdst:
-                fdst.write(fsrc.read())
-        except Exception:
-            logger.debug("Ignored exception", exc_info=True)
-
-        logger.info(f"Story composite card rendered via Playwright: {output_path} (coords: {self.last_card_coords})")
-        return output_path
+        logger.info(f"Story composite card rendered via Playwright: {output_path} (coords: {coords})")
+        return output_path, coords
 
     # ==========================================
     # --- RESILIENT PILLOW (PIL) FALLBACK ---
@@ -678,21 +718,37 @@ html, body {{
         """Scales and center-crops an image to exact dimensions"""
         sw, sh = img.size
         scale = max(target_w / sw, target_h / sh)
-        nw, nh = int(sw * scale), int(sh * scale)
+        nw, nh = max(target_w, int(round(sw * scale))), max(target_h, int(round(sh * scale)))
         res = img.resize((nw, nh), Image.Resampling.LANCZOS)
         cx, cy = (nw - target_w) // 2, (nh - target_h) // 2
         return res.crop((cx, cy, cx + target_w, cy + target_h))
+
+    @staticmethod
+    def _load_image_scaled(path: str, max_w: int, max_h: int) -> Optional[Image.Image]:
+        """Opens a photo decoded at (roughly) the size it will be shown at: JPEG draft decoding scales by 1/2..1/8
+        while decoding, so a 12 MP photo never becomes a 36 MB bitmap"""
+        try:
+            with Image.open(path) as im:
+                im.draft("RGB", (max_w, max_h))
+                img = im.convert("RGB")
+            if img.width > max_w * 2 or img.height > max_h * 2:
+                img.thumbnail((max_w * 2, max_h * 2), Image.Resampling.BILINEAR)
+            return img
+        except Exception:
+            logger.debug(f"Could not open story photo {path}", exc_info=True)
+            return None
 
     @classmethod
     def create_photo_collage(cls, photo_paths: List[str], width: int = 880, height: int = 920) -> Optional[Image.Image]:
         """Creates an authentic Telegram-style photo collage matching the reference layout. Returns None if no valid photos."""
         valid_imgs = []
-        for p in photo_paths:
+        for p in photo_paths or []:
+            if len(valid_imgs) >= _COLLAGE_MAX_PHOTOS:
+                break
             if p and os.path.exists(p):
-                try:
-                    valid_imgs.append(Image.open(p).convert('RGB'))
-                except Exception:
-                    logger.debug("Ignored exception", exc_info=True)
+                img = cls._load_image_scaled(p, width, height)
+                if img is not None:
+                    valid_imgs.append(img)
 
         n = len(valid_imgs)
         gap = 2
@@ -708,7 +764,7 @@ html, body {{
         if n == 2:
             col_w = (width - gap) // 2
             collage.paste(cls._fit_and_crop(valid_imgs[0], col_w, height), (0, 0))
-            collage.paste(cls._fit_and_crop(valid_imgs[1], col_w, height), (col_w + gap, 0))
+            collage.paste(cls._fit_and_crop(valid_imgs[1], width - col_w - gap, height), (col_w + gap, 0))
             return collage
 
         if n == 3:
@@ -717,41 +773,42 @@ html, body {{
             col_w = (width - gap) // 2
             collage.paste(cls._fit_and_crop(valid_imgs[0], width, h1), (0, 0))
             collage.paste(cls._fit_and_crop(valid_imgs[1], col_w, h2), (0, h1 + gap))
-            collage.paste(cls._fit_and_crop(valid_imgs[2], col_w, h2), (col_w + gap, h1 + gap))
+            collage.paste(cls._fit_and_crop(valid_imgs[2], width - col_w - gap, h2), (col_w + gap, h1 + gap))
             return collage
 
         if n == 4:
             col_w = (width - gap) // 2
             row_h = (height - gap) // 2
             collage.paste(cls._fit_and_crop(valid_imgs[0], col_w, row_h), (0, 0))
-            collage.paste(cls._fit_and_crop(valid_imgs[1], col_w, row_h), (col_w + gap, 0))
-            collage.paste(cls._fit_and_crop(valid_imgs[2], col_w, row_h), (0, row_h + gap))
-            collage.paste(cls._fit_and_crop(valid_imgs[3], col_w, row_h), (col_w + gap, row_h + gap))
+            collage.paste(cls._fit_and_crop(valid_imgs[1], width - col_w - gap, row_h), (col_w + gap, 0))
+            collage.paste(cls._fit_and_crop(valid_imgs[2], col_w, height - row_h - gap), (0, row_h + gap))
+            collage.paste(cls._fit_and_crop(valid_imgs[3], width - col_w - gap, height - row_h - gap), (col_w + gap, row_h + gap))
             return collage
 
-        # 5 or more photos
+        def paste_row(images: List[Image.Image], y: int, row_h: int) -> None:
+            count = len(images)
+            cell_w = (width - (count - 1) * gap) // count
+            x = 0
+            for idx, img in enumerate(images):
+                # The last cell absorbs the rounding remainder so every row spans the full width
+                w = cell_w if idx < count - 1 else width - x
+                collage.paste(cls._fit_and_crop(img, w, row_h), (x, y))
+                x += w + gap
+
+        if n == 5:
+            # 2 + 3 layout filling the whole area (no empty band)
+            h1 = int(height * 0.55)
+            paste_row(valid_imgs[0:2], 0, h1)
+            paste_row(valid_imgs[2:5], h1 + gap, height - h1 - gap)
+            return collage
+
+        # 6 or more photos: 2 + 3 + (1..3)
         h1 = int(height * 0.42)
         h2 = int(height * 0.29)
         h3 = height - h1 - h2 - (2 * gap)
-
-        col_w2 = (width - gap) // 2
-        collage.paste(cls._fit_and_crop(valid_imgs[0], col_w2, h1), (0, 0))
-        collage.paste(cls._fit_and_crop(valid_imgs[1], col_w2, h1), (col_w2 + gap, 0))
-
-        col_w3 = (width - 2 * gap) // 3
-        y2 = h1 + gap
-        collage.paste(cls._fit_and_crop(valid_imgs[2], col_w3, h2), (0, y2))
-        collage.paste(cls._fit_and_crop(valid_imgs[3], col_w3, h2), (col_w3 + gap, y2))
-        collage.paste(cls._fit_and_crop(valid_imgs[4], col_w3, h2), (2 * (col_w3 + gap), y2))
-
-        rem_count = min(n - 5, 3)
-        if rem_count > 0:
-            col_w_rem = (width - (rem_count - 1) * gap) // rem_count
-            y3 = y2 + h2 + gap
-            for idx in range(rem_count):
-                x = idx * (col_w_rem + gap)
-                collage.paste(cls._fit_and_crop(valid_imgs[5 + idx], col_w_rem, h3), (x, y3))
-
+        paste_row(valid_imgs[0:2], 0, h1)
+        paste_row(valid_imgs[2:5], h1 + gap, h2)
+        paste_row(valid_imgs[5:8], h1 + gap + h2 + gap, h3)
         return collage
 
     @classmethod
@@ -777,6 +834,73 @@ html, body {{
             return ImageFont.load_default(size=size)
         except TypeError:
             return ImageFont.load_default()
+
+    @staticmethod
+    def _text_width(font: ImageFont.ImageFont, text: str) -> float:
+        try:
+            return float(font.getlength(text))
+        except Exception:
+            bbox = font.getbbox(text)
+            return float(bbox[2] - bbox[0])
+
+    @classmethod
+    def _fit_line(cls, font: ImageFont.ImageFont, text: str, max_width: float) -> str:
+        """Truncates a single line with an ellipsis so it fits max_width"""
+        if cls._text_width(font, text) <= max_width:
+            return text
+        ellipsis = "…"
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if cls._text_width(font, text[:mid].rstrip() + ellipsis) <= max_width:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo].rstrip() + ellipsis
+
+    @classmethod
+    def _wrap_text(cls, font: ImageFont.ImageFont, text: str, max_width: float) -> List[str]:
+        """Word-wraps one paragraph by measured pixel width; words longer than a line are split"""
+        words = text.split()
+        lines: List[str] = []
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}" if current else word
+            if cls._text_width(font, candidate) <= max_width:
+                current = candidate
+                continue
+            if current:
+                lines.append(current)
+                current = ""
+            # Hard-split a single word that does not fit on an empty line
+            while cls._text_width(font, word) > max_width and len(word) > 1:
+                cut = len(word)
+                while cut > 1 and cls._text_width(font, word[:cut]) > max_width:
+                    cut -= 1
+                lines.append(word[:cut])
+                word = word[cut:]
+            current = word
+        if current:
+            lines.append(current)
+        return lines
+
+    @classmethod
+    def _layout_caption(cls, font: ImageFont.ImageFont, paragraphs: List[str], max_width: float, max_lines: int) -> List[str]:
+        """Wraps all caption paragraphs and caps the total number of lines (last line gets an ellipsis)"""
+        lines: List[str] = []
+        truncated = False
+        for para in paragraphs:
+            wrapped = cls._wrap_text(font, para, max_width)
+            for ln in wrapped:
+                if len(lines) >= max_lines:
+                    truncated = True
+                    break
+                lines.append(ln)
+            if truncated:
+                break
+        if truncated and lines:
+            lines[-1] = cls._fit_line(font, lines[-1] + " …", max_width)
+        return lines
 
     @classmethod
     def _create_gradient_background(cls, style: str, w: int = 1080, h: int = 1920) -> Image.Image:
@@ -826,6 +950,7 @@ html, body {{
             clean_text = cls._clean_text_for_rendering(b_text, strip_emoji=True).strip().upper()
             if not clean_text:
                 continue
+            clean_text = cls._fit_line(font, clean_text, collage.width - 48 - 50)
 
             dot_color = color_map.get(b_type, color_map['default'])
 
@@ -883,35 +1008,49 @@ html, body {{
         transparent: bool = False
     ) -> str:
         """Pillow fallback implementation if Playwright is unavailable with badges and gradients"""
+        out_path, coords = self._render_pil_internal(
+            bg_base_path=bg_base_path,
+            channel_title=channel_title,
+            photo_paths=photo_paths,
+            caption=caption,
+            price=price,
+            date_str=date_str,
+            avatar_path=avatar_path,
+            forward_title=forward_title,
+            badges=badges,
+            output_path=output_path,
+            transparent=transparent
+        )
+        self._set_card_coords(coords)
+        return out_path
+
+    def _render_pil_internal(
+        self,
+        bg_base_path: Optional[str],
+        channel_title: str,
+        photo_paths: List[str],
+        caption: str,
+        price: Optional[float] = None,
+        date_str: Optional[str] = None,
+        avatar_path: Optional[str] = None,
+        forward_title: Optional[str] = None,
+        badges: Optional[List[Any]] = None,
+        output_path: Optional[str] = None,
+        transparent: bool = False
+    ) -> Tuple[str, Dict[str, float]]:
+        """Renders the card with Pillow. Returns (output_path, card_coordinates)."""
         target_w, target_h = 1080, 1920
 
         if transparent:
             bg_rgba = Image.new('RGBA', (target_w, target_h), (0, 0, 0, 0))
         elif bg_base_path and os.path.isfile(bg_base_path):
             try:
-                bg = Image.open(bg_base_path).convert('RGB')
+                with Image.open(bg_base_path) as bg_file:
+                    bg_file.draft("RGB", (target_w, target_h))
+                    bg = bg_file.convert('RGB')
                 if bg.size != (target_w, target_h):
                     bg = bg.resize((target_w, target_h), Image.Resampling.LANCZOS)
                 bg_rgba = bg.convert('RGBA')
-            except Exception:
-                bg_rgba = self._create_gradient_background('telegram_green', target_w, target_h)
-        elif bg_base_path == 'listing_blur' and photo_paths and os.path.exists(photo_paths[0]):
-            try:
-                im = Image.open(photo_paths[0]).convert('RGB')
-                im_ratio = im.width / im.height
-                target_ratio = target_w / target_h
-                if im_ratio > target_ratio:
-                    new_w = int(im.height * target_ratio)
-                    left = (im.width - new_w) // 2
-                    im = im.crop((left, 0, left + new_w, im.height))
-                else:
-                    new_h = int(im.width / target_ratio)
-                    top = (im.height - new_h) // 2
-                    im = im.crop((0, top, im.width, top + new_h))
-                im = im.resize((target_w, target_h), Image.Resampling.BILINEAR)
-                im = im.filter(ImageFilter.GaussianBlur(35))
-                im = ImageEnhance.Brightness(im).enhance(0.7)
-                bg_rgba = im.convert('RGBA')
             except Exception:
                 bg_rgba = self._create_gradient_background('telegram_green', target_w, target_h)
         else:
@@ -920,35 +1059,49 @@ html, body {{
 
         font_title = self._get_system_font(28, bold=True)
         font_sub = self._get_system_font(20, bold=False)
-        font_text = self._get_system_font(24, bold=False)
         font_time = self._get_system_font(20, bold=False)
         font_badge = self._get_system_font(18, bold=True)
 
         card_w = 880
         card_r = 24
-
-        collage = self.create_photo_collage(photo_paths, width=card_w, height=920)
-        has_collage = collage is not None
-        collage_h = 920 if has_collage else 0
+        text_x = 32
+        text_max_w = card_w - 2 * text_x
+        outer_margin = 60
 
         raw_display = self.extract_story_lines(caption, price)
-        display_lines = [self._clean_text_for_rendering(l, strip_emoji=True) for l in raw_display if l.strip()]
-        display_lines = [l for l in display_lines if l]
+        paragraphs = [self._clean_text_for_rendering(line, strip_emoji=True) for line in raw_display if line.strip()]
+        paragraphs = [p for p in paragraphs if p]
+
+        collage_h = 920
+        collage = self.create_photo_collage(photo_paths, width=card_w, height=collage_h)
+        has_collage = collage is not None
 
         if not has_collage:
             font_text = self._get_system_font(28, bold=False)
             line_h = 42
             caption_padding_top = 28
-            caption_padding_bottom = 32
+            max_lines = 14
             header_h = 96 if forward_title else 68
+            collage_h = 0
         else:
             font_text = self._get_system_font(24, bold=False)
             line_h = 34
             caption_padding_top = 20
-            caption_padding_bottom = 24
+            max_lines = 8
             header_h = 86 if forward_title else 58
 
-        caption_h = caption_padding_top + (len(display_lines) * line_h) + caption_padding_bottom
+        text_lines = self._layout_caption(font_text, paragraphs, text_max_w, max_lines)
+        date_line_h = 30
+        caption_padding_bottom = 18
+        caption_h = caption_padding_top + (len(text_lines) * line_h) + 6 + date_line_h + caption_padding_bottom
+
+        # Keep the whole card inside the 9:16 frame: shrink the collage when the caption is long
+        if has_collage:
+            overflow = header_h + collage_h + caption_h - (target_h - 2 * outer_margin)
+            if overflow > 0:
+                collage_h = max(420, collage_h - overflow)
+                collage = self._fit_and_crop(collage, card_w, collage_h)
+
         card_h = header_h + collage_h + caption_h
         if not has_collage:
             card_h = max(card_h, 340)
@@ -963,26 +1116,24 @@ html, body {{
         card_draw = ImageDraw.Draw(card_img)
         card_draw.rounded_rectangle([0, 0, card_w, card_h], radius=card_r, fill=(255, 255, 255, 255))
 
-        c_title_clean = self._clean_text_for_rendering(channel_title or "ARENDA UY", strip_emoji=True)
-        card_draw.text((32, 16 if not forward_title else 14), c_title_clean, font=font_title, fill=(155, 61, 125))
+        c_title_clean = self._clean_text_for_rendering(channel_title or "ARENDA UY", strip_emoji=True) or "ARENDA UY"
+        card_draw.text((text_x, 16 if not forward_title else 14), self._fit_line(font_title, c_title_clean, text_max_w), font=font_title, fill=(155, 61, 125))
         if forward_title:
             fwd_clean = self._clean_text_for_rendering(forward_title, strip_emoji=True)
-            card_draw.text((32, 52), f"Manba: {fwd_clean}", font=font_sub, fill=(198, 125, 50))
+            card_draw.text((text_x, 52), self._fit_line(font_sub, f"Manba: {fwd_clean}", text_max_w), font=font_sub, fill=(198, 125, 50))
 
         if has_collage:
             card_img.paste(collage, (0, header_h))
 
         y_text = header_h + collage_h + caption_padding_top
-        for idx, line in enumerate(display_lines):
-            card_draw.text((32, y_text), line, font=font_text, fill=(28, 28, 30))
+        for line in text_lines:
+            card_draw.text((text_x, y_text), line, font=font_text, fill=(28, 28, 30))
             y_text += line_h
 
-        now_dt = datetime.now()
-        m_names = ['yan', 'fev', 'mar', 'apr', 'may', 'iyn', 'iyl', 'avg', 'sen', 'okt', 'noy', 'dek']
-        default_date = f"{now_dt.day} {m_names[now_dt.month - 1]}, {now_dt.strftime('%H:%M')}"
-        d_text = self._clean_text_for_rendering(date_str or default_date, strip_emoji=True)
-        w_date = font_time.getbbox(d_text)[2] - font_time.getbbox(d_text)[0]
-        card_draw.text((card_w - w_date - 32, card_h - 36), d_text, font=font_time, fill=(142, 142, 147))
+        d_text = self._clean_text_for_rendering(date_str or tashkent_date_label(), strip_emoji=True)
+        d_bbox = font_time.getbbox(d_text)
+        w_date = d_bbox[2] - d_bbox[0]
+        card_draw.text((card_w - w_date - text_x, card_h - caption_padding_bottom - date_line_h), d_text, font=font_time, fill=(142, 142, 147))
 
         shadow = Image.new('RGBA', (card_w + 30, card_h + 30), (0, 0, 0, 0))
         ImageDraw.Draw(shadow).rounded_rectangle([15, 15, card_w + 15, card_h + 15], radius=card_r, fill=(0, 0, 0, 45))
@@ -1001,17 +1152,22 @@ html, body {{
         ]
         ImageDraw.Draw(bg_rgba).polygon(tail_poly, fill=(255, 255, 255, 255))
 
+        av_loaded = None
         if avatar_path and os.path.exists(avatar_path):
             try:
-                av = Image.open(avatar_path).convert('RGBA').resize((68, 68), Image.Resampling.LANCZOS)
-                mask = Image.new('L', (68, 68), 0)
-                ImageDraw.Draw(mask).ellipse((0, 0, 68, 68), fill=255)
-                av_bordered = Image.new('RGBA', (74, 74), (0, 0, 0, 0))
-                ImageDraw.Draw(av_bordered).ellipse((0, 0, 74, 74), fill=(255, 255, 255, 255))
-                av_bordered.paste(av, (3, 3), mask)
-                bg_rgba.paste(av_bordered, (card_left - 20, card_top + card_h - 48), av_bordered)
+                with Image.open(avatar_path) as av_file:
+                    av_file.draft("RGB", (136, 136))
+                    av_loaded = av_file.convert('RGBA').resize((68, 68), Image.Resampling.LANCZOS)
             except Exception as av_err:
                 logger.debug(f"Avatar paste note: {av_err}")
+                av_loaded = None
+        if av_loaded is not None:
+            mask = Image.new('L', (68, 68), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, 68, 68), fill=255)
+            av_bordered = Image.new('RGBA', (74, 74), (0, 0, 0, 0))
+            ImageDraw.Draw(av_bordered).ellipse((0, 0, 74, 74), fill=(255, 255, 255, 255))
+            av_bordered.paste(av_loaded, (3, 3), mask)
+            bg_rgba.paste(av_bordered, (card_left - 20, card_top + card_h - 48), av_bordered)
         else:
             initial = (c_title_clean[:1] if c_title_clean else "A").upper()
             av_bordered = Image.new('RGBA', (74, 74), (0, 0, 0, 0))
@@ -1026,9 +1182,8 @@ html, body {{
             bg_rgba.paste(av_bordered, (card_left - 20, card_top + card_h - 48), av_bordered)
 
         if not output_path:
-            temp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp_media")
-            os.makedirs(temp_dir, exist_ok=True)
-            output_path = os.path.join(temp_dir, f"story_card_{int(time.time() * 1000)}.jpg" if not transparent else f"card_overlay_{int(time.time() * 1000)}.png")
+            name = f"overlay_{uuid.uuid4().hex}.png" if transparent else f"story_card_{uuid.uuid4().hex}.jpg"
+            output_path = os.path.join(_temp_media_dir(), name)
 
         if transparent or (output_path and output_path.lower().endswith('.png')):
             bg_rgba.save(output_path, format='PNG')
@@ -1037,17 +1192,15 @@ html, body {{
             out_res.save(output_path, format='JPEG', quality=95)
 
         center_y_pct = (card_top + card_h / 2.0) / float(target_h) * 100.0
-        h_pct = card_h / float(target_h) * 100.0
-        w_pct = float(card_w) / float(target_w) * 100.0
-        self._set_card_coords({
+        coords = {
             "x": 50.0,
             "y": round(center_y_pct, 1),
-            "w": round(w_pct, 1),
-            "h": round(h_pct, 1)
-        })
+            "w": round(float(card_w) / float(target_w) * 100.0, 1),
+            "h": round(card_h / float(target_h) * 100.0, 1)
+        }
 
-        logger.info(f"Story composite card rendered via PIL fallback: {output_path} (coords: {self.last_card_coords})")
-        return output_path
+        logger.info(f"Story composite card rendered via PIL fallback: {output_path} (coords: {coords})")
+        return output_path, coords
 
     # ==========================================
     # --- PRIMARY ENTRY POINTS ---
@@ -1068,12 +1221,10 @@ html, body {{
         """
         Renders the repost card as a 1080x1920 transparent PNG overlay with
         natural drop shadow, tail, avatar badge, and smart property tags.
-        Designed specifically for compositing onto 25s video slideshows via FFmpeg.
+        Designed specifically for compositing onto video slideshows via FFmpeg.
         """
         if not output_path:
-            temp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp_media")
-            os.makedirs(temp_dir, exist_ok=True)
-            output_path = os.path.join(temp_dir, f"card_overlay_{int(time.time() * 1000)}.png")
+            output_path = os.path.join(_temp_media_dir(), f"overlay_{uuid.uuid4().hex}.png")
 
         if getattr(settings, "ENABLE_PLAYWRIGHT", True):
             try:
@@ -1160,6 +1311,18 @@ html, body {{
             transparent=False
         )
 
+    def render_story_composite_with_coords(self, **kwargs) -> Tuple[str, Dict[str, float]]:
+        """render_story_composite() plus the coordinates of THIS card (render and read happen on one thread)"""
+        self._local.last_card_coords = None
+        path = self.render_story_composite(**kwargs)
+        return path, self.get_last_card_coordinates()
+
+    def render_card_overlay_png_with_coords(self, **kwargs) -> Tuple[str, Dict[str, float]]:
+        """render_card_overlay_png() plus the coordinates of THIS card (render and read happen on one thread)"""
+        self._local.last_card_coords = None
+        path = self.render_card_overlay_png(**kwargs)
+        return path, self.get_last_card_coordinates()
+
     async def render_story_composite_async(
         self,
         bg_base_path: str,
@@ -1174,8 +1337,7 @@ html, body {{
         output_path: Optional[str] = None
     ) -> str:
         """Non-blocking async wrapper executing composite rendering in a worker thread"""
-        return await asyncio.to_thread(
-            self.render_story_composite,
+        path, _coords = await self.render_story_composite_with_coords_async(
             bg_base_path=bg_base_path,
             channel_title=channel_title,
             photo_paths=photo_paths,
@@ -1187,6 +1349,11 @@ html, body {{
             badges=badges,
             output_path=output_path
         )
+        return path
+
+    async def render_story_composite_with_coords_async(self, **kwargs) -> Tuple[str, Dict[str, float]]:
+        """Renders a static story card in a worker thread and returns (path, card_coordinates)"""
+        return await asyncio.to_thread(lambda: self.render_story_composite_with_coords(**kwargs))
 
     async def render_card_overlay_png_async(
         self,
@@ -1201,18 +1368,20 @@ html, body {{
         output_path: Optional[str] = None
     ) -> str:
         """Non-blocking async wrapper executing card overlay rendering in a worker thread"""
-        return await asyncio.to_thread(
-            self.render_card_overlay_png,
-            channel_title=channel_title,
-            photo_paths=photo_paths,
-            caption=caption,
-            price=price,
-            date_str=date_str,
-            avatar_path=avatar_path,
-            forward_title=forward_title,
-            badges=badges,
-            output_path=output_path
+        path, _coords = await asyncio.to_thread(
+            lambda: self.render_card_overlay_png_with_coords(
+                channel_title=channel_title,
+                photo_paths=photo_paths,
+                caption=caption,
+                price=price,
+                date_str=date_str,
+                avatar_path=avatar_path,
+                forward_title=forward_title,
+                badges=badges,
+                output_path=output_path
+            )
         )
+        return path
 
 
 story_card_renderer = StoryCardRenderer()
@@ -1220,10 +1389,8 @@ story_card_renderer = StoryCardRenderer()
 
 def shutdown_playwright_pool(wait: bool = False, cancel_futures: bool = True) -> None:
     """Cleanly shuts down the dedicated Playwright thread pool during application stop"""
-    global _PLAYWRIGHT_POOL
     try:
-        if _PLAYWRIGHT_POOL:
-            _PLAYWRIGHT_POOL.shutdown(wait=wait, cancel_futures=cancel_futures)
-            logger.info("Playwright renderer thread pool shut down cleanly.")
+        _PLAYWRIGHT_POOL.shutdown(wait=wait, cancel_futures=cancel_futures)
+        logger.info("Playwright renderer thread pool shut down cleanly.")
     except Exception as e:
         logger.warning(f"Error shutting down Playwright thread pool: {e}")

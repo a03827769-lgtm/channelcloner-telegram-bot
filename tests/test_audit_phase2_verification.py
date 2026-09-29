@@ -1,5 +1,4 @@
 import os
-import sys
 import hmac
 import hashlib
 import zipfile
@@ -10,7 +9,7 @@ import logging
 from unittest.mock import patch, MagicMock
 
 from database.db_manager import DatabaseManager, ReentrantAsyncLock
-from services.log_viewer import MemoryLogHandler, sanitize_log_message
+from services.log_viewer import MemoryLogHandler
 from scripts.decrypt_backup import decrypt_backup
 from services.translator_service import TranslatorService
 from services.ai_paraphraser import AIParaphraserService
@@ -200,6 +199,7 @@ class TestAuditPhase2Verification(unittest.IsolatedAsyncioTestCase):
             handler.send_response = MagicMock()
             handler.end_headers = MagicMock()
 
+            handler._reply = lambda status, payload: WebhookHandler._reply(handler, status, payload)
             WebhookHandler.do_POST(handler)
             handler.send_response.assert_called_with(403)
 
@@ -215,6 +215,7 @@ class TestAuditPhase2Verification(unittest.IsolatedAsyncioTestCase):
             handler_valid.send_response = MagicMock()
             handler_valid.end_headers = MagicMock()
 
+            handler_valid._reply = lambda status, payload: WebhookHandler._reply(handler_valid, status, payload)
             WebhookHandler.do_POST(handler_valid)
             handler_valid.send_response.assert_called_with(200)
         finally:

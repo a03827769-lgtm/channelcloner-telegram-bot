@@ -1,121 +1,120 @@
-import unittest
-import os
+"""
+Keep-alive HTTP server of run.py: liveness (/health) schema, HEAD support, PORT binding, concurrency and
+404s. Every test binds a free loopback port chosen at runtime, so the suite never collides with a running
+bot (8080) or with parallel test runs. "/" serves the Mini App SPA when webapp/dist exists (HTML) and the
+health JSON otherwise, so both are accepted there; /health is always JSON.
+"""
 import asyncio
+import os
+import socket
+from contextlib import asynccontextmanager
+from unittest.mock import patch
+
 import aiohttp
-from unittest.mock import patch, MagicMock
+
 from run import start_health_server
 
-class TestHealthCheckEmpirical(unittest.IsolatedAsyncioTestCase):
-    """
-    Empirical tests for Keep-Alive HTTP Healthcheck server.
-    Tests real TCP socket binding, dynamic PORT configuration, GET / HEAD routes,
-    payload schema, concurrency, and 404 responses.
-    """
+HEALTH_KEYS = {"status", "bot", "service", "telethon_connected"}
 
-    async def asyncSetUp(self):
-        # Default test port to avoid conflict with running instances
-        self.test_port = 8089
-        os.environ["PORT"] = str(self.test_port)
 
-    async def asyncTearDown(self):
-        if "PORT" in os.environ:
-            del os.environ["PORT"]
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
-    async def test_health_server_get_routes_and_schema(self):
-        """Verify GET / and GET /health return 200 OK and strict JSON schema."""
-        self.test_port = 8095
-        os.environ["PORT"] = str(self.test_port)
-        
+
+def _bound_port(runner) -> int:
+    for address in runner.addresses:
+        if isinstance(address, tuple) and len(address) >= 2:
+            return address[1]
+    raise AssertionError(f"HTTP server did not bind: {runner.addresses!r}")
+
+
+@asynccontextmanager
+async def running_server(port: int):
+    with patch.dict(os.environ, {"PORT": str(port)}):
         runner = await start_health_server()
-        try:
+    try:
+        yield runner
+    finally:
+        await runner.cleanup()
+
+
+def _assert_health_payload(data: dict) -> None:
+    assert HEALTH_KEYS <= set(data), data
+    assert data["status"] == "ok"
+    assert data["bot"] == "running"
+    assert data["service"] == "telegram-channel-cloner"
+    assert isinstance(data["telethon_connected"], bool)
+
+
+async def test_health_endpoint_returns_json_schema():
+    port = _free_port()
+    async with running_server(port) as runner:
+        bound = _bound_port(runner)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{bound}/health") as resp:
+                assert resp.status == 200
+                assert "application/json" in resp.headers.get("Content-Type", "")
+                _assert_health_payload(await resp.json())
+
+
+async def test_root_serves_spa_html_or_health_json():
+    port = _free_port()
+    async with running_server(port) as runner:
+        bound = _bound_port(runner)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{bound}/") as resp:
+                assert resp.status == 200
+                content_type = resp.headers.get("Content-Type", "")
+                if "application/json" in content_type:
+                    _assert_health_payload(await resp.json())
+                else:
+                    assert "text/html" in content_type
+                    assert "<html" in (await resp.text()).lower()
+
+
+async def test_head_health_returns_empty_body():
+    port = _free_port()
+    async with running_server(port) as runner:
+        bound = _bound_port(runner)
+        async with aiohttp.ClientSession() as session:
+            async with session.head(f"http://127.0.0.1:{bound}/health") as resp:
+                assert resp.status == 200
+                assert "application/json" in resp.headers.get("Content-Type", "")
+                assert len(await resp.read()) == 0
+
+
+async def test_server_binds_the_configured_port():
+    for _ in range(2):
+        port = _free_port()
+        async with running_server(port) as runner:
+            assert _bound_port(runner) == port
             async with aiohttp.ClientSession() as session:
-                for path in ["/", "/health"]:
-                    url = f"http://127.0.0.1:{self.test_port}{path}"
-                    async with session.get(url) as resp:
-                        self.assertEqual(resp.status, 200, f"GET {path} did not return 200")
-                        self.assertIn("application/json", resp.headers.get("Content-Type", ""))
-                        
-                        data = await resp.json()
-                        # Strict schema assertions
-                        self.assertIn("status", data)
-                        self.assertEqual(data["status"], "ok")
-                        self.assertIn("bot", data)
-                        self.assertEqual(data["bot"], "running")
-                        self.assertIn("service", data)
-                        self.assertEqual(data["service"], "telegram-channel-cloner")
-                        self.assertIn("telethon_connected", data)
-                        self.assertIsInstance(data["telethon_connected"], bool)
-        finally:
-            await runner.cleanup()
+                async with session.get(f"http://127.0.0.1:{port}/health") as resp:
+                    assert resp.status == 200
+                    assert (await resp.json())["status"] == "ok"
 
-    async def test_health_server_head_routes(self):
-        """Verify HEAD / and HEAD /health return 200 OK with empty body."""
-        self.test_port = 8090
-        os.environ["PORT"] = str(self.test_port)
-        
-        runner = await start_health_server()
-        try:
-            async with aiohttp.ClientSession() as session:
-                for path in ["/", "/health"]:
-                    url = f"http://127.0.0.1:{self.test_port}{path}"
-                    async with session.head(url) as resp:
-                        self.assertEqual(resp.status, 200, f"HEAD {path} did not return 200")
-                        self.assertIn("application/json", resp.headers.get("Content-Type", ""))
-                        body = await resp.read()
-                        self.assertEqual(len(body), 0, f"HEAD {path} returned non-empty body")
-        finally:
-            await runner.cleanup()
 
-    async def test_health_server_dynamic_port_binding(self):
-        """Verify dynamic port binding on arbitrary PORT (e.g. 8091 and 8092)."""
-        for custom_port in [8091, 8092]:
-            os.environ["PORT"] = str(custom_port)
-            runner = await start_health_server()
-            try:
-                async with aiohttp.ClientSession() as session:
-                    url = f"http://127.0.0.1:{custom_port}/health"
-                    async with session.get(url) as resp:
-                        self.assertEqual(resp.status, 200)
-                        data = await resp.json()
-                        self.assertEqual(data["status"], "ok")
-            finally:
-                await runner.cleanup()
+async def test_health_under_concurrent_load():
+    port = _free_port()
+    async with running_server(port) as runner:
+        bound = _bound_port(runner)
+        async with aiohttp.ClientSession() as session:
+            async def fetch():
+                async with session.get(f"http://127.0.0.1:{bound}/health") as resp:
+                    assert resp.status == 200
+                    return (await resp.json())["status"]
 
-    async def test_health_server_concurrency_and_stress(self):
-        """Stress-test health server with 50 concurrent requests."""
-        self.test_port = 8093
-        os.environ["PORT"] = str(self.test_port)
-        
-        runner = await start_health_server()
-        try:
-            async with aiohttp.ClientSession() as session:
-                async def fetch(url):
-                    async with session.get(url) as resp:
-                        self.assertEqual(resp.status, 200)
-                        data = await resp.json()
-                        return data["status"]
+            results = await asyncio.gather(*[fetch() for _ in range(50)])
+    assert results == ["ok"] * 50
 
-                urls = [f"http://127.0.0.1:{self.test_port}/health" for _ in range(50)]
-                results = await asyncio.gather(*[fetch(u) for u in urls])
-                self.assertEqual(len(results), 50)
-                self.assertTrue(all(r == "ok" for r in results))
-        finally:
-            await runner.cleanup()
 
-    async def test_health_server_404_for_unknown_paths(self):
-        """Verify that undefined endpoints return 404 Not Found."""
-        self.test_port = 8094
-        os.environ["PORT"] = str(self.test_port)
-        
-        runner = await start_health_server()
-        try:
-            async with aiohttp.ClientSession() as session:
-                for path in ["/nonexistent", "/api/v1", "/status"]:
-                    url = f"http://127.0.0.1:{self.test_port}{path}"
-                    async with session.get(url) as resp:
-                        self.assertEqual(resp.status, 404, f"Path {path} did not return 404")
-        finally:
-            await runner.cleanup()
-
-if __name__ == "__main__":
-    unittest.main()
+async def test_unknown_paths_return_404():
+    port = _free_port()
+    async with running_server(port) as runner:
+        bound = _bound_port(runner)
+        async with aiohttp.ClientSession() as session:
+            for path in ("/nonexistent", "/status", "/.env"):
+                async with session.get(f"http://127.0.0.1:{bound}{path}") as resp:
+                    assert resp.status == 404, path

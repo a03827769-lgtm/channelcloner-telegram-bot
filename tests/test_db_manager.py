@@ -1,24 +1,33 @@
 import unittest
 import os
+import tempfile
 import uuid
 from database.db_manager import DatabaseManager
 
 class TestDatabaseManager(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.test_db_path = f"temp_media/test_cloner_{uuid.uuid4().hex[:8]}.db"
-        os.makedirs("temp_media", exist_ok=True)
+        self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.test_db_path = os.path.join(self._tmp_dir.name, f"test_cloner_{uuid.uuid4().hex[:8]}.db")
         self.db = DatabaseManager(self.test_db_path)
         await self.db.init_db()
 
     async def asyncTearDown(self):
         from tests.test_utils import safe_cleanup_db
         await safe_cleanup_db(self.test_db_path, self.db)
+        self._tmp_dir.cleanup()
 
     async def test_user_operations(self):
+        # Registration never grants admin rights (only set_admin_status does)
         user = await self.db.get_or_create_user(12345, "Test User", "testuser", is_admin=True)
         self.assertEqual(user.user_id, 12345)
         self.assertEqual(user.full_name, "Test User")
-        self.assertTrue(user.is_admin)
+        self.assertFalse(user.is_admin)
+
+        await self.db.set_admin_status(12345, True)
+        self.assertTrue((await self.db.get_user_by_id(12345)).is_admin)
+        refreshed = await self.db.get_or_create_user(12345, "Test User Renamed", "testuser")
+        self.assertTrue(refreshed.is_admin)
+        self.assertEqual((await self.db.get_user_by_id(12345)).full_name, "Test User Renamed")
 
     async def test_channel_pair_operations(self):
         await self.db.get_or_create_user(12345, "Test User", "testuser", is_admin=True)
@@ -39,9 +48,10 @@ class TestDatabaseManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pair.custom_signature, "My Signature")
         self.assertTrue(pair.is_active)
 
-        # Toggle active
-        new_status = await self.db.toggle_pair_active(pair_id)
+        # Owner pause
+        new_status, error = await self.db.set_pair_active_by_owner(pair_id, False)
         self.assertFalse(new_status)
+        self.assertIsNone(error)
 
         # Toggle clean
         new_clean = await self.db.toggle_clean_links(pair_id)

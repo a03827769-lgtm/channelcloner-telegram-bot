@@ -1,6 +1,4 @@
-import os
 import pytest
-import aiosqlite
 from unittest.mock import AsyncMock, patch, MagicMock
 from database.models import StorySettings
 from database.db_manager import DatabaseManager
@@ -112,8 +110,6 @@ def test_story_video_generator_duration_bounds_and_slide_cap(tmp_path):
 @pytest.mark.asyncio
 async def test_story_cloner_service_uses_configured_duration():
     """Verify story_cloner_service passes user's configured duration to create_video_story_async"""
-    from services.story_cloner_service import story_cloner_service
-    from telethon.tl import types
 
     mock_db = MagicMock()
     mock_db.get_story_settings = AsyncMock(return_value=StorySettings(user_id=12345, video_duration=35))

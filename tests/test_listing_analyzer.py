@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-import pytest
-from services.listing_analyzer import listing_analyzer, ListingAnalyzer
+from services.listing_analyzer import listing_analyzer
 
 
 def test_tashkent_districts_detection():

@@ -1,5 +1,5 @@
 import React from 'react';
-import { LayoutGrid, Radio, Clapperboard, History } from 'lucide-react';
+import { LayoutGrid, Radio, Clapperboard, History, ShoppingBag } from 'lucide-react';
 import { ActiveTab } from '../../types';
 import { telegram } from '../../services/telegram';
 
@@ -13,6 +13,7 @@ export const BottomNav: React.FC<BottomNavProps> = ({ activeTab, onChangeTab, is
   const tabs = [
     { id: 'dashboard' as ActiveTab, label: 'Asosiy', icon: LayoutGrid },
     { id: 'channels' as ActiveTab, label: 'Kanallar', icon: Radio },
+    { id: 'store' as ActiveTab, label: "Do'kon", icon: ShoppingBag },
     { id: 'story' as ActiveTab, label: 'VIP Story', icon: Clapperboard, isHighlight: true },
     { id: 'backfill' as ActiveTab, label: 'Tarix', icon: History },
   ];
