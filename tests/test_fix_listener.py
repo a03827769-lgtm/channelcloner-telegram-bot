@@ -941,6 +941,55 @@ async def test_ready_endpoint_reports_readiness(monkeypatch):
         await runner.cleanup()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="SO_EXCLUSIVEADDRUSE exists on Windows only")
+async def test_http_port_cannot_be_taken_over_on_windows(monkeypatch):
+    """While the bot listens on 0.0.0.0:<port>, nothing else may bind that port - not even on 127.0.0.1, which
+    is what Docker does when it publishes a container port - so the watchdog's probes and the tunnel traffic
+    can never be diverted to another process."""
+    port = free_port()
+    monkeypatch.setenv("PORT", str(port))
+    runner = await run.start_health_server()
+    try:
+        assert [address[1] for address in runner.addresses] == [port]
+        for host in ("127.0.0.1", "0.0.0.0"):
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                with pytest.raises(OSError):
+                    probe.bind((host, port))
+            finally:
+                probe.close()
+    finally:
+        await runner.cleanup()
+    # A restarted bot gets the same port straight away
+    again = run.bind_http_socket("0.0.0.0", port)
+    again.close()
+
+
+async def test_http_server_uses_a_fallback_port_when_the_configured_one_is_taken(monkeypatch):
+    port = free_port()
+    monkeypatch.setenv("PORT", str(port))
+    real_bind = run.bind_http_socket
+    attempts = []
+
+    def bind(host, candidate, backlog=128):
+        attempts.append(candidate)
+        if candidate == port:
+            raise OSError(10048, "Only one usage of each socket address is normally permitted")
+        return real_bind("127.0.0.1", 0, backlog)  # stand-in for the fallback port, never a well-known one
+
+    monkeypatch.setattr(run, "bind_http_socket", bind)
+    runner = await run.start_health_server()
+    try:
+        bound = [address[1] for address in runner.addresses]
+        assert attempts[:2] == [port, 8000]
+        assert len(bound) == 1 and bound[0] != port
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{bound[0]}/health") as resp:
+                assert resp.status == 200
+    finally:
+        await runner.cleanup()
+
+
 def test_instance_lock_is_exclusive_and_released(tmp_path):
     lock_file = str(tmp_path / "app.lock")
     first = run._lock_file_handle(lock_file)

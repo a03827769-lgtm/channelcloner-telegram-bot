@@ -4,6 +4,7 @@ import logging.handlers
 import sys
 import os
 import signal
+import socket
 import time
 from typing import Any, Callable, List, Optional
 
@@ -157,7 +158,7 @@ def resolve_http_port() -> int:
 def build_health_payload() -> dict:
     """/health body. "status" is "ok" while the database is open and the public bot is polling; the MTProto
     listener is reported separately because an account that is not logged in is a normal state (the Windows
-    watchdog restarts the process whenever status != "ok")."""
+    watchdog treats any HTTP 200 as alive and only reports a lasting "degraded")."""
     telethon_connected = False
     try:
         telethon_connected = bool(telethon_listener.is_connected())
@@ -176,6 +177,27 @@ def build_health_payload() -> dict:
         "admin_polling_alive": runtime_state.admin_polling_alive,
         "telethon_connected": telethon_connected,
     }
+
+def bind_http_socket(host: str, port: int, backlog: int = 128) -> socket.socket:
+    """Listening socket of the HTTP server.
+
+    On Windows it is bound with SO_EXCLUSIVEADDRUSE. Without it another process can bind the same port on a
+    more specific address (Docker publishing 127.0.0.1:8080 does exactly that) and silently take over the
+    watchdog's health probes and the Cloudflare tunnel traffic; SO_REUSEADDR would even allow an identical
+    bind. On POSIX, SO_REUSEADDR only allows fast restarts over TIME_WAIT sockets."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name == "nt":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.listen(backlog)
+        sock.setblocking(False)
+    except OSError:
+        sock.close()
+        raise
+    return sock
 
 async def start_health_server(bot=None, publish_port_file: bool = False):
     """Keep-Alive HTTP Healthcheck Server for Docker container and host monitoring"""
@@ -250,26 +272,28 @@ async def start_health_server(bot=None, publish_port_file: bool = False):
     runner = web.AppRunner(app)
     await runner.setup()
     port = resolve_http_port()
-    # SO_REUSEADDR on Windows lets a second process bind an already-used port (silent port hijack),
-    # so it is only enabled on POSIX where it merely allows fast restarts over TIME_WAIT sockets.
-    reuse = os.name != "nt"
     bound_port = port
     site = None
     candidates = [port] + [p for p in (8000, 8091, 8092, 8095, 9080, 0) if p != port]
     for candidate in candidates:
         try:
-            site = web.TCPSite(runner, "0.0.0.0", candidate, reuse_address=reuse)
-            await site.start()
-            server = getattr(site, "_server", None)
-            sockets = getattr(server, "sockets", None) if server else None
-            bound_port = sockets[0].getsockname()[1] if sockets else candidate
-            if candidate != port:
-                logger.warning(f"⚠️ Port {port} is busy; HTTP server fell back to 0.0.0.0:{bound_port}")
-            logger.info(f"🚀 HTTP server (health, Mini App & API) running on 0.0.0.0:{bound_port}")
-            break
-        except (OSError, PermissionError) as bind_err:
+            sock = bind_http_socket("0.0.0.0", candidate)
+        except OSError as bind_err:
             logger.warning(f"⚠️ Could not bind HTTP server on 0.0.0.0:{candidate} ({bind_err})")
+            continue
+        try:
+            site = web.SockSite(runner, sock)
+            await site.start()
+        except OSError as start_err:
+            sock.close()
             site = None
+            logger.warning(f"⚠️ Could not start HTTP server on 0.0.0.0:{candidate} ({start_err})")
+            continue
+        bound_port = sock.getsockname()[1]
+        if candidate != port:
+            logger.warning(f"⚠️ Port {port} is busy; HTTP server fell back to 0.0.0.0:{bound_port}")
+        logger.info(f"🚀 HTTP server (health, Mini App & API) running on 0.0.0.0:{bound_port}")
+        break
     if site is None:
         logger.error("❌ Failed to bind HTTP server on any port. Continuing bot execution without HTTP server.")
     elif publish_port_file:
