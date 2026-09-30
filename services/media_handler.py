@@ -439,7 +439,9 @@ class MediaHandler:
             if fname.endswith((".db", ".db-wal", ".db-shm")):
                 continue
             try:
-                age = now - os.path.getmtime(fpath)
+                # clamped: a file written a moment ago can carry an mtime a hair after `now` (timer
+                # granularity), which must not keep it alive when max_age is 0
+                age = max(0.0, now - os.path.getmtime(fpath))
             except OSError:
                 continue
             effective_max_age = 0 if max_age <= 0 else max_age
