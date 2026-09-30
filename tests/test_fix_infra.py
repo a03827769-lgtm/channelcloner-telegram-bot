@@ -628,6 +628,65 @@ def test_autostart_install_can_start_the_watchdog(tmp_path):
     assert backend.started and backend.started[0][1] == [setup_autostart.WATCHDOG_SCRIPT]
 
 
+def test_autostart_reports_a_watchdog_that_could_not_start(tmp_path, monkeypatch):
+    backend = FakeAutostartBackend(tmp_path)
+    monkeypatch.setattr(backend, "start_watchdog", lambda target, arguments, working_dir: None)
+    messages = []
+    assert setup_autostart.install(backend, report=messages.append, start=True) == 1
+    assert any(m.startswith("[ERROR]") for m in messages)
+    assert os.path.exists(os.path.join(backend.startup, setup_autostart.SHORTCUT_NAME))
+
+
+# A watchdog started from a terminal, IDE or agent session must not live in that tool's job object: the
+# whole job is killed when the tool exits, and the bot and the tunnel would die with the watchdog.
+
+def test_watchdog_spawn_leaves_the_callers_job(monkeypatch):
+    flags = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            flags.append(kwargs["creationflags"])
+            self.pid = 777
+
+    monkeypatch.setattr(watchdog.subprocess, "Popen", FakePopen)
+    assert watchdog.spawn_outside_job(["pythonw.exe", "wd.py"], "C:\\project") == 777
+    assert flags[0] & watchdog.CREATE_BREAKAWAY_FROM_JOB
+    assert flags[0] & watchdog.DETACHED_PROCESS
+
+
+def test_watchdog_spawn_uses_wmi_when_the_job_forbids_breakaway(monkeypatch):
+    def refuse(cmd, **kwargs):
+        error = OSError("Access is denied")
+        error.winerror = watchdog.ERROR_ACCESS_DENIED
+        raise error
+
+    runs = []
+
+    def fake_run(args, **kwargs):
+        runs.append((args, kwargs["env"]))
+        return subprocess.CompletedProcess(args, 0, stdout="31337", stderr="")
+
+    monkeypatch.setattr(watchdog.subprocess, "Popen", refuse)
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_run)
+    cmd = [r"C:\Program Files\Python\pythonw.exe", r"C:\my project\scripts\windows_keepalive_watchdog.py"]
+    assert watchdog.spawn_outside_job(cmd, r"C:\my project") == 31337
+    (args, env), = runs
+    assert "Win32_Process" in args[-1]
+    assert env["CC_SPAWN_CMD"] == subprocess.list2cmdline(cmd)
+    assert env["CC_SPAWN_CWD"] == r"C:\my project"
+
+    # A failed WMI call and any other spawn error are reported as "not started"
+    monkeypatch.setattr(watchdog.subprocess, "run",
+                        lambda args, **kwargs: subprocess.CompletedProcess(args, 9, stdout="", stderr=""))
+    assert watchdog.spawn_outside_job(cmd, r"C:\my project") is None
+
+    def missing(cmd, **kwargs):
+        raise FileNotFoundError("pythonw.exe")
+
+    monkeypatch.setattr(watchdog.subprocess, "Popen", missing)
+    assert watchdog.spawn_outside_job(cmd, r"C:\my project") is None
+
+
 # ---------------------------------------------------------------------------------------------------
 # setup_wizard: keeps values, atomic write, generated key never printed (L6)
 # ---------------------------------------------------------------------------------------------------

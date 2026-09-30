@@ -61,6 +61,7 @@ ERROR_ALREADY_EXISTS = 183
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 DETACHED_PROCESS = 0x00000008
 CREATE_NO_WINDOW = 0x08000000
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
 # Single-instance mutex
 MUTEX_NAME = "Local\\ChannelCloner_24_7_Watchdog_Mutex"
@@ -1220,24 +1221,67 @@ def request_reload(timeout: float = RELOAD_WAIT_SECONDS) -> bool:
     return False
 
 
-def spawn_detached_watchdog(extra_args: Optional[List[str]] = None) -> Optional[int]:
-    """Starts a new windowless watchdog in the background (used by --restart)."""
-    cmd = [background_python_executable(), WATCHDOG_SCRIPT] + list(extra_args or [])
+# Runs Win32_Process.Create through CIM. The command line and working directory travel through
+# environment variables, so paths with spaces or quotes need no escaping.
+_WMI_CREATE_SCRIPT = (
+    "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+    "-Arguments @{ CommandLine = $env:CC_SPAWN_CMD; CurrentDirectory = $env:CC_SPAWN_CWD }; "
+    "if ($r.ReturnValue -ne 0) { exit [int]$r.ReturnValue }; [Console]::Out.Write($r.ProcessId)"
+)
+
+
+def _create_process_via_wmi(cmd: List[str], cwd: str) -> Optional[int]:
+    """Lets the WMI service create the process. It then belongs to no job of the caller."""
+    env = dict(os.environ, CC_SPAWN_CMD=subprocess.list2cmdline(cmd), CC_SPAWN_CWD=cwd)
     try:
-        creationflags = (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if IS_WINDOWS else 0
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", _WMI_CREATE_SCRIPT],
+            env=env, capture_output=True, text=True, timeout=60, creationflags=_no_window_flags(),
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"❌ WMI process creation failed: {e}")
+        return None
+    if result.returncode != 0:
+        print(f"❌ WMI process creation failed (Win32_Process.Create returned {result.returncode})")
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def spawn_outside_job(cmd: List[str], cwd: str, label: str = "the Watchdog") -> Optional[int]:
+    """Starts `cmd` in the background so that it survives the program that started it.
+
+    Terminals, IDEs and agent sessions often run their commands inside a Windows job object that is killed
+    as a whole when the tool exits, so a watchdog started from there would take the bot and the tunnel down
+    with it. CREATE_BREAKAWAY_FROM_JOB leaves the caller's job; when the job forbids that, the WMI service
+    creates the process instead."""
+    creationflags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
+    try:
         proc = subprocess.Popen(
-            cmd,
-            cwd=BASE_DIR,
-            creationflags=creationflags,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
+            cmd, cwd=cwd, creationflags=creationflags, close_fds=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         return proc.pid
     except OSError as e:
-        print(f"❌ Could not start the Watchdog: {e}")
-        return None
+        if getattr(e, "winerror", None) != ERROR_ACCESS_DENIED:
+            print(f"❌ Could not start {label}: {e}")
+            return None
+    return _create_process_via_wmi(cmd, cwd)
+
+
+def spawn_detached_watchdog(extra_args: Optional[List[str]] = None) -> Optional[int]:
+    """Starts a new windowless watchdog in the background (used by --restart), outside the caller's job."""
+    cmd = [background_python_executable(), WATCHDOG_SCRIPT] + list(extra_args or [])
+    if not IS_WINDOWS:
+        try:
+            return subprocess.Popen(cmd, cwd=BASE_DIR, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True).pid
+        except OSError as e:
+            print(f"❌ Could not start the Watchdog: {e}")
+            return None
+    return spawn_outside_job(cmd, BASE_DIR)
 
 
 def save_status(mode: str, healthy: bool, consecutive_failures: int, extra: Optional[Dict[str, Any]] = None):

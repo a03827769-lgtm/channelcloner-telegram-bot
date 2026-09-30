@@ -101,12 +101,13 @@ class WindowsAutostartBackend:
             return None
         return (result.stderr or result.stdout or "").strip() or f"exit code {result.returncode}"
 
-    def start_watchdog(self, target: str, arguments: List[str], working_dir: str) -> int:
-        DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP = 0x00000008, 0x00000200
-        proc = subprocess.Popen([target] + arguments, cwd=working_dir, close_fds=True,
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        return proc.pid
+    def start_watchdog(self, target: str, arguments: List[str], working_dir: str) -> Optional[int]:
+        """Started outside the caller's job object, so closing the terminal or tool that ran this script
+        never takes the watchdog (and the bot it supervises) down."""
+        if SCRIPTS_DIR not in sys.path:
+            sys.path.insert(0, SCRIPTS_DIR)
+        from windows_keepalive_watchdog import spawn_outside_job
+        return spawn_outside_job([target] + arguments, working_dir)
 
 
 def remove_legacy_registrations(backend, report: Callable[[str], None]) -> List[str]:
@@ -159,11 +160,19 @@ def install(backend, report: Callable[[str], None] = print, start: bool = False)
         return 1
     report(f"[OK] Autostart shortcut: {lnk}")
     report(f"     -> {target} \"{WATCHDOG_SCRIPT}\"")
+    start_failed = False
     if start:
         pid = backend.start_watchdog(target, [WATCHDOG_SCRIPT], PROJECT_ROOT)
-        report(f"[OK] Watchdog started in the background (PID {pid}); an already running one keeps running.")
+        if pid:
+            report(f"[OK] Watchdog started in the background (PID {pid}); an already running one keeps running.")
+        else:
+            start_failed = True
+            report("[ERROR] The watchdog could not be started now; it starts at the next logon "
+                   "(or run: pythonw scripts\\windows_keepalive_watchdog.py)")
     for problem in problems:
         report(f"[WARN] Not removed: {problem}")
+    if start_failed:
+        return 1
     return 0 if not problems else 2
 
 
