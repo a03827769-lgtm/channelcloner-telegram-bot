@@ -168,5 +168,7 @@ def create_admin_dispatcher(storage=None) -> Dispatcher:
     fsm_storage = storage if storage is not None else SQLiteStorage()
     # Serializes updates per user/chat so wizard steps (and FSM data updates) can never interleave
     dp = Dispatcher(storage=fsm_storage, events_isolation=SimpleEventIsolation())
+    from bot.error_handler import register_error_handler
+    register_error_handler(dp)
     dp.include_router(create_admin_router("dedicated_admin_router"))
     return dp

@@ -6,6 +6,7 @@ import uuid
 import time
 from contextlib import contextmanager
 from typing import List, Dict, Optional, Callable, Any, Iterable, Set
+from telethon.errors import FileReferenceExpiredError
 from telethon.tl.types import Message
 import aiofiles.os
 
@@ -222,7 +223,8 @@ class MediaHandler:
         self,
         message: Message,
         max_size_bytes: int = 20 * 1024 * 1024,
-        max_bytes: Optional[int] = None
+        max_bytes: Optional[int] = None,
+        _refreshed: bool = False
     ) -> Optional[bytes]:
         """
         Downloads media directly into an in-memory BytesIO buffer without touching disk.
@@ -263,14 +265,41 @@ class MediaHandler:
                 if len(data) > 0:
                     return data
             return None
+        except FileReferenceExpiredError:
+            fresh = None if _refreshed else await self.refetch_message(message)
+            if fresh is None:
+                logger.debug(f"In-memory media download for message {message.id}: file reference expired")
+                return None
+            return await self.download_telethon_media_bytes(
+                fresh, max_size_bytes=max_size_bytes, max_bytes=max_bytes, _refreshed=True
+            )
         except Exception as e:
             logger.debug(f"In-memory media download notice for message {message.id}: {e}")
             return None
 
+    @staticmethod
+    async def refetch_message(message: Message) -> Optional[Message]:
+        """Fetches the message again so its media carries a fresh file reference.
+        Telegram expires file references after a while (and after reconnects), so messages that waited
+        in an album buffer or a catch-up batch can no longer be downloaded with the stored reference."""
+        client = getattr(message, "client", None)
+        chat = getattr(message, "peer_id", None) or getattr(message, "chat_id", None)
+        if client is None or chat is None:
+            return None
+        try:
+            fresh = await client.get_messages(chat, ids=message.id)
+        except Exception as e:
+            logger.warning(f"Could not refetch message {message.id} for a fresh file reference: {e}")
+            return None
+        if not fresh or not getattr(fresh, "media", None):
+            return None
+        return fresh
+
     async def download_telethon_media(
         self,
         message: Message,
-        max_file_size: int = 2000 * 1024 * 1024
+        max_file_size: int = 2000 * 1024 * 1024,
+        _refreshed: bool = False
     ) -> Optional[str]:
         """
         Downloads media to temporary disk storage.
@@ -370,13 +399,18 @@ class MediaHandler:
             self.release_path(temp_path)
             return downloaded_path
         except Exception as e:
-            logger.error(f"Failed to download media for message {message.id}: {e}")
             self.release_path(temp_path)
             if os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
                 except Exception:
                     logger.debug("Ignored exception", exc_info=True)
+            if isinstance(e, FileReferenceExpiredError) and not _refreshed:
+                fresh = await self.refetch_message(message)
+                if fresh is not None:
+                    logger.info(f"File reference of message {message.id} expired; retrying with a refetched copy")
+                    return await self.download_telethon_media(fresh, max_file_size=max_file_size, _refreshed=True)
+            logger.error(f"Failed to download media for message {message.id}: {e}")
             return None
 
     async def cleanup_files(self, file_paths: List[Optional[str]]):

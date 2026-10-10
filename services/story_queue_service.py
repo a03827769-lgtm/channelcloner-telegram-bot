@@ -25,10 +25,20 @@ NON_PREMIUM_DAILY_STORY_LIMIT = 3
 PROCESSING_STALE_MINUTES = 30
 TRANSIENT_MAX_RETRIES = 3
 CLIENT_MAX_RETRIES = 10
+# Back-off between client checks: 5, 10, 20, 40, then 60 minutes, so a power or network outage of
+# up to ~6 hours does not drop queued stories
+CLIENT_RETRY_BASE_MINUTES = 5
+CLIENT_RETRY_MAX_MINUTES = 60
 # STORIES_TOO_MUCH / FloodWait deferrals before the listing is dropped
 DEFERRAL_MAX_ATTEMPTS = 7
 STORIES_LIMIT_RETRY_SECONDS = 24 * 3600
 MIN_QUEUE_SPACING_MINUTES = 15
+
+
+def client_retry_delay_minutes(attempt: int) -> int:
+    """Minutes to wait after the given failed client check (1-based), doubling up to the cap"""
+    attempt = max(1, int(attempt))
+    return min(CLIENT_RETRY_MAX_MINUTES, CLIENT_RETRY_BASE_MINUTES * (2 ** min(attempt - 1, 10)))
 
 
 def parse_hour(value: Any, default: int) -> int:
@@ -481,11 +491,12 @@ class StoryQueueService:
             retries = _to_int(payload.get("client_retries", 0), 0) + 1
             if retries >= CLIENT_MAX_RETRIES:
                 logger.warning(f"User {user_id} client permanently disconnected for #{item.id}; marking failed.")
-                await self._record_terminal_failure(item, payload, st, "Telethon client not connected after 10 attempts")
+                await self._record_terminal_failure(item, payload, st, f"Telethon client not connected after {CLIENT_MAX_RETRIES} attempts")
                 return
             payload["client_retries"] = retries
-            logger.warning(f"User {user_id} Telethon client not connected for queue #{item.id} (attempt {retries}/{CLIENT_MAX_RETRIES}); postponing 5 minutes.")
-            await self._reschedule(item.id, now_utc + timedelta(minutes=5), payload)
+            delay_minutes = client_retry_delay_minutes(retries)
+            logger.warning(f"User {user_id} Telethon client not connected for queue #{item.id} (attempt {retries}/{CLIENT_MAX_RETRIES}); postponing {delay_minutes} minutes.")
+            await self._reschedule(item.id, now_utc + timedelta(minutes=delay_minutes), payload)
             return
 
         # 6. Publish story

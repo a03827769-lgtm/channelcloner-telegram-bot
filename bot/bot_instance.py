@@ -24,6 +24,7 @@ from bot.handlers.comment_moderator import router as comment_moderator_router
 from bot.middlewares.user_registration_middleware import UserRegistrationMiddleware
 from bot.middlewares.throttling_middleware import ThrottlingMiddleware
 from bot.middlewares.private_mode_middleware import PrivateModeGatekeeperMiddleware
+from bot.error_handler import register_error_handler
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,7 @@ def create_dispatcher(storage=None) -> Dispatcher:
     # Updates of one user in one chat are handled strictly one after another (see PerUserEventIsolation);
     # long jobs (backfill, restore, catch-up) run as background tasks so they never hold this lock
     dp = Dispatcher(storage=fsm_storage, events_isolation=PerUserEventIsolation())
+    register_error_handler(dp)
 
     # 1. Anti-flood / Throttling rate limiting middleware
     throttling_mw = ThrottlingMiddleware(rate_limit=0.5, burst_limit=5, window_seconds=2.0)

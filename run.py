@@ -872,8 +872,20 @@ async def run_application() -> bool:
         logger.info("Telegram Channel Cloner shut down cleanly.")
     return should_reexec
 
+def loop_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Telethon leaves its reconnect future unretrieved when the network drops ('Future exception was
+    never retrieved: ConnectionError'). That is an expected outage, not a crash: log one line instead of
+    a traceback. Everything else goes to asyncio's default handler."""
+    exc = context.get("exception")
+    message = str(context.get("message", ""))
+    if isinstance(exc, OSError) and "never retrieved" in message:
+        logger.warning(f"Network error in a finished background future: {exc!r}")
+        return
+    loop.default_exception_handler(context)
+
 async def main():
     logger.info("🚀 Starting 100k High-Concurrency Telegram Channel Cloner system...")
+    asyncio.get_running_loop().set_exception_handler(loop_exception_handler)
 
     if not acquire_pid_lock():
         logger.error("Another instance of Channel Cloner is already running (instance lock held). Exiting.")
