@@ -21,6 +21,7 @@ from bot.handlers.help_guide import router as help_guide_router
 from bot.handlers.story_menu import router as story_menu_router
 from bot.handlers.inline_search import router as inline_search_router
 from bot.handlers.comment_moderator import router as comment_moderator_router
+from bot.handlers.channel_membership import router as channel_membership_router
 from bot.middlewares.user_registration_middleware import UserRegistrationMiddleware
 from bot.middlewares.throttling_middleware import ThrottlingMiddleware
 from bot.middlewares.private_mode_middleware import PrivateModeGatekeeperMiddleware
@@ -121,6 +122,7 @@ def create_dispatcher(storage=None) -> Dispatcher:
     dp.include_router(story_menu_router)
     dp.include_router(inline_search_router)
     dp.include_router(comment_moderator_router)
+    dp.include_router(channel_membership_router)
 
     # Embedded admin tools come last so the public handlers win on shared entry points (admin callbacks
     # are unique "admin_*"/"adm_*" and still reach it). The two shared ones defer to it explicitly:
