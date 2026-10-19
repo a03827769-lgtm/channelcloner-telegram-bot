@@ -3,6 +3,7 @@
 Everything Telegram-related is mocked; files live in pytest's tmp_path."""
 import asyncio
 import io
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -736,6 +737,17 @@ def test_invisible_watermark_roundtrip_on_real_photo(tmp_path):
     assert steganography_service.embed_watermark(str(src), str(out), "UID_1_CH_2")
     assert steganography_service.extract_watermark(str(out)) == "UID_1_CH_2"
     assert steganography_service.embed_watermark_bytes(src.read_bytes(), "UID_1_CH_2")
+
+
+def test_image_too_small_for_watermark_is_sent_unmarked_without_a_warning(tmp_path, caplog):
+    from services.steganography_service import steganography_service
+    import numpy as np
+    src = tmp_path / "thumb.png"
+    Image.fromarray(np.full((40, 40, 3), 128, dtype=np.uint8)).save(src)
+    with caplog.at_level(logging.INFO, logger="services.steganography_service"):
+        assert steganography_service.embed_watermark_bytes(src.read_bytes(), "UID_1_CH_2") is None
+    small = [r for r in caplog.records if "Image too small" in r.getMessage()]
+    assert small and all(r.levelno == logging.INFO for r in small)
 
 
 # ---------------------------------------------------------------- rate limiter (LS-L9)

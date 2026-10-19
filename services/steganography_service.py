@@ -92,7 +92,8 @@ class SteganographyService:
         total_blocks = blocks_h * blocks_w
 
         if len(bits) > total_blocks:
-            logger.warning(f"Image too small ({w}x{h}) to hold watermark payload ({len(bits)} bits vs {total_blocks} blocks)")
+            # Expected for thumbnails and small stickers: the image is sent unmarked
+            logger.info(f"Image too small ({w}x{h}) to hold watermark payload ({len(bits)} bits vs {total_blocks} blocks)")
             return None
 
         bit_idx = 0

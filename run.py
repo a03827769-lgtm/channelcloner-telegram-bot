@@ -72,7 +72,7 @@ from services.memory_supervisor import system_supervisor
 from services.cache_manager import cache_manager
 from bot.bot_instance import create_bot, create_dispatcher
 from admin_bot.bot_instance import create_admin_bot, create_admin_dispatcher
-from services.log_viewer import log_viewer, install_redaction_filter
+from services.log_viewer import log_viewer, install_noise_filters, install_redaction_filter
 
 HEALTH_SERVICE_NAME = "telegram-channel-cloner"
 PID_FILE = str(PROJECT_ROOT / "app.pid")
@@ -144,6 +144,7 @@ def configure_logging():
     install_redaction_filter(log_viewer)
     if log_viewer not in logging.getLogger().handlers:
         logging.getLogger().addHandler(log_viewer)
+    install_noise_filters()
 
 def resolve_http_port() -> int:
     """Process environment wins (Docker/PaaS inject PORT); otherwise the value from .env via settings."""

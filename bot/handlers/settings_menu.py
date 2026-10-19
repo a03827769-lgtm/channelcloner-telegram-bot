@@ -310,7 +310,7 @@ async def process_new_wm_text(message: Message, state: FSMContext):
         return
 
     new_wm = message.text.strip()
-    clean_wm = re.sub(r'[​‌‍﻿⁠]', '', new_wm).strip()
+    clean_wm = re.sub(r'[\u200b\u200c\u200d\ufeff\u2060]', '', new_wm).strip()
     if not clean_wm and new_wm != "/clear":
         await message.answer(f"{WARN} Suv belgisi matni bo'sh yoki ko'rinmas belgilardan iborat bo'lishi mumkin emas.", parse_mode="HTML")
         return
@@ -830,7 +830,7 @@ async def process_new_vwm_text(message: Message, state: FSMContext):
         await message.answer(f"{WARN} Iltimos, faqat matn ko'rinishidagi suv belgisini yuboring.", parse_mode="HTML")
         return
 
-    new_text = re.sub(r'[​‌‍﻿⁠]', '', message.text).strip()
+    new_text = re.sub(r'[\u200b\u200c\u200d\ufeff\u2060]', '', message.text).strip()
     if not new_text:
         await message.answer(f"{WARN} Suv belgisi matni bo'sh yoki ko'rinmas belgilardan iborat bo'lishi mumkin emas.", parse_mode="HTML")
         return

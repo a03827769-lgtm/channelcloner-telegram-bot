@@ -42,7 +42,14 @@ import services.telethon_listener as tl_mod
 from database.db_manager import DatabaseManager
 from database.models import ChannelPair
 from services.code_reloader import SourceCodeWatcher
-from services.log_viewer import MemoryLogHandler, SecretRedactingFilter, sanitize_log_message
+from services.log_viewer import (
+    HealthProbeAccessFilter,
+    MemoryLogHandler,
+    SecretRedactingFilter,
+    StaleTelethonSenderFilter,
+    install_noise_filters,
+    sanitize_log_message,
+)
 from services.media_handler import MediaGroupBuffer
 from services.memory_supervisor import SystemSupervisor
 from services.phone_utils import normalize_phone_number
@@ -1155,6 +1162,58 @@ def test_redaction_covers_tracebacks_and_phone_formats():
         assert sanitize_log_message(harmless) == harmless
 
 
+def _access_record(line):
+    return logging.LogRecord("aiohttp.access", logging.INFO, __file__, 1, line, None, None)
+
+
+def test_health_probe_access_lines_are_dropped_only_when_successful():
+    probe_filter = HealthProbeAccessFilter()
+    ok = '127.0.0.1 [20/Oct/2026:10:00:00 +0500] "GET /health HTTP/1.1" 200 312 "-" "python-requests/2.32"'
+    ready = '127.0.0.1 [20/Oct/2026:10:00:00 +0500] "HEAD /ready HTTP/1.1" 200 0 "-" "curl/8.0"'
+    not_ready = '127.0.0.1 [20/Oct/2026:10:00:00 +0500] "GET /ready HTTP/1.1" 503 41 "-" "curl/8.0"'
+    api = '127.0.0.1 [20/Oct/2026:10:00:00 +0500] "GET /api/health-report HTTP/1.1" 200 90 "-" "Telegram"'
+    assert not probe_filter.filter(_access_record(ok))
+    assert not probe_filter.filter(_access_record(ready))
+    assert probe_filter.filter(_access_record(not_ready))
+    assert probe_filter.filter(_access_record(api))
+
+
+def test_stale_telethon_sender_reconnect_noise_is_dropped():
+    sender_filter = StaleTelethonSenderFilter()
+    # What Telethon's reconnect loop hits once the client was disconnected on purpose (connection is None)
+    stale_exc = AttributeError("'NoneType' object has no attribute 'connect'")
+    exc_info = (AttributeError, stale_exc, None)
+    name = "telethon.network.mtprotosender"
+    stale = logging.LogRecord(name, logging.WARNING, __file__, 1, "Unexpected exception reconnecting on attempt %d", (2,), exc_info)
+    connecting = logging.LogRecord(name, logging.INFO, __file__, 1, "Connecting to %s...", (None,), None)
+    real = logging.LogRecord(name, logging.INFO, __file__, 1, "Connecting to %s...", ("149.154.167.51:443/TcpFull",), None)
+    failed_exc = ConnectionError("Connection to Telegram failed 5 time(s)")
+    failure = logging.LogRecord(name, logging.ERROR, __file__, 1, "Reconnect failed", None, (ConnectionError, failed_exc, None))
+    assert not sender_filter.filter(stale)
+    assert not sender_filter.filter(connecting)
+    assert sender_filter.filter(real)
+    assert sender_filter.filter(failure)
+
+
+def test_install_noise_filters_is_idempotent_and_quiets_transfer_loggers():
+    names = ("aiohttp.access", "telethon.network.mtprotosender", "telethon.client.downloads", "telethon.client.uploads")
+    saved = {name: (list(logging.getLogger(name).filters), logging.getLogger(name).level) for name in names}
+    try:
+        install_noise_filters()
+        install_noise_filters()
+        access = logging.getLogger("aiohttp.access").filters
+        sender = logging.getLogger("telethon.network.mtprotosender").filters
+        assert sum(isinstance(f, HealthProbeAccessFilter) for f in access) == 1
+        assert sum(isinstance(f, StaleTelethonSenderFilter) for f in sender) == 1
+        assert logging.getLogger("telethon.client.downloads").level == logging.WARNING
+        assert logging.getLogger("telethon.client.uploads").level == logging.WARNING
+    finally:
+        for name, (filters, level) in saved.items():
+            target = logging.getLogger(name)
+            target.filters[:] = filters
+            target.setLevel(level)
+
+
 # --------------------------------------------------------------------------- LS-L6: subscription watcher
 
 def test_paid_plan_days_left():
@@ -1226,6 +1285,50 @@ async def test_system_supervisor_aclose_and_rate_limited_lag_warnings(caplog):
         assert caplog.text.count("Event loop lag detected") == 1
     finally:
         gc.set_threshold(*thresholds)
+
+
+def _fake_frame(filename, name, lineno=10, back=None):
+    return SimpleNamespace(f_code=SimpleNamespace(co_filename=filename, co_name=name), f_lineno=lineno, f_back=back)
+
+
+def test_describe_loop_frame_names_the_blocking_call_or_host_starvation():
+    from services.memory_supervisor import _PROJECT_ROOT, STARVED_SITE, describe_loop_frame
+    lib = os.path.join(sys.prefix, "Lib", "site-packages", "PIL", "Image.py")
+    project = os.path.join(_PROJECT_ROOT, "services", "story_renderer.py")
+    assert describe_loop_frame(_fake_frame(os.path.join(sys.prefix, "Lib", "asyncio", "windows_events.py"), "_poll")) == STARVED_SITE
+    assert describe_loop_frame(_fake_frame("/usr/lib/python3.11/selectors.py", "select")) == STARVED_SITE
+    assert describe_loop_frame(_fake_frame(project, "render", 42)) == "services/story_renderer.py:42 render"
+    nested = _fake_frame(lib, "resize", 7, back=_fake_frame(project, "render", 42))
+    assert describe_loop_frame(nested) == "services/story_renderer.py:42 render (in Image.py:7 resize)"
+    assert describe_loop_frame(_fake_frame(lib, "resize", 7)) == "Image.py:7 resize"
+    assert describe_loop_frame(None) == "unknown"
+
+
+def _block_the_event_loop(seconds):
+    time.sleep(seconds)
+
+
+async def test_lag_warning_names_the_code_that_blocked_the_loop(caplog):
+    thresholds = gc.get_threshold()
+    sup = SystemSupervisor(memory_interval=3600, lag_threshold_ms=150.0, lag_report_interval=0.0)
+    try:
+        with caplog.at_level(logging.WARNING, logger="SystemSupervisor"):
+            sup.start()
+            await asyncio.sleep(0.1)
+            _block_the_event_loop(1.2)
+            for _ in range(40):
+                await asyncio.sleep(0.05)
+                if "Event loop lag detected" in caplog.text:
+                    break
+        assert "Stalled at: tests/test_fix_listener.py:" in caplog.text
+        assert "_block_the_event_loop" in caplog.text
+    finally:
+        await sup.aclose()
+        gc.set_threshold(*thresholds)
+    sampler = sup._sampler
+    assert sampler is not None
+    sampler.join(timeout=1)
+    assert not sampler.is_alive()
 
 
 async def test_code_reloader_detects_files_restored_with_an_older_timestamp(tmp_path):

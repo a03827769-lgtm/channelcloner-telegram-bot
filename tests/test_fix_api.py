@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import itertools
 import json
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING
@@ -1055,3 +1056,24 @@ async def test_tunnel_sync_quick_tunnel_fallback(tmp_path, monkeypatch):
     assert svc.url_file.read_text(encoding="utf-8") == "https://abc.trycloudflare.com"
     status = json.loads((tmp_path / "data" / "tunnel_status.json").read_text(encoding="utf-8"))
     assert status["status"] == "degraded" and status["mode"] == "quick_tunnel"
+
+
+async def test_tunnel_probe_warns_only_on_a_lasting_outage(tmp_path, caplog):
+    svc = TunnelSyncService(base_dir=tmp_path)
+    svc._configured_url = "https://app.example.com"
+    svc.active_url = svc.bot_menu_synced_url = svc._configured_url
+    probe = AsyncMock(side_effect=[False, True, False, False, True])
+    with patch.object(svc, "probe_endpoint", probe), caplog.at_level(logging.INFO, logger="TunnelSyncService"):
+        levels = []
+        for _ in range(5):
+            caplog.clear()
+            await svc.sync_once()
+            levels.append([(r.levelname, r.getMessage().split(":")[0]) for r in caplog.records])
+    assert levels == [
+        [("INFO", "Tunnel probe degraded")],     # a single failed probe is a network blip
+        [],                                      # recovery after one failure is not worth a line
+        [("INFO", "Tunnel probe degraded")],
+        [("WARNING", "Tunnel probe degraded")],  # second failure in a row: a real outage
+        [("INFO", "Tunnel probe recovered")],
+    ]
+    assert svc.consecutive_failures == 0

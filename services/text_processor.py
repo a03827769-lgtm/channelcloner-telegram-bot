@@ -114,11 +114,11 @@ _GAMBLING_URL_KEYWORD_RE = re.compile(r'bet|casino|kazino|stavk|1win|1xbet', re.
 
 # Invisible characters used to obfuscate links/words. ZWJ is kept when it joins two emoji (👨‍💻, ❤️‍🔥).
 _INVISIBLE_RE = re.compile(
-    r'[​‌⁠﻿]'
-    r'|(?<![\U0001F000-\U0001FAFF☀-➿️])‍'
-    r'|‍(?![\U0001F000-\U0001FAFF☀-➿])'
+    r'[\u200b\u200c\u2060\ufeff]'
+    r'|(?<![\U0001F000-\U0001FAFF☀-➿️])\u200d'
+    r'|\u200d(?![\U0001F000-\U0001FAFF☀-➿])'
 )
-_ALL_INVISIBLE_RE = re.compile(r'[­​-‍⁠﻿]')
+_ALL_INVISIBLE_RE = re.compile(r'[\u00ad\u200b-\u200d\u2060\ufeff]')
 _APOSTROPHES_RE = re.compile(r"[’‘ʻʼ`´]")
 _TAG_SPLIT_RE = re.compile(r'(<[^>]*>)')
 _TAG_NAME_RE = re.compile(r'<\s*(/)?\s*([a-zA-Z][a-zA-Z0-9_\-]*)')
@@ -151,7 +151,7 @@ _SOURCE_SIGNATURE_RE = re.compile(
     r'|' + _SIG_KEYWORDS + r'(?!\w)\s*(?:@\w+|(?:https?://)?' + _TG_HOSTS + r'/\S*))',
     re.IGNORECASE
 )
-_SIG_PREFIX_RE = re.compile(r'^(?:[\U00010000-\U0010ffff☀-➿⭐⌚-⏳▪-◾‍️•\-\*]\s*)+')
+_SIG_PREFIX_RE = re.compile(r'^(?:[\U00010000-\U0010ffff☀-➿⭐⌚-⏳▪-◾\u200d️•\-\*]\s*)+')
 _SEPARATOR_LINE_RE = re.compile(r'[—–\-_=*•#\s]{3,}')
 
 

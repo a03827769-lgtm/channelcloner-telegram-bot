@@ -107,6 +107,55 @@ class MemoryLogHandler(logging.Handler):
     def get_recent_logs(self, count: int = 35) -> List[str]:
         return list(self.buffer)[-count:]
 
+class HealthProbeAccessFilter(logging.Filter):
+    """Drops the access-log lines of successful /health and /ready probes. The watchdog polls every 15 s,
+    which made them over a third of the log file and pushed real events out of the in-memory viewer.
+    Failed probes (503 from /ready, anything not 200) are kept."""
+
+    _PROBES = ('"GET /health ', '"GET /ready ', '"HEAD /health ', '"HEAD /ready ')
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return not ('" 200 ' in message and any(probe in message for probe in self._PROBES))
+
+
+class StaleTelethonSenderFilter(logging.Filter):
+    """Drops the tracebacks Telethon writes for a client that was disconnected on purpose (listener rebuild,
+    shutdown) while its internal reconnect loop was running: the sender's connection is None by then, so each
+    remaining attempt fails with AttributeError until the loop gives up. The replacement client is unaffected."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        if isinstance(exc, AttributeError) and "'NoneType' object has no attribute 'connect'" in str(exc):
+            return False
+        try:
+            return record.getMessage() != "Connecting to None..."
+        except Exception:
+            return True
+
+
+# Per-chunk transfer notices ("Starting direct file download...", "File lives in another DC") are a fifth of
+# the log and say nothing an operator can act on; failures are still logged at WARNING and above
+_QUIET_LOGGERS = ("telethon.client.downloads", "telethon.client.uploads")
+
+
+def install_noise_filters() -> None:
+    """Attaches the noise filters to the loggers that emit the records (idempotent). A filter on a logger
+    applies to records created on that exact logger, which is where aiohttp and Telethon log them."""
+    for name, filter_cls in (
+        ("aiohttp.access", HealthProbeAccessFilter),
+        ("telethon.network.mtprotosender", StaleTelethonSenderFilter),
+    ):
+        target = logging.getLogger(name)
+        if not any(isinstance(f, filter_cls) for f in target.filters):
+            target.addFilter(filter_cls())
+    for name in _QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 # Global singleton attached to root logger
 log_viewer = MemoryLogHandler()
 logging.getLogger().addHandler(log_viewer)

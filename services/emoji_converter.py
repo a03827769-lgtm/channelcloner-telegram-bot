@@ -321,7 +321,7 @@ _EMOJI_ELEMENT = _EMOJI_BASE + r'[︎️]?[\U0001F3FB-\U0001F3FF]?(?:[\U000E0020
 _EMOJI_CLUSTER_REGEX = re.compile(
     r'[\U0001F1E6-\U0001F1FF]{2}'
     r'|[0-9#*]️?⃣'
-    r'|' + _EMOJI_ELEMENT + r'(?:‍' + _EMOJI_ELEMENT + r')*'
+    r'|' + _EMOJI_ELEMENT + r'(?:\u200d' + _EMOJI_ELEMENT + r')*'
 )
 
 

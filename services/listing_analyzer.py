@@ -12,7 +12,7 @@ ANALYZE_MAX_CHARS = 4096
 
 # Uzbek apostrophe variants (o‘, gʻ, U+02BB/U+02BC, typographic quotes, backticks) are unified to "'"
 _APOSTROPHES_RE = re.compile(r"[`´ʻʼʽ‘’′]")
-_INVISIBLE_RE = re.compile(r"[​-‏﻿‪-‮⁠-⁯]")
+_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\ufeff\u202a-\u202e\u2060-\u206f]")
 
 
 def normalize_listing_text(text: str) -> str:

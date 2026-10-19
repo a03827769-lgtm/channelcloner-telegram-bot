@@ -206,12 +206,16 @@ class TunnelSyncService:
                 await self.persist_active_url(url, bot, legacy_publish=True)
 
         if await self.probe_endpoint(url):
+            if self.consecutive_failures >= 2:
+                logger.info(f"Tunnel probe recovered: {url} (after {self.consecutive_failures} failed probes)")
             self.consecutive_failures = 0
             self.write_status("healthy", f"Edge verified and responsive at {url}")
         else:
             self.consecutive_failures += 1
             self.write_status("degraded", f"Probe failed ({self.consecutive_failures}/{self.max_failures})")
-            logger.warning(f"Tunnel probe degraded: {url} (fails: {self.consecutive_failures})")
+            # One failed probe is a routine network blip (Wi-Fi flap, edge reconnect); only a lasting outage is a warning
+            log = logger.warning if self.consecutive_failures >= 2 else logger.info
+            log(f"Tunnel probe degraded: {url} (fails: {self.consecutive_failures})")
         return url
 
     async def start_worker(self, bot=None):
